@@ -1,0 +1,9 @@
+{
+  "repo_role": "raw_python_agent",
+  "base_model": "../models/gui-owl-1.5-8b-think-base",
+  "output_contract": "raw_python",
+  "executor_contract": "local_python_runner",
+  "execution_isolation": false,
+  "recoverable_sandbox": false,
+  "logging_required": true
+}

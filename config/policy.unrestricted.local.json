@@ -1,0 +1,16 @@
+{
+  "policy_name": "unrestricted_local",
+  "description": "Local unrestricted Python execution for GUI, file, process, and network actions.",
+  "allow_gui_control": true,
+  "allow_subprocess": true,
+  "allow_file_read": true,
+  "allow_file_write": true,
+  "allow_file_delete": true,
+  "allow_network": true,
+  "allow_package_install": true,
+  "allow_registry_edit": true,
+  "log_generated_code": true,
+  "log_stdout": true,
+  "log_stderr": true,
+  "log_metadata": true
+}

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "computer-use-raw-python-agent"
+version = "0.1.0"
+description = "Vision-conditioned raw Python GUI agent scaffold."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+runtime = ["pillow"]
+train = ["accelerate", "bitsandbytes", "datasets", "peft", "pillow", "torch", "torchvision", "transformers"]
+
+[project.scripts]
+computer-use-raw-python-agent = "computer_use_raw_python_agent.service:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
