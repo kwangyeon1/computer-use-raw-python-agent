@@ -4,6 +4,8 @@
   "run_dir": "../data/runs",
   "max_iterations": 5,
   "max_new_tokens": 256,
+  "repeat_code_streak_limit": 2,
+  "replan_on_repeated_code": true,
   "load_request_timeout_s": 120,
   "run_request_timeout_s": 100
 }

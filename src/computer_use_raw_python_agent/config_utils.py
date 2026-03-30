@@ -36,6 +36,10 @@ def load_agent_config(path: str | None) -> tuple[dict[str, Any], Path | None]:
         normalized["max_iterations"] = int(data["max_iterations"])
     if "max_new_tokens" in data:
         normalized["max_new_tokens"] = int(data["max_new_tokens"])
+    if "repeat_code_streak_limit" in data:
+        normalized["repeat_code_streak_limit"] = int(data["repeat_code_streak_limit"])
+    if "replan_on_repeated_code" in data:
+        normalized["replan_on_repeated_code"] = bool(data["replan_on_repeated_code"])
     if "load_request_timeout_s" in data:
         normalized["load_request_timeout_s"] = float(data["load_request_timeout_s"])
     if "run_request_timeout_s" in data:

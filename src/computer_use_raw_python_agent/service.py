@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 import argparse
 import base64
+import hashlib
 import json
 
 try:
@@ -30,8 +31,10 @@ def _load_json(path: str | None) -> dict[str, Any]:
 
 
 def _read_tail(path: str | Path, limit_chars: int = 2000) -> str:
+    if not str(path).strip():
+        return ""
     file_path = Path(path)
-    if not file_path.exists():
+    if not file_path.exists() or file_path.is_dir():
         return ""
     text = file_path.read_text(encoding="utf-8", errors="replace")
     return text[-limit_chars:]
@@ -47,6 +50,15 @@ def _write_json(path: str | Path, payload: dict[str, Any]) -> None:
     file_path = Path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _normalize_python_code(code: str) -> str:
+    return "\n".join(line.rstrip() for line in str(code).replace("\r\n", "\n").strip().split("\n")).strip()
+
+
+def _code_fingerprint(code: str) -> str:
+    normalized = _normalize_python_code(code)
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
 
 
 def build_executor_client(*, endpoint: str | None, mcp_command: list[str] | None, mcp_cwd: str | None):
@@ -93,6 +105,8 @@ def run_agent_control_loop(
     run_dir: str | Path,
     max_iterations: int,
     max_new_tokens: int,
+    repeat_code_streak_limit: int = 2,
+    replan_on_repeated_code: bool = False,
 ) -> dict[str, Any]:
     root = _ensure_run_dir(run_dir)
     (root / "payloads").mkdir(exist_ok=True)
@@ -112,6 +126,12 @@ def run_agent_control_loop(
     last_execution: dict[str, Any] = {}
     history: list[str] = []
     final_response: dict[str, Any] | None = None
+    generated_steps = 0
+    executed_steps = 0
+    stopped_reason: str | None = None
+    previous_code: str | None = None
+    repeated_code_streak = 0
+    replans_used = 0
 
     for step_index in range(max_iterations):
         request = StepRequest(
@@ -129,9 +149,35 @@ def run_agent_control_loop(
         _write_json(request_path, request.to_dict())
 
         response = generate_step_response(runtime, request, max_new_tokens=max_new_tokens)
+        generated_steps += 1
+        normalized_code = _normalize_python_code(response.python_code)
+        if normalized_code and normalized_code == previous_code:
+            repeated_code_streak += 1
+        else:
+            repeated_code_streak = 1 if normalized_code else 0
+        previous_code = normalized_code
+        response.notes.append(f"code_fingerprint={_code_fingerprint(response.python_code)}")
+        response.notes.append(f"code_repeat_streak={repeated_code_streak}")
         final_response = response.to_dict()
         response_path = root / "responses" / f"step-{step_index:03d}.response.json"
         _write_json(response_path, response.to_dict())
+
+        if repeat_code_streak_limit > 0 and repeated_code_streak >= repeat_code_streak_limit:
+            if replan_on_repeated_code and replans_used == 0:
+                replans_used += 1
+                repeated_code_streak = 0
+                response.notes.append("replan_requested_due_to_repeated_code")
+                final_response = response.to_dict()
+                _write_json(response_path, response.to_dict())
+                history.append(f"step-{step_index:03d}_replan_requested=repeated_code")
+                history.append("system_hint=previous python code repeated; generate different code")
+                continue
+            stopped_reason = "repeated_code"
+            response.notes.append("stopped_due_to_repeated_code")
+            final_response = response.to_dict()
+            _write_json(response_path, response.to_dict())
+            history.append(f"step-{step_index:03d}_stopped=repeated_code")
+            break
 
         step_id = f"step-{step_index:03d}"
         step_dir = root / "steps" / step_id
@@ -149,12 +195,14 @@ def run_agent_control_loop(
         _write_json(root / "responses" / f"{step_id}.executor.json", exec_result)
 
         record = dict(exec_result.get("record", {}))
+        executed_steps += 1
         last_execution = {
             **record,
             "stdout_tail": exec_result.get("stdout_tail") or _read_tail(record.get("stdout_path", "")),
             "stderr_tail": exec_result.get("stderr_tail") or _read_tail(record.get("stderr_path", "")),
         }
         history.append(f"{step_id}_return_code={record.get('return_code', 'unknown')}")
+        history.append(f"{step_id}_code_fingerprint={_code_fingerprint(response.python_code)}")
         state = {
             "screenshot_path": exec_result.get("screenshot_path"),
             "screenshot_base64": exec_result.get("screenshot_base64"),
@@ -167,9 +215,15 @@ def run_agent_control_loop(
 
     summary = {
         "run_dir": str(root),
-        "iterations": len(history),
+        "iterations": executed_steps,
+        "generated_steps": generated_steps,
         "last_execution": last_execution,
         "final_response": final_response,
+        "stopped_reason": stopped_reason,
+        "repeat_code_streak_limit": repeat_code_streak_limit,
+        "replan_on_repeated_code": replan_on_repeated_code,
+        "replans_used": replans_used,
+        "repeat_code_streak": repeated_code_streak,
     }
     _write_json(root / "loop-summary.json", summary)
     return summary
@@ -187,6 +241,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--processor-id")
     parser.add_argument("--max-iterations", type=int, default=5)
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--repeat-code-streak-limit", type=int, default=2)
+    parser.add_argument("--replan-on-repeated-code", action="store_true")
     parser.add_argument("--compute-dtype", default="bfloat16")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--disable-4bit", action="store_true")
@@ -222,6 +278,8 @@ def main() -> None:
             run_dir=args.run_dir,
             max_iterations=args.max_iterations,
             max_new_tokens=args.max_new_tokens,
+            repeat_code_streak_limit=args.repeat_code_streak_limit,
+            replan_on_repeated_code=args.replan_on_repeated_code,
         )
     finally:
         executor_client.close()

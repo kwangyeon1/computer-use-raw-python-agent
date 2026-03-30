@@ -206,6 +206,8 @@ def _handle_run(daemon_state: AgentDaemonState, payload: dict[str, Any]) -> dict
             run_dir=run_dir,
             max_iterations=int(defaults.get("max_iterations", 5)),
             max_new_tokens=int(defaults.get("max_new_tokens", 256)),
+            repeat_code_streak_limit=int(defaults.get("repeat_code_streak_limit", 2)),
+            replan_on_repeated_code=bool(defaults.get("replan_on_repeated_code", False)),
         )
     finally:
         daemon_state.phase = "ready"

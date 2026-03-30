@@ -30,6 +30,8 @@ def _build_default_overrides(args: argparse.Namespace, config_defaults: dict) ->
         "policy",
         "max_iterations",
         "max_new_tokens",
+        "repeat_code_streak_limit",
+        "replan_on_repeated_code",
         "load_request_timeout_s",
         "run_request_timeout_s",
     ):
@@ -161,6 +163,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcp-cwd")
     parser.add_argument("--max-iterations", type=int)
     parser.add_argument("--max-new-tokens", type=int)
+    parser.add_argument("--repeat-code-streak-limit", type=int)
+    parser.add_argument("--replan-on-repeated-code", action="store_true", default=None)
     parser.add_argument("--compute-dtype", default="bfloat16")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--disable-4bit", action="store_true")

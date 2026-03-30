@@ -55,10 +55,19 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-ag
   "run_dir": "../data/runs",
   "max_iterations": 5,
   "max_new_tokens": 256,
-  "load_request_timeout_s": 1800,
-  "run_request_timeout_s": 900
+  "repeat_code_streak_limit": 2,
+  "replan_on_repeated_code": false,
+  "load_request_timeout_s": 120,
+  "run_request_timeout_s": 100
 }
 ```
+
+같은 Python 코드가 연속으로 생성되면 `repeat_code_streak_limit`에 따라 처리합니다.
+- 기본값: `replan_on_repeated_code = false`
+  - 바로 종료하고 summary에 `stopped_reason: "repeated_code"`를 남깁니다.
+- `replan_on_repeated_code = true` 또는 `--replan-on-repeated-code`
+  - 반복 코드가 감지됐을 때 한 번만 실행 없이 재생성 기회를 줍니다.
+  - 그 뒤에도 반복되면 종료합니다.
 
 ## 남긴 파일
 
