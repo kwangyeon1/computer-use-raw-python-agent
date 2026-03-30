@@ -5,9 +5,13 @@
 `computer-use-raw-python-agent`는 loop controller입니다.
 
 - `--prompt`와 `--policy`를 직접 보유
-- `--model-id`로 GUI-Owl base/merged model을 로드
+- `--model-id`로 GUI-Owl base/merged model을 daemon에 로드
 - executor endpoint에서 현재 state를 가져옴
 - 다음 step용 raw Python code를 만들어 executor에 보냄
+
+실행 형태는 두 단계입니다.
+- 최초 1회: `computer-use-raw-python-agent --model-id ... --config config/agent.default.json`
+- 이후 반복: `computer-use-raw-python-agent --prompt "..."`
 
 ## transport
 

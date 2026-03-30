@@ -16,7 +16,7 @@ runtime = ["pillow"]
 train = ["accelerate", "bitsandbytes", "datasets", "peft", "pillow", "torch", "torchvision", "transformers"]
 
 [project.scripts]
-computer-use-raw-python-agent = "computer_use_raw_python_agent.service:main"
+computer-use-raw-python-agent = "computer_use_raw_python_agent.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

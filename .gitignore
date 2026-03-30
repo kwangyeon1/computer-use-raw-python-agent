@@ -1,6 +1,31 @@
-.venv/
 __pycache__/
 *.pyc
 .pytest_cache/
 data/
 artifacts/
+
+.venv/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+.vscode/
+.idea/
+.DS_Store
+
+# Project outputs
+data/
+outputs/
+
+# Windows metadata
+*:Zone.Identifier
+# vibe-kit
+.vibe/
+.vibe/db/
+.vibe/reports/
+.vibe/locks/
+.vibe/context/LATEST_CONTEXT.md
+AGENTS.md

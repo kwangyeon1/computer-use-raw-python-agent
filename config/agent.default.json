@@ -1,0 +1,9 @@
+{
+  "endpoint": "http://127.0.0.1:8790",
+  "policy": "policy.unrestricted.local.json",
+  "run_dir": "../data/runs",
+  "max_iterations": 5,
+  "max_new_tokens": 256,
+  "load_request_timeout_s": 120,
+  "run_request_timeout_s": 100
+}

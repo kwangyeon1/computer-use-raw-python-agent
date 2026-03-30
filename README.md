@@ -1,11 +1,12 @@
 # computer-use-raw-python-agent
 
-`GUI-Owl` 같은 비전 모델을 로드하고, executor endpoint에 붙어서
-`현재 화면 + 사용자 프롬프트 + 직전 실행 결과`를 보고 다음 `raw Python` 코드를 생성하는 최소 agent repo입니다.
+`GUI-Owl` 같은 비전 모델을 한 번 로드한 뒤 daemon 형태로 유지하고,
+executor endpoint에 붙어서 `현재 화면 + 사용자 프롬프트 + 직전 실행 결과`를 보고
+다음 `raw Python` 코드를 생성하는 최소 agent repo입니다.
 
 - 역할: loop controller + vision-conditioned raw Python code generator
 - 기본 모델: `../models/gui-owl-1.5-8b-think-base`
-- 입력: `--prompt`, `--policy`, executor state
+- 입력: `--prompt`, config JSON, executor state
 - 출력: next-step Python 코드와 loop artifact
 - executor 연결: `--endpoint` 또는 `--mcp-command`
 
@@ -27,16 +28,43 @@ agent owns prompt and loop
 ```bash
 cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-agent
 
-./.venv/bin/python -m computer_use_raw_python_agent.service \
-  --prompt "Chrome을 열고 북마크 관리자 페이지로 이동해줘" \
-  --run-dir data/runs/bookmarks-loop \
-  --mcp-command /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-executor/.venv/bin/python -m computer_use_raw_python_executor.cli --transport stdio --screenshot-path C:\\path\\to\\current_screen.png \
+./.venv/bin/computer-use-raw-python-agent \
   --model-id /home/kss930/model-projects/gui-owl-8B-think-1.0.0/models/gui-owl-1.5-8b-think-base \
-  --preload
+  --config config/agent.default.json
+```
+
+이후에는 모델이 daemon에 남아 있으므로 prompt만 보내면 됩니다.
+
+```bash
+./.venv/bin/computer-use-raw-python-agent \
+  --prompt "Chrome을 열고 북마크 관리자 페이지로 이동해줘"
+```
+
+첫 `--model-id` 로딩은 시간이 오래 걸릴 수 있습니다. 그래서 timeout은 둘로 나뉩니다.
+- model load/reload: `load_request_timeout_s`
+- prompt 실행: `run_request_timeout_s`
+
+각각 CLI에서 `--load-request-timeout-s`, `--run-request-timeout-s`로 따로 덮어쓸 수 있습니다.
+
+기본 config 예시는 [config/agent.default.json](/home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-agent/config/agent.default.json) 입니다.
+
+```json
+{
+  "endpoint": "http://127.0.0.1:8790",
+  "policy": "policy.unrestricted.local.json",
+  "run_dir": "../data/runs",
+  "max_iterations": 5,
+  "max_new_tokens": 256,
+  "load_request_timeout_s": 1800,
+  "run_request_timeout_s": 900
+}
 ```
 
 ## 남긴 파일
 
+- `src/computer_use_raw_python_agent/cli.py`
+- `src/computer_use_raw_python_agent/daemon.py`
+- `src/computer_use_raw_python_agent/config_utils.py`
 - `src/computer_use_raw_python_agent/service.py`
 - `src/computer_use_raw_python_agent/executor_client.py`
 - `src/computer_use_raw_python_agent/runtime.py`

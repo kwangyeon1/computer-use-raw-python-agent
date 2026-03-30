@@ -49,6 +49,14 @@ def _write_json(path: str | Path, payload: dict[str, Any]) -> None:
     file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def build_executor_client(*, endpoint: str | None, mcp_command: list[str] | None, mcp_cwd: str | None):
+    if bool(endpoint) == bool(mcp_command):
+        raise RuntimeError("provide exactly one of endpoint or mcp_command")
+    if endpoint:
+        return ExecutorHttpClient(endpoint)
+    return ExecutorStdioClient(mcp_command or [], cwd=mcp_cwd)
+
+
 def generate_step_response(
     runtime: GUIOwlRawPythonRuntime,
     request: StepRequest,
@@ -63,7 +71,7 @@ def generate_step_response(
         prompt_bundle=bundle,
         image_path=request.screenshot_path,
         image_bytes=image_bytes,
-        use_blank_image=not bool(request.screenshot_path),
+        use_blank_image=not bool(request.screenshot_path or image_bytes),
         max_new_tokens=max_new_tokens,
     )
     return StepResponse(
@@ -131,19 +139,26 @@ def run_agent_control_loop(
             python_code=response.python_code,
             run_dir=str(step_dir),
             step_id=step_id,
-            metadata={"agent_response": response.to_dict(), "step_index": step_index},
+            metadata={
+                "agent_response": response.to_dict(),
+                "step_index": step_index,
+                "agent_session_id": root.name,
+                "agent_step_dir": str(step_dir),
+            },
         )
         _write_json(root / "responses" / f"{step_id}.executor.json", exec_result)
 
         record = dict(exec_result.get("record", {}))
         last_execution = {
             **record,
-            "stdout_tail": _read_tail(record.get("stdout_path", "")),
-            "stderr_tail": _read_tail(record.get("stderr_path", "")),
+            "stdout_tail": exec_result.get("stdout_tail") or _read_tail(record.get("stdout_path", "")),
+            "stderr_tail": exec_result.get("stderr_tail") or _read_tail(record.get("stderr_path", "")),
         }
         history.append(f"{step_id}_return_code={record.get('return_code', 'unknown')}")
         state = {
             "screenshot_path": exec_result.get("screenshot_path"),
+            "screenshot_base64": exec_result.get("screenshot_base64"),
+            "screenshot_media_type": exec_result.get("screenshot_media_type"),
             "observation_text": exec_result.get("observation_text"),
         }
 
@@ -180,14 +195,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _build_executor_client(args: argparse.Namespace):
-    if bool(args.endpoint) == bool(args.mcp_command):
-        raise SystemExit("provide exactly one of --endpoint or --mcp-command")
-    if args.endpoint:
-        return ExecutorHttpClient(args.endpoint)
-    return ExecutorStdioClient(args.mcp_command, cwd=args.mcp_cwd)
-
-
 def main() -> None:
     args = build_parser().parse_args()
     runtime = GUIOwlRawPythonRuntime(
@@ -201,7 +208,11 @@ def main() -> None:
     )
     if args.preload:
         runtime.ensure_loaded()
-    executor_client = _build_executor_client(args)
+    executor_client = build_executor_client(
+        endpoint=args.endpoint,
+        mcp_command=args.mcp_command,
+        mcp_cwd=args.mcp_cwd,
+    )
     try:
         summary = run_agent_control_loop(
             runtime=runtime,

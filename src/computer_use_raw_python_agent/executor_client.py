@@ -75,8 +75,9 @@ class ExecutorStdioClient:
 
 
 class ExecutorHttpClient:
-    def __init__(self, endpoint: str) -> None:
+    def __init__(self, endpoint: str, timeout_s: float = 600.0) -> None:
         self.endpoint = endpoint.rstrip("/")
+        self.timeout_s = float(timeout_s)
 
     def _rpc(self, payload: dict[str, Any]) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -86,7 +87,7 @@ class ExecutorHttpClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
                 body = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:  # pragma: no cover - networked path
             body = exc.read().decode("utf-8", errors="replace")
