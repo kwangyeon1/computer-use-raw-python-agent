@@ -1,9 +1,7 @@
+# Python cache / env
 __pycache__/
 *.pyc
 .pytest_cache/
-data/
-artifacts/
-
 .venv/
 
 # Packaging
@@ -11,17 +9,22 @@ build/
 dist/
 *.egg-info/
 .eggs/
+pip-wheel-metadata/
 
+# Project outputs
+data/
+artifacts/
+outputs/
+*.log
+
+# Editor / OS metadata
 .vscode/
 .idea/
 .DS_Store
 
-# Project outputs
-data/
-outputs/
-
 # Windows metadata
 *:Zone.Identifier
+
 # vibe-kit
 .vibe/
 .vibe/db/
