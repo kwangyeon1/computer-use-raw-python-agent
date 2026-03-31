@@ -206,8 +206,12 @@ def _handle_run(daemon_state: AgentDaemonState, payload: dict[str, Any]) -> dict
             run_dir=run_dir,
             max_iterations=int(defaults.get("max_iterations", 5)),
             max_new_tokens=int(defaults.get("max_new_tokens", 256)),
-            repeat_code_streak_limit=int(defaults.get("repeat_code_streak_limit", 2)),
-            replan_on_repeated_code=bool(defaults.get("replan_on_repeated_code", False)),
+            strong_visual_grounding=bool(defaults.get("strong_visual_grounding", False)),
+            replan_enabled=bool(defaults.get("replan_enabled", False)),
+            replan_max_attempts=int(defaults.get("replan_max_attempts", 1)),
+            dependency_repair_enabled=bool(defaults.get("dependency_repair_enabled", False)),
+            dependency_repair_max_attempts=int(defaults.get("dependency_repair_max_attempts", 2)),
+            dependency_repair_allow_shell_fallback=bool(defaults.get("dependency_repair_allow_shell_fallback", False)),
         )
     finally:
         daemon_state.phase = "ready"

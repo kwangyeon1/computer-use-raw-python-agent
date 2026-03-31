@@ -21,7 +21,7 @@ def _state_or_empty() -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _build_default_overrides(args: argparse.Namespace, config_defaults: dict) -> dict:
+def _collect_explicit_overrides(args: argparse.Namespace) -> dict:
     overrides = {}
     for key in (
         "endpoint",
@@ -30,8 +30,12 @@ def _build_default_overrides(args: argparse.Namespace, config_defaults: dict) ->
         "policy",
         "max_iterations",
         "max_new_tokens",
-        "repeat_code_streak_limit",
-        "replan_on_repeated_code",
+        "strong_visual_grounding",
+        "replan_enabled",
+        "replan_max_attempts",
+        "dependency_repair_enabled",
+        "dependency_repair_max_attempts",
+        "dependency_repair_allow_shell_fallback",
         "load_request_timeout_s",
         "run_request_timeout_s",
     ):
@@ -40,7 +44,18 @@ def _build_default_overrides(args: argparse.Namespace, config_defaults: dict) ->
             overrides[key] = value
     if args.mcp_command:
         overrides["mcp_command"] = list(args.mcp_command)
-    return {**config_defaults, **overrides}
+    return overrides
+
+
+def _build_default_overrides(args: argparse.Namespace, config_defaults: dict) -> dict:
+    return {**config_defaults, **_collect_explicit_overrides(args)}
+
+
+def _build_run_overrides(args: argparse.Namespace, config_defaults: dict) -> dict:
+    explicit_overrides = _collect_explicit_overrides(args)
+    if args.model_id or args.config:
+        return {**config_defaults, **explicit_overrides}
+    return explicit_overrides
 
 
 def _ensure_daemon_started() -> None:
@@ -94,7 +109,7 @@ def cmd_stop(_: argparse.Namespace) -> int:
 
 def cmd_main(args: argparse.Namespace) -> int:
     config_defaults, config_path = load_agent_config(args.config)
-    overrides = _build_default_overrides(args, config_defaults)
+    default_overrides = _build_default_overrides(args, config_defaults)
 
     if args.model_id:
         _ensure_daemon_started()
@@ -107,9 +122,9 @@ def cmd_main(args: argparse.Namespace) -> int:
                 "device_map": args.device_map,
                 "disable_4bit": args.disable_4bit,
                 "disable_cpu_offload": args.disable_cpu_offload,
-                "defaults": overrides,
+                "defaults": default_overrides,
             },
-            timeout_s=_resolve_load_timeout(args, overrides),
+            timeout_s=_resolve_load_timeout(args, default_overrides),
         )
         if not response.get("ok", False):
             raise SystemExit(response.get("error", "agent reload failed"))
@@ -130,13 +145,14 @@ def cmd_main(args: argparse.Namespace) -> int:
     if args.prompt:
         if not daemon_is_responding():
             raise SystemExit("agent daemon is not running; start it once with --model-id")
+        run_overrides = _build_run_overrides(args, config_defaults)
         response = _send_request(
             {
                 "action": "run",
                 "prompt": args.prompt,
-                "overrides": overrides,
+                "overrides": run_overrides,
             },
-            timeout_s=_resolve_run_timeout(args, overrides),
+            timeout_s=_resolve_run_timeout(args, run_overrides),
         )
         if not response.get("ok", False):
             raise SystemExit(response.get("error", "agent run failed"))
@@ -163,8 +179,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcp-cwd")
     parser.add_argument("--max-iterations", type=int)
     parser.add_argument("--max-new-tokens", type=int)
-    parser.add_argument("--repeat-code-streak-limit", type=int)
-    parser.add_argument("--replan-on-repeated-code", action="store_true", default=None)
+    parser.add_argument("--strong-visual-grounding", action="store_true", default=None)
+    parser.add_argument("--replan-enabled", action="store_true", default=None)
+    parser.add_argument("--replan-max-attempts", type=int)
+    parser.add_argument("--dependency-repair-enabled", action="store_true", default=None)
+    parser.add_argument("--dependency-repair-max-attempts", type=int)
+    parser.add_argument("--dependency-repair-allow-shell-fallback", action="store_true", default=None)
     parser.add_argument("--compute-dtype", default="bfloat16")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--disable-4bit", action="store_true")

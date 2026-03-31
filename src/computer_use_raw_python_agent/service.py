@@ -61,6 +61,22 @@ def _code_fingerprint(code: str) -> str:
     return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
 
 
+def _is_empty_python_code(code: str) -> bool:
+    return not bool(_normalize_python_code(code))
+
+
+def _state_visual_hash(state: dict[str, Any]) -> str | None:
+    screenshot_base64 = str(state.get("screenshot_base64") or "").strip()
+    if screenshot_base64:
+        return hashlib.sha1(screenshot_base64.encode("utf-8")).hexdigest()[:12]
+    screenshot_path = str(state.get("screenshot_path") or "").strip()
+    if screenshot_path:
+        path = Path(screenshot_path)
+        if path.exists() and path.is_file():
+            return hashlib.sha1(path.read_bytes()).hexdigest()[:12]
+    return None
+
+
 def build_executor_client(*, endpoint: str | None, mcp_command: list[str] | None, mcp_cwd: str | None):
     if bool(endpoint) == bool(mcp_command):
         raise RuntimeError("provide exactly one of endpoint or mcp_command")
@@ -96,6 +112,175 @@ def generate_step_response(
     )
 
 
+def _extract_last_execution(exec_result: dict[str, Any]) -> dict[str, Any]:
+    record = dict(exec_result.get("record", {}))
+    return {
+        **record,
+        "stdout_tail": exec_result.get("stdout_tail") or _read_tail(record.get("stdout_path", "")),
+        "stderr_tail": exec_result.get("stderr_tail") or _read_tail(record.get("stderr_path", "")),
+        "error_info": exec_result.get("error_info"),
+    }
+
+
+def _extract_state(exec_result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "screenshot_path": exec_result.get("screenshot_path"),
+        "screenshot_base64": exec_result.get("screenshot_base64"),
+        "screenshot_media_type": exec_result.get("screenshot_media_type"),
+        "observation_text": exec_result.get("observation_text"),
+    }
+
+
+def _execute_code_step(
+    *,
+    executor_client,
+    root: Path,
+    step_id: str,
+    python_code: str,
+    metadata: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    step_dir = root / "steps" / step_id
+    exec_result = executor_client.execute(
+        python_code=python_code,
+        run_dir=str(step_dir),
+        step_id=step_id,
+        metadata=metadata,
+    )
+    _write_json(root / "responses" / f"{step_id}.executor.json", exec_result)
+    return exec_result, _extract_last_execution(exec_result), _extract_state(exec_result)
+
+
+def _attempt_dependency_repair(
+    *,
+    runtime: GUIOwlRawPythonRuntime,
+    executor_client,
+    root: Path,
+    user_prompt: str,
+    policy: dict[str, Any],
+    strong_visual_grounding: bool,
+    state: dict[str, Any],
+    history: list[str],
+    last_execution: dict[str, Any],
+    original_response: StepResponse,
+    original_step_id: str,
+    step_index: int,
+    max_new_tokens: int,
+    repair_attempt_index: int,
+    allow_shell_fallback: bool,
+) -> dict[str, Any]:
+    error_info = dict(last_execution.get("error_info") or {})
+    install_name = str(error_info.get("install_name") or error_info.get("module_name") or "").strip()
+    if not install_name:
+        return {"handled": False}
+
+    strategies = ["pip_install"]
+    if allow_shell_fallback:
+        strategies.append("shell_fallback")
+    executions_added = 0
+
+    for strategy_index, strategy in enumerate(strategies):
+        repair_request = StepRequest(
+            user_prompt=user_prompt,
+            policy=policy,
+            request_kind="dependency_repair",
+            repair_context={
+                "reason": "missing_python_module",
+                "module_name": error_info.get("module_name"),
+                "install_name": install_name,
+                "repair_strategy": strategy,
+                "repair_attempt_index": repair_attempt_index,
+                "failed_python_code": original_response.python_code,
+                "failed_step_id": original_step_id,
+                "stderr_tail": last_execution.get("stderr_tail"),
+            },
+            strong_visual_grounding=strong_visual_grounding,
+            screenshot_path=state.get("screenshot_path"),
+            screenshot_base64=state.get("screenshot_base64"),
+            screenshot_media_type=state.get("screenshot_media_type"),
+            observation_text=state.get("observation_text"),
+            recent_history=list(history),
+            last_execution=last_execution,
+            step_index=step_index,
+        )
+        repair_request_name = f"{original_step_id}.repair-{repair_attempt_index:02d}-{strategy_index:02d}"
+        _write_json(root / "payloads" / f"{repair_request_name}.request.json", repair_request.to_dict())
+        repair_response = generate_step_response(runtime, repair_request, max_new_tokens=max_new_tokens)
+        repair_response.notes.append("dependency_repair_mode=true")
+        repair_response.notes.append(f"dependency_repair_strategy={strategy}")
+        _write_json(root / "responses" / f"{repair_request_name}.response.json", repair_response.to_dict())
+
+        repair_exec_result, repair_last_execution, repair_state = _execute_code_step(
+            executor_client=executor_client,
+            root=root,
+            step_id=repair_request_name,
+            python_code=repair_response.python_code,
+            metadata={
+                "agent_response": repair_response.to_dict(),
+                "repair_context": repair_request.repair_context,
+                "step_index": step_index,
+                "agent_session_id": root.name,
+                "agent_step_dir": str(root / "steps" / repair_request_name),
+            },
+        )
+        executions_added += 1
+        history.append(f"{repair_request_name}_return_code={repair_last_execution.get('return_code', 'unknown')}")
+        history.append(f"{repair_request_name}_repair_strategy={strategy}")
+
+        if int(repair_last_execution.get("return_code", 1)) != 0:
+            last_execution = repair_last_execution
+            state = repair_state
+            continue
+
+        retry_step_id = f"{original_step_id}.retry-{repair_attempt_index:02d}-{strategy_index:02d}"
+        retry_exec_result, retry_last_execution, retry_state = _execute_code_step(
+            executor_client=executor_client,
+            root=root,
+            step_id=retry_step_id,
+            python_code=original_response.python_code,
+            metadata={
+                "agent_response": original_response.to_dict(),
+                "dependency_repair_retry": True,
+                "repair_context": repair_request.repair_context,
+                "step_index": step_index,
+                "agent_session_id": root.name,
+                "agent_step_dir": str(root / "steps" / retry_step_id),
+            },
+        )
+        executions_added += 1
+        history.append(f"{retry_step_id}_return_code={retry_last_execution.get('return_code', 'unknown')}")
+        history.append(f"{retry_step_id}_code_fingerprint={_code_fingerprint(original_response.python_code)}")
+
+        retry_error_info = dict(retry_last_execution.get("error_info") or {})
+        if int(retry_last_execution.get("return_code", 1)) == 0:
+            return {
+                "handled": True,
+                "success": True,
+                "executions_added": executions_added,
+                "repair_response": repair_response.to_dict(),
+                "last_execution": retry_last_execution,
+                "state": retry_state,
+            }
+        if retry_error_info.get("kind") != "missing_python_module":
+            return {
+                "handled": True,
+                "success": False,
+                "executions_added": executions_added,
+                "repair_response": repair_response.to_dict(),
+                "last_execution": retry_last_execution,
+                "state": retry_state,
+            }
+        last_execution = retry_last_execution
+        state = retry_state
+
+    return {
+        "handled": True,
+        "success": False,
+        "executions_added": executions_added,
+        "last_execution": last_execution,
+        "state": state,
+    }
+
+
 def run_agent_control_loop(
     *,
     runtime: GUIOwlRawPythonRuntime,
@@ -105,8 +290,12 @@ def run_agent_control_loop(
     run_dir: str | Path,
     max_iterations: int,
     max_new_tokens: int,
-    repeat_code_streak_limit: int = 2,
-    replan_on_repeated_code: bool = False,
+    strong_visual_grounding: bool = False,
+    replan_enabled: bool = False,
+    replan_max_attempts: int = 1,
+    dependency_repair_enabled: bool = False,
+    dependency_repair_max_attempts: int = 2,
+    dependency_repair_allow_shell_fallback: bool = False,
 ) -> dict[str, Any]:
     root = _ensure_run_dir(run_dir)
     (root / "payloads").mkdir(exist_ok=True)
@@ -129,14 +318,22 @@ def run_agent_control_loop(
     generated_steps = 0
     executed_steps = 0
     stopped_reason: str | None = None
-    previous_code: str | None = None
-    repeated_code_streak = 0
+    previous_executed_code: str | None = None
+    previous_visual_hash = _state_visual_hash(state)
+    pending_replan_reasons: list[str] = []
     replans_used = 0
+    dependency_repairs_used = 0
+    empty_generation_retries_used = 0
 
     for step_index in range(max_iterations):
+        active_replan_reasons = list(pending_replan_reasons)
+        pending_replan_reasons = []
         request = StepRequest(
             user_prompt=user_prompt,
             policy=policy,
+            replan_requested=bool(active_replan_reasons),
+            replan_reasons=active_replan_reasons,
+            strong_visual_grounding=strong_visual_grounding,
             screenshot_path=state.get("screenshot_path"),
             screenshot_base64=state.get("screenshot_base64"),
             screenshot_media_type=state.get("screenshot_media_type"),
@@ -151,67 +348,134 @@ def run_agent_control_loop(
         response = generate_step_response(runtime, request, max_new_tokens=max_new_tokens)
         generated_steps += 1
         normalized_code = _normalize_python_code(response.python_code)
-        if normalized_code and normalized_code == previous_code:
-            repeated_code_streak += 1
-        else:
-            repeated_code_streak = 1 if normalized_code else 0
-        previous_code = normalized_code
-        response.notes.append(f"code_fingerprint={_code_fingerprint(response.python_code)}")
-        response.notes.append(f"code_repeat_streak={repeated_code_streak}")
-        final_response = response.to_dict()
         response_path = root / "responses" / f"step-{step_index:03d}.response.json"
+        if _is_empty_python_code(response.python_code):
+            empty_attempt_path = root / "responses" / f"step-{step_index:03d}.empty-attempt-00.response.json"
+            response.notes.append("empty_generation_detected")
+            _write_json(empty_attempt_path, response.to_dict())
+            retry_history = list(history)
+            retry_history.append(f"step-{step_index:03d}_empty_generation=1")
+            retry_history.append("system_hint=previous model output was empty; return non-empty executable Python only")
+            retry_request = StepRequest(
+                user_prompt=user_prompt,
+                policy=policy,
+                replan_requested=bool(active_replan_reasons),
+                replan_reasons=active_replan_reasons,
+                strong_visual_grounding=strong_visual_grounding,
+                screenshot_path=state.get("screenshot_path"),
+                screenshot_base64=state.get("screenshot_base64"),
+                screenshot_media_type=state.get("screenshot_media_type"),
+                observation_text=state.get("observation_text"),
+                recent_history=retry_history,
+                last_execution=last_execution,
+                step_index=step_index,
+            )
+            retry_request_path = root / "payloads" / f"step-{step_index:03d}.empty-retry-00.request.json"
+            _write_json(retry_request_path, retry_request.to_dict())
+            retry_response = generate_step_response(runtime, retry_request, max_new_tokens=max_new_tokens)
+            generated_steps += 1
+            empty_generation_retries_used += 1
+            retry_response.notes.append("retry_due_to_empty_generation")
+            retry_normalized_code = _normalize_python_code(retry_response.python_code)
+            retry_response_path = root / "responses" / f"step-{step_index:03d}.empty-retry-00.response.json"
+            _write_json(retry_response_path, retry_response.to_dict())
+            if _is_empty_python_code(retry_response.python_code):
+                retry_response.notes.append("stopped_due_to_empty_generation")
+                final_response = retry_response.to_dict()
+                _write_json(retry_response_path, retry_response.to_dict())
+                _write_json(response_path, retry_response.to_dict())
+                stopped_reason = "empty_generation"
+                history.append(f"step-{step_index:03d}_stopped=empty_generation")
+                break
+            response = retry_response
+            normalized_code = retry_normalized_code
+
+        response.notes.append(f"code_fingerprint={_code_fingerprint(response.python_code)}")
+        final_response = response.to_dict()
         _write_json(response_path, response.to_dict())
 
-        if repeat_code_streak_limit > 0 and repeated_code_streak >= repeat_code_streak_limit:
-            if replan_on_repeated_code and replans_used == 0:
-                replans_used += 1
-                repeated_code_streak = 0
-                response.notes.append("replan_requested_due_to_repeated_code")
-                final_response = response.to_dict()
-                _write_json(response_path, response.to_dict())
-                history.append(f"step-{step_index:03d}_replan_requested=repeated_code")
-                history.append("system_hint=previous python code repeated; generate different code")
-                continue
-            stopped_reason = "repeated_code"
-            response.notes.append("stopped_due_to_repeated_code")
-            final_response = response.to_dict()
-            _write_json(response_path, response.to_dict())
-            history.append(f"step-{step_index:03d}_stopped=repeated_code")
-            break
-
         step_id = f"step-{step_index:03d}"
-        step_dir = root / "steps" / step_id
-        exec_result = executor_client.execute(
-            python_code=response.python_code,
-            run_dir=str(step_dir),
+        _, last_execution, state = _execute_code_step(
+            executor_client=executor_client,
+            root=root,
             step_id=step_id,
+            python_code=response.python_code,
             metadata={
                 "agent_response": response.to_dict(),
                 "step_index": step_index,
                 "agent_session_id": root.name,
-                "agent_step_dir": str(step_dir),
+                "agent_step_dir": str(root / "steps" / step_id),
             },
         )
-        _write_json(root / "responses" / f"{step_id}.executor.json", exec_result)
-
-        record = dict(exec_result.get("record", {}))
         executed_steps += 1
-        last_execution = {
-            **record,
-            "stdout_tail": exec_result.get("stdout_tail") or _read_tail(record.get("stdout_path", "")),
-            "stderr_tail": exec_result.get("stderr_tail") or _read_tail(record.get("stderr_path", "")),
-        }
-        history.append(f"{step_id}_return_code={record.get('return_code', 'unknown')}")
+        history.append(f"{step_id}_return_code={last_execution.get('return_code', 'unknown')}")
         history.append(f"{step_id}_code_fingerprint={_code_fingerprint(response.python_code)}")
-        state = {
-            "screenshot_path": exec_result.get("screenshot_path"),
-            "screenshot_base64": exec_result.get("screenshot_base64"),
-            "screenshot_media_type": exec_result.get("screenshot_media_type"),
-            "observation_text": exec_result.get("observation_text"),
-        }
+
+        error_info = dict(last_execution.get("error_info") or {})
+        repairable_missing_module = (
+            dependency_repair_enabled
+            and bool(policy.get("allow_package_install", False))
+            and dependency_repairs_used < dependency_repair_max_attempts
+            and error_info.get("kind") == "missing_python_module"
+            and bool(error_info.get("repairable", False))
+        )
+        if repairable_missing_module:
+            repair_attempt_index = dependency_repairs_used
+            dependency_repairs_used += 1
+            repair_result = _attempt_dependency_repair(
+                runtime=runtime,
+                executor_client=executor_client,
+                root=root,
+                user_prompt=user_prompt,
+                policy=policy,
+                strong_visual_grounding=strong_visual_grounding,
+                state=state,
+                history=history,
+                last_execution=last_execution,
+                original_response=response,
+                original_step_id=step_id,
+                step_index=step_index,
+                max_new_tokens=max_new_tokens,
+                repair_attempt_index=repair_attempt_index,
+                allow_shell_fallback=dependency_repair_allow_shell_fallback,
+            )
+            executed_steps += int(repair_result.get("executions_added", 0))
+            if repair_result.get("handled"):
+                last_execution = dict(repair_result.get("last_execution") or last_execution)
+                state = dict(repair_result.get("state") or state)
+
+        current_visual_hash = _state_visual_hash(state)
+        replan_reasons: list[str] = []
+        if previous_executed_code and normalized_code and normalized_code == previous_executed_code:
+            replan_reasons.append("repeated_code_execution")
+        dependency_error_handled = repairable_missing_module and dependency_repairs_used > repair_attempt_index if repairable_missing_module else False
+        if int(last_execution.get("return_code", 0) or 0) != 0 and not dependency_error_handled:
+            replan_reasons.append("execution_error")
+        if previous_visual_hash and current_visual_hash and previous_visual_hash == current_visual_hash:
+            replan_reasons.append("no_visual_change")
+        previous_executed_code = normalized_code or previous_executed_code
+        previous_visual_hash = current_visual_hash
+
+        if (
+            replan_enabled
+            and replan_reasons
+            and replans_used < replan_max_attempts
+            and step_index + 1 < max_iterations
+        ):
+            unique_reasons = list(dict.fromkeys(replan_reasons))
+            replans_used += 1
+            pending_replan_reasons = unique_reasons
+            response.notes.append(f"replan_reasons={','.join(unique_reasons)}")
+            final_response = response.to_dict()
+            _write_json(response_path, response.to_dict())
+            history.append(f"{step_id}_replan_requested={','.join(unique_reasons)}")
+            history.append("system_hint=previous attempt repeated, failed, or did not visibly change the UI; generate a materially different next Python step")
 
         if response.done:
             break
+    else:
+        if stopped_reason is None and final_response and not bool(final_response.get("done", False)):
+            stopped_reason = "max_iterations_reached"
 
     summary = {
         "run_dir": str(root),
@@ -220,10 +484,16 @@ def run_agent_control_loop(
         "last_execution": last_execution,
         "final_response": final_response,
         "stopped_reason": stopped_reason,
-        "repeat_code_streak_limit": repeat_code_streak_limit,
-        "replan_on_repeated_code": replan_on_repeated_code,
+        "strong_visual_grounding": strong_visual_grounding,
+        "replan_enabled": replan_enabled,
+        "replan_max_attempts": replan_max_attempts,
         "replans_used": replans_used,
-        "repeat_code_streak": repeated_code_streak,
+        "pending_replan_reasons": pending_replan_reasons,
+        "empty_generation_retries_used": empty_generation_retries_used,
+        "dependency_repair_enabled": dependency_repair_enabled,
+        "dependency_repair_max_attempts": dependency_repair_max_attempts,
+        "dependency_repair_allow_shell_fallback": dependency_repair_allow_shell_fallback,
+        "dependency_repairs_used": dependency_repairs_used,
     }
     _write_json(root / "loop-summary.json", summary)
     return summary
@@ -241,8 +511,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--processor-id")
     parser.add_argument("--max-iterations", type=int, default=5)
     parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--repeat-code-streak-limit", type=int, default=2)
-    parser.add_argument("--replan-on-repeated-code", action="store_true")
+    parser.add_argument("--strong-visual-grounding", action="store_true")
+    parser.add_argument("--replan-enabled", action="store_true")
+    parser.add_argument("--replan-max-attempts", type=int, default=1)
+    parser.add_argument("--dependency-repair-enabled", action="store_true")
+    parser.add_argument("--dependency-repair-max-attempts", type=int, default=2)
+    parser.add_argument("--dependency-repair-allow-shell-fallback", action="store_true")
     parser.add_argument("--compute-dtype", default="bfloat16")
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--disable-4bit", action="store_true")
@@ -278,8 +552,12 @@ def main() -> None:
             run_dir=args.run_dir,
             max_iterations=args.max_iterations,
             max_new_tokens=args.max_new_tokens,
-            repeat_code_streak_limit=args.repeat_code_streak_limit,
-            replan_on_repeated_code=args.replan_on_repeated_code,
+            strong_visual_grounding=args.strong_visual_grounding,
+            replan_enabled=args.replan_enabled,
+            replan_max_attempts=args.replan_max_attempts,
+            dependency_repair_enabled=args.dependency_repair_enabled,
+            dependency_repair_max_attempts=args.dependency_repair_max_attempts,
+            dependency_repair_allow_shell_fallback=args.dependency_repair_allow_shell_fallback,
         )
     finally:
         executor_client.close()

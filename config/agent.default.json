@@ -4,8 +4,12 @@
   "run_dir": "../data/runs",
   "max_iterations": 5,
   "max_new_tokens": 256,
-  "repeat_code_streak_limit": 2,
-  "replan_on_repeated_code": true,
+  "strong_visual_grounding": false,
+  "replan_enabled": false,
+  "replan_max_attempts": 1,
+  "dependency_repair_enabled": false,
+  "dependency_repair_max_attempts": 2,
+  "dependency_repair_allow_shell_fallback": false,
   "load_request_timeout_s": 120,
   "run_request_timeout_s": 100
 }

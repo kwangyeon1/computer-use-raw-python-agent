@@ -36,10 +36,18 @@ def load_agent_config(path: str | None) -> tuple[dict[str, Any], Path | None]:
         normalized["max_iterations"] = int(data["max_iterations"])
     if "max_new_tokens" in data:
         normalized["max_new_tokens"] = int(data["max_new_tokens"])
-    if "repeat_code_streak_limit" in data:
-        normalized["repeat_code_streak_limit"] = int(data["repeat_code_streak_limit"])
-    if "replan_on_repeated_code" in data:
-        normalized["replan_on_repeated_code"] = bool(data["replan_on_repeated_code"])
+    if "strong_visual_grounding" in data:
+        normalized["strong_visual_grounding"] = bool(data["strong_visual_grounding"])
+    if "replan_enabled" in data:
+        normalized["replan_enabled"] = bool(data["replan_enabled"])
+    if "replan_max_attempts" in data:
+        normalized["replan_max_attempts"] = int(data["replan_max_attempts"])
+    if "dependency_repair_enabled" in data:
+        normalized["dependency_repair_enabled"] = bool(data["dependency_repair_enabled"])
+    if "dependency_repair_max_attempts" in data:
+        normalized["dependency_repair_max_attempts"] = int(data["dependency_repair_max_attempts"])
+    if "dependency_repair_allow_shell_fallback" in data:
+        normalized["dependency_repair_allow_shell_fallback"] = bool(data["dependency_repair_allow_shell_fallback"])
     if "load_request_timeout_s" in data:
         normalized["load_request_timeout_s"] = float(data["load_request_timeout_s"])
     if "run_request_timeout_s" in data:

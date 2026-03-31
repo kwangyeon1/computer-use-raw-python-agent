@@ -16,13 +16,21 @@ _DEFAULT_BLANK_IMAGE_COLOR = (255, 255, 255)
 
 
 def extract_python_code(text: str) -> str:
+    stripped = text.strip()
     fenced = re.search(r"```python\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
     if fenced:
         return fenced.group(1).strip()
     generic = re.search(r"```\s*(.*?)```", text, flags=re.DOTALL)
     if generic:
         return generic.group(1).strip()
-    return text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+    return stripped
 
 
 class GUIOwlRawPythonRuntime:

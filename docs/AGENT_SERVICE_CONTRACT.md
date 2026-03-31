@@ -48,6 +48,14 @@
   "policy": {
     "policy_name": "unrestricted_local"
   },
+  "request_kind": "task_step",
+  "repair_context": null,
+  "replan_requested": true,
+  "replan_reasons": [
+    "repeated_code_execution",
+    "no_visual_change"
+  ],
+  "strong_visual_grounding": false,
   "screenshot_path": "C:/runs/current.png",
   "screenshot_base64": "<base64 png bytes>",
   "screenshot_media_type": "image/png",
@@ -86,6 +94,9 @@
     "step_id": "step-001",
     "return_code": 0
   },
+  "stdout_tail": "",
+  "stderr_tail": "",
+  "error_info": null,
   "screenshot_path": "C:/runs/current.png",
   "screenshot_base64": "<base64 png bytes>",
   "screenshot_media_type": "image/png",

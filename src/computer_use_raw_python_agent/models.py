@@ -38,7 +38,11 @@ class PromptBundle:
     session_prompt: str
     policy: dict[str, Any]
     observation_text: str | None = None
+    last_execution: dict[str, Any] = field(default_factory=dict)
+    stderr_tail: str | None = None
     recent_history: list[str] = field(default_factory=list)
+    replan_requested: bool = False
+    replan_reasons: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -61,6 +65,11 @@ class GeneratedCode:
 class StepRequest:
     user_prompt: str
     policy: dict[str, Any] = field(default_factory=dict)
+    request_kind: str = "task_step"
+    repair_context: dict[str, Any] = field(default_factory=dict)
+    replan_requested: bool = False
+    replan_reasons: list[str] = field(default_factory=list)
+    strong_visual_grounding: bool = False
     screenshot_path: str | None = None
     screenshot_base64: str | None = None
     screenshot_media_type: str | None = None
@@ -74,6 +83,11 @@ class StepRequest:
         return cls(
             user_prompt=str(data["user_prompt"]),
             policy=dict(data.get("policy", {})),
+            request_kind=str(data.get("request_kind", "task_step")),
+            repair_context=dict(data.get("repair_context", {})),
+            replan_requested=bool(data.get("replan_requested", False)),
+            replan_reasons=[str(item) for item in data.get("replan_reasons", [])],
+            strong_visual_grounding=bool(data.get("strong_visual_grounding", False)),
             screenshot_path=data.get("screenshot_path"),
             screenshot_base64=data.get("screenshot_base64"),
             screenshot_media_type=data.get("screenshot_media_type"),

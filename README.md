@@ -55,19 +55,40 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-ag
   "run_dir": "../data/runs",
   "max_iterations": 5,
   "max_new_tokens": 256,
-  "repeat_code_streak_limit": 2,
-  "replan_on_repeated_code": false,
+  "strong_visual_grounding": false,
+  "replan_enabled": false,
+  "replan_max_attempts": 1,
+  "dependency_repair_enabled": false,
+  "dependency_repair_max_attempts": 2,
+  "dependency_repair_allow_shell_fallback": false,
   "load_request_timeout_s": 120,
   "run_request_timeout_s": 100
 }
 ```
 
-같은 Python 코드가 연속으로 생성되면 `repeat_code_streak_limit`에 따라 처리합니다.
-- 기본값: `replan_on_repeated_code = false`
-  - 바로 종료하고 summary에 `stopped_reason: "repeated_code"`를 남깁니다.
-- `replan_on_repeated_code = true` 또는 `--replan-on-repeated-code`
-  - 반복 코드가 감지됐을 때 한 번만 실행 없이 재생성 기회를 줍니다.
-  - 그 뒤에도 반복되면 종료합니다.
+시각 grounding 강제는 옵션으로만 켤 수 있습니다.
+- 기본값: `strong_visual_grounding = false`
+- `strong_visual_grounding = true` 또는 `--strong-visual-grounding`
+  - system/user prompt에 현재 스크린샷을 1차 근거로 사용하라는 규칙을 추가합니다.
+  - 같은 사용자 요청만 반복적으로 따르기보다, 현재 화면 변화와 최근 실행 결과를 더 강하게 반영하도록 유도합니다.
+
+`replan_enabled`를 켜면 agent는 다음 조건에서 새 전략을 유도합니다.
+- 직전과 같은 Python 코드가 다시 실행됨
+- dependency repair 대상이 아닌 실행 오류가 발생함
+- 최신 스크린샷 해시가 직전과 같아서 화면 변화가 없음
+
+`replan_max_attempts`는 세션당 이 재계획 유도 신호를 몇 번까지 보낼지 정합니다.
+
+의존성 자동 복구도 옵션으로만 켤 수 있습니다.
+- 기본값: `dependency_repair_enabled = false`
+- `dependency_repair_enabled = true` 또는 `--dependency-repair-enabled`
+  - executor가 `ModuleNotFoundError: No module named '...'`를 정확히 분류했을 때만 복구 모드를 탑니다.
+  - agent는 먼저 pip 기반 복구 코드를 생성합니다.
+  - 복구 성공 시 원래 작업 코드를 1회 자동 재실행합니다.
+- `dependency_repair_max_attempts`
+  - 세션당 자동 복구 최대 시도 횟수입니다.
+- `dependency_repair_allow_shell_fallback = true` 또는 `--dependency-repair-allow-shell-fallback`
+  - pip 기반 복구 뒤에도 필요하면 subprocess 기반 shell/batch 설치 경로를 한 번 더 시도할 수 있게 합니다.
 
 ## 남긴 파일
 
