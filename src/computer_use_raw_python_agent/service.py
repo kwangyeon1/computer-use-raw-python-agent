@@ -65,6 +65,30 @@ def _is_empty_python_code(code: str) -> bool:
     return not bool(_normalize_python_code(code))
 
 
+def _tail_history(history: list[str], *, limit: int = 2) -> list[str]:
+    if limit <= 0:
+        return []
+    return list(history[-limit:])
+
+
+def _history_for_step(history: list[str]) -> list[str]:
+    return _tail_history(history, limit=2)
+
+
+def _history_for_empty_retry(history: list[str], *, step_index: int) -> list[str]:
+    retry_history = _history_for_step(history)
+    retry_history.append(f"step-{step_index:03d}_empty_generation=1")
+    retry_history.append("system_hint=previous model output was empty; return non-empty executable Python only")
+    return retry_history
+
+
+def _history_for_dependency_repair(history: list[str], *, failed_step_id: str) -> list[str]:
+    failed_step_history = [entry for entry in history if entry.startswith(f"{failed_step_id}_")]
+    if not failed_step_history:
+        return _history_for_step(history)
+    return failed_step_history[-2:]
+
+
 def _state_visual_hash(state: dict[str, Any]) -> str | None:
     screenshot_base64 = str(state.get("screenshot_base64") or "").strip()
     if screenshot_base64:
@@ -198,7 +222,7 @@ def _attempt_dependency_repair(
             screenshot_base64=state.get("screenshot_base64"),
             screenshot_media_type=state.get("screenshot_media_type"),
             observation_text=state.get("observation_text"),
-            recent_history=list(history),
+            recent_history=_history_for_dependency_repair(history, failed_step_id=original_step_id),
             last_execution=last_execution,
             step_index=step_index,
         )
@@ -338,7 +362,7 @@ def run_agent_control_loop(
             screenshot_base64=state.get("screenshot_base64"),
             screenshot_media_type=state.get("screenshot_media_type"),
             observation_text=state.get("observation_text"),
-            recent_history=history,
+            recent_history=_history_for_step(history),
             last_execution=last_execution,
             step_index=step_index,
         )
@@ -353,9 +377,6 @@ def run_agent_control_loop(
             empty_attempt_path = root / "responses" / f"step-{step_index:03d}.empty-attempt-00.response.json"
             response.notes.append("empty_generation_detected")
             _write_json(empty_attempt_path, response.to_dict())
-            retry_history = list(history)
-            retry_history.append(f"step-{step_index:03d}_empty_generation=1")
-            retry_history.append("system_hint=previous model output was empty; return non-empty executable Python only")
             retry_request = StepRequest(
                 user_prompt=user_prompt,
                 policy=policy,
@@ -366,7 +387,7 @@ def run_agent_control_loop(
                 screenshot_base64=state.get("screenshot_base64"),
                 screenshot_media_type=state.get("screenshot_media_type"),
                 observation_text=state.get("observation_text"),
-                recent_history=retry_history,
+                recent_history=_history_for_empty_retry(history, step_index=step_index),
                 last_execution=last_execution,
                 step_index=step_index,
             )

@@ -1,0 +1,15 @@
+{
+  "endpoint": "http://127.0.0.1:8790",
+  "policy": "policy.unrestricted.local.json",
+  "run_dir": "../data/runs-qwen35",
+  "max_iterations": 5,
+  "max_new_tokens": 1024,
+  "strong_visual_grounding": true,
+  "replan_enabled": true,
+  "replan_max_attempts": 1,
+  "dependency_repair_enabled": true,
+  "dependency_repair_max_attempts": 2,
+  "dependency_repair_allow_shell_fallback": false,
+  "load_request_timeout_s": 120,
+  "run_request_timeout_s": 120
+}
