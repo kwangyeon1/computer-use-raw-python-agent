@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
+import time
 
 from .config_utils import load_agent_config
 from .daemon import (
@@ -99,11 +102,26 @@ def cmd_status(_: argparse.Namespace) -> int:
 
 
 def cmd_stop(_: argparse.Namespace) -> int:
-    if not daemon_is_responding():
+    if daemon_is_responding():
+        response = _send_request({"action": "shutdown"})
+        print(json.dumps(response, ensure_ascii=False, indent=2))
+        return 0
+    state = _state_or_empty()
+    pid = state.get("pid")
+    if not (isinstance(pid, int) and daemon_process_alive()):
         print(json.dumps({"running": False}, ensure_ascii=False, indent=2))
         return 0
-    response = _send_request({"action": "shutdown"})
-    print(json.dumps(response, ensure_ascii=False, indent=2))
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not daemon_process_alive():
+            daemon_state_path().unlink(missing_ok=True)
+            print(json.dumps({"ok": True, "forced": True, "pid": pid}, ensure_ascii=False, indent=2))
+            return 0
+        time.sleep(0.05)
+    os.kill(pid, signal.SIGKILL)
+    daemon_state_path().unlink(missing_ok=True)
+    print(json.dumps({"ok": True, "forced": True, "signal": "SIGKILL", "pid": pid}, ensure_ascii=False, indent=2))
     return 0
 
 

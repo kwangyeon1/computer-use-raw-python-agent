@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 
 from .config_utils import load_policy_from_path
@@ -268,21 +269,31 @@ def _serve() -> int:
             for request_path in sorted(requests_dir.glob("*.json")):
                 handled_any = True
                 response_path = responses_dir / request_path.name
-                payload = json.loads(request_path.read_text(encoding="utf-8"))
-                action = payload.get("action")
-                if action == "status":
-                    response = {"ok": True, "status": daemon_state.to_public_dict()}
-                elif action == "reload":
-                    response = _handle_reload(daemon_state, payload)
-                elif action == "run":
-                    response = _handle_run(daemon_state, payload)
-                elif action == "shutdown":
-                    response = {"ok": True}
-                    response_path.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
-                    request_path.unlink(missing_ok=True)
-                    return 0
-                else:
-                    response = {"ok": False, "error": f"unknown action: {action!r}"}
+                try:
+                    payload = json.loads(request_path.read_text(encoding="utf-8"))
+                    action = payload.get("action")
+                    if action == "status":
+                        response = {"ok": True, "status": daemon_state.to_public_dict()}
+                    elif action == "reload":
+                        response = _handle_reload(daemon_state, payload)
+                    elif action == "run":
+                        response = _handle_run(daemon_state, payload)
+                    elif action == "shutdown":
+                        response = {"ok": True}
+                        response_path.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
+                        request_path.unlink(missing_ok=True)
+                        return 0
+                    else:
+                        response = {"ok": False, "error": f"unknown action: {action!r}"}
+                except Exception as exc:  # pragma: no cover - daemon safety path
+                    daemon_state.phase = "ready"
+                    _write_state_file(os.getpid(), daemon_state.to_public_dict())
+                    response = {
+                        "ok": False,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                        "traceback": traceback.format_exc(),
+                    }
                 response_path.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
                 request_path.unlink(missing_ok=True)
             if not handled_any:

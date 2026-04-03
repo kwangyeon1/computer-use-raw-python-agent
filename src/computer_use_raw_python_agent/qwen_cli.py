@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import signal
+import time
 
 from .config_utils import load_agent_config
 from .qwen_daemon import (
@@ -95,6 +98,46 @@ def _resolve_run_timeout(args: argparse.Namespace, overrides: dict) -> float:
     return 900.0
 
 
+def _resolve_compute_dtype(args: argparse.Namespace, config_defaults: dict) -> str:
+    if args.compute_dtype is not None:
+        return str(args.compute_dtype)
+    if "compute_dtype" in config_defaults:
+        return str(config_defaults["compute_dtype"])
+    return "bfloat16"
+
+
+def _resolve_device_map(args: argparse.Namespace, config_defaults: dict) -> str:
+    if args.device_map is not None:
+        return str(args.device_map)
+    if "device_map" in config_defaults:
+        return str(config_defaults["device_map"])
+    return "auto"
+
+
+def _resolve_disable_4bit(args: argparse.Namespace, config_defaults: dict) -> bool:
+    if args.disable_4bit is not None:
+        return bool(args.disable_4bit)
+    if "load_in_4bit" in config_defaults:
+        return not bool(config_defaults["load_in_4bit"])
+    return False
+
+
+def _resolve_load_in_8bit(args: argparse.Namespace, config_defaults: dict) -> bool:
+    if args.load_in_8bit is not None:
+        return bool(args.load_in_8bit)
+    if "load_in_8bit" in config_defaults:
+        return bool(config_defaults["load_in_8bit"])
+    return False
+
+
+def _resolve_disable_cpu_offload(args: argparse.Namespace, config_defaults: dict) -> bool:
+    if args.disable_cpu_offload is not None:
+        return bool(args.disable_cpu_offload)
+    if "enable_fp32_cpu_offload" in config_defaults:
+        return not bool(config_defaults["enable_fp32_cpu_offload"])
+    return False
+
+
 def cmd_status(_: argparse.Namespace) -> int:
     if daemon_is_responding():
         response = _send_request({"action": "status"})
@@ -111,11 +154,26 @@ def cmd_status(_: argparse.Namespace) -> int:
 
 
 def cmd_stop(_: argparse.Namespace) -> int:
-    if not daemon_is_responding():
+    if daemon_is_responding():
+        response = _send_request({"action": "shutdown"})
+        print(json.dumps(response, ensure_ascii=False, indent=2))
+        return 0
+    state = _state_or_empty()
+    pid = state.get("pid")
+    if not (isinstance(pid, int) and daemon_process_alive()):
         print(json.dumps({"running": False}, ensure_ascii=False, indent=2))
         return 0
-    response = _send_request({"action": "shutdown"})
-    print(json.dumps(response, ensure_ascii=False, indent=2))
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not daemon_process_alive():
+            daemon_state_path().unlink(missing_ok=True)
+            print(json.dumps({"ok": True, "forced": True, "pid": pid}, ensure_ascii=False, indent=2))
+            return 0
+        time.sleep(0.05)
+    os.kill(pid, signal.SIGKILL)
+    daemon_state_path().unlink(missing_ok=True)
+    print(json.dumps({"ok": True, "forced": True, "signal": "SIGKILL", "pid": pid}, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -125,15 +183,20 @@ def cmd_main(args: argparse.Namespace) -> int:
 
     if args.model_id:
         _ensure_daemon_started()
+        load_in_8bit = _resolve_load_in_8bit(args, config_defaults)
+        disable_4bit = _resolve_disable_4bit(args, config_defaults)
+        if load_in_8bit and not disable_4bit:
+            raise SystemExit("8bit mode requires 4bit to be disabled; set load_in_4bit=false or pass --disable-4bit")
         response = _send_request(
             {
                 "action": "reload",
                 "model_id": args.model_id,
                 "processor_id": args.processor_id,
-                "compute_dtype": args.compute_dtype,
-                "device_map": args.device_map,
-                "disable_4bit": args.disable_4bit,
-                "disable_cpu_offload": args.disable_cpu_offload,
+                "compute_dtype": _resolve_compute_dtype(args, config_defaults),
+                "device_map": _resolve_device_map(args, config_defaults),
+                "disable_4bit": disable_4bit,
+                "load_in_8bit": load_in_8bit,
+                "disable_cpu_offload": _resolve_disable_cpu_offload(args, config_defaults),
                 "defaults": default_overrides,
             },
             timeout_s=_resolve_load_timeout(args, default_overrides),
@@ -197,10 +260,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dependency-repair-enabled", action="store_true", default=None)
     parser.add_argument("--dependency-repair-max-attempts", type=int)
     parser.add_argument("--dependency-repair-allow-shell-fallback", action="store_true", default=None)
-    parser.add_argument("--compute-dtype", default="bfloat16")
-    parser.add_argument("--device-map", default="auto")
-    parser.add_argument("--disable-4bit", action="store_true")
-    parser.add_argument("--disable-cpu-offload", action="store_true")
+    parser.add_argument("--compute-dtype")
+    parser.add_argument("--device-map")
+    parser.add_argument("--disable-4bit", action="store_true", default=None)
+    parser.add_argument("--load-in-8bit", action="store_true", default=None)
+    parser.add_argument("--disable-cpu-offload", action="store_true", default=None)
     parser.add_argument("--load-request-timeout-s", type=float)
     parser.add_argument("--run-request-timeout-s", type=float)
     parser.add_argument("--status", action="store_true")

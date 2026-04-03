@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 
 from .config_utils import load_policy_from_path
@@ -49,6 +50,7 @@ class AgentDaemonState:
     compute_dtype: str
     device_map: str
     load_in_4bit: bool
+    load_in_8bit: bool
     enable_fp32_cpu_offload: bool
     defaults: dict[str, Any]
     phase: str = "idle"
@@ -61,6 +63,7 @@ class AgentDaemonState:
                 processor_id=self.processor_id,
                 max_new_tokens=int(self.defaults.get("max_new_tokens", 256)),
                 load_in_4bit=self.load_in_4bit,
+                load_in_8bit=self.load_in_8bit,
                 compute_dtype=self.compute_dtype,
                 device_map=self.device_map,
                 enable_fp32_cpu_offload=self.enable_fp32_cpu_offload,
@@ -75,6 +78,7 @@ class AgentDaemonState:
             "compute_dtype": self.compute_dtype,
             "device_map": self.device_map,
             "load_in_4bit": self.load_in_4bit,
+            "load_in_8bit": self.load_in_8bit,
             "enable_fp32_cpu_offload": self.enable_fp32_cpu_offload,
             "defaults": self.defaults,
             "phase": self.phase,
@@ -228,8 +232,13 @@ def _handle_reload(daemon_state: AgentDaemonState, payload: dict[str, Any]) -> d
     daemon_state.processor_id = str(processor_id) if processor_id else None
     daemon_state.compute_dtype = str(payload.get("compute_dtype") or daemon_state.compute_dtype)
     daemon_state.device_map = str(payload.get("device_map") or daemon_state.device_map)
-    daemon_state.load_in_4bit = not bool(payload.get("disable_4bit", False))
-    daemon_state.enable_fp32_cpu_offload = not bool(payload.get("disable_cpu_offload", False))
+    daemon_state.load_in_4bit = bool(payload.get("load_in_4bit", not bool(payload.get("disable_4bit", False))))
+    daemon_state.load_in_8bit = bool(payload.get("load_in_8bit", daemon_state.load_in_8bit))
+    if daemon_state.load_in_4bit and daemon_state.load_in_8bit:
+        raise RuntimeError("load_in_4bit and load_in_8bit cannot both be enabled")
+    daemon_state.enable_fp32_cpu_offload = bool(
+        payload.get("enable_fp32_cpu_offload", not bool(payload.get("disable_cpu_offload", False)))
+    )
     daemon_state.defaults = defaults
     daemon_state.phase = "loading"
     _write_state_file(os.getpid(), daemon_state.to_public_dict())
@@ -238,6 +247,7 @@ def _handle_reload(daemon_state: AgentDaemonState, payload: dict[str, Any]) -> d
         processor_id=daemon_state.processor_id,
         max_new_tokens=int(defaults.get("max_new_tokens", 256)),
         load_in_4bit=daemon_state.load_in_4bit,
+        load_in_8bit=daemon_state.load_in_8bit,
         compute_dtype=daemon_state.compute_dtype,
         device_map=daemon_state.device_map,
         enable_fp32_cpu_offload=daemon_state.enable_fp32_cpu_offload,
@@ -257,6 +267,7 @@ def _serve() -> int:
         compute_dtype="bfloat16",
         device_map="auto",
         load_in_4bit=True,
+        load_in_8bit=False,
         enable_fp32_cpu_offload=True,
         defaults={},
         phase="idle",
@@ -268,21 +279,31 @@ def _serve() -> int:
             for request_path in sorted(requests_dir.glob("*.json")):
                 handled_any = True
                 response_path = responses_dir / request_path.name
-                payload = json.loads(request_path.read_text(encoding="utf-8"))
-                action = payload.get("action")
-                if action == "status":
-                    response = {"ok": True, "status": daemon_state.to_public_dict()}
-                elif action == "reload":
-                    response = _handle_reload(daemon_state, payload)
-                elif action == "run":
-                    response = _handle_run(daemon_state, payload)
-                elif action == "shutdown":
-                    response = {"ok": True}
-                    response_path.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
-                    request_path.unlink(missing_ok=True)
-                    return 0
-                else:
-                    response = {"ok": False, "error": f"unknown action: {action!r}"}
+                try:
+                    payload = json.loads(request_path.read_text(encoding="utf-8"))
+                    action = payload.get("action")
+                    if action == "status":
+                        response = {"ok": True, "status": daemon_state.to_public_dict()}
+                    elif action == "reload":
+                        response = _handle_reload(daemon_state, payload)
+                    elif action == "run":
+                        response = _handle_run(daemon_state, payload)
+                    elif action == "shutdown":
+                        response = {"ok": True}
+                        response_path.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
+                        request_path.unlink(missing_ok=True)
+                        return 0
+                    else:
+                        response = {"ok": False, "error": f"unknown action: {action!r}"}
+                except Exception as exc:  # pragma: no cover - daemon safety path
+                    daemon_state.phase = "ready"
+                    _write_state_file(os.getpid(), daemon_state.to_public_dict())
+                    response = {
+                        "ok": False,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                        "traceback": traceback.format_exc(),
+                    }
                 response_path.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
                 request_path.unlink(missing_ok=True)
             if not handled_any:

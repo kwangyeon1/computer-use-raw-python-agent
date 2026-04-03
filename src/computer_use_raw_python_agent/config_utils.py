@@ -36,6 +36,16 @@ def load_agent_config(path: str | None) -> tuple[dict[str, Any], Path | None]:
         normalized["max_iterations"] = int(data["max_iterations"])
     if "max_new_tokens" in data:
         normalized["max_new_tokens"] = int(data["max_new_tokens"])
+    if "compute_dtype" in data:
+        normalized["compute_dtype"] = str(data["compute_dtype"])
+    if "device_map" in data:
+        normalized["device_map"] = str(data["device_map"])
+    if "load_in_4bit" in data:
+        normalized["load_in_4bit"] = bool(data["load_in_4bit"])
+    if "load_in_8bit" in data:
+        normalized["load_in_8bit"] = bool(data["load_in_8bit"])
+    if "enable_fp32_cpu_offload" in data:
+        normalized["enable_fp32_cpu_offload"] = bool(data["enable_fp32_cpu_offload"])
     if "strong_visual_grounding" in data:
         normalized["strong_visual_grounding"] = bool(data["strong_visual_grounding"])
     if "replan_enabled" in data:

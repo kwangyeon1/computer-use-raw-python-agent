@@ -41,6 +41,7 @@ class GUIOwlRawPythonRuntime:
         processor_id: str | Path | None = None,
         trust_remote_code: bool = True,
         load_in_4bit: bool = True,
+        load_in_8bit: bool = False,
         quant_type: str = "nf4",
         compute_dtype: str = "bfloat16",
         device_map: str = "auto",
@@ -51,6 +52,7 @@ class GUIOwlRawPythonRuntime:
         self.processor_id = str(Path(processor_id).resolve()) if processor_id else self.model_id
         self.trust_remote_code = trust_remote_code
         self.load_in_4bit = load_in_4bit
+        self.load_in_8bit = load_in_8bit
         self.quant_type = quant_type
         self.compute_dtype = compute_dtype
         self.device_map = device_map
@@ -70,9 +72,24 @@ class GUIOwlRawPythonRuntime:
         from PIL import Image
         from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
 
+        if self.load_in_4bit and self.load_in_8bit:
+            raise SystemExit("load_in_4bit and load_in_8bit cannot both be enabled")
+
         quantization_config = None
         if self.load_in_4bit:
-            quantization_config = self._build_quantization_config(torch, BitsAndBytesConfig, enable_cpu_offload=False)
+            quantization_config = self._build_quantization_config(
+                torch,
+                BitsAndBytesConfig,
+                mode="4bit",
+                enable_cpu_offload=False,
+            )
+        elif self.load_in_8bit:
+            quantization_config = self._build_quantization_config(
+                torch,
+                BitsAndBytesConfig,
+                mode="8bit",
+                enable_cpu_offload=False,
+            )
 
         self._torch = torch
         self._image_cls = Image
@@ -199,14 +216,21 @@ class GUIOwlRawPythonRuntime:
                     return device
         return None
 
-    def _build_quantization_config(self, torch_module, bitsandbytes_config_cls, *, enable_cpu_offload: bool):
-        return bitsandbytes_config_cls(
-            load_in_4bit=True,
-            bnb_4bit_quant_type=self.quant_type,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=self._resolve_dtype(torch_module, self.compute_dtype),
-            llm_int8_enable_fp32_cpu_offload=bool(enable_cpu_offload),
-        )
+    def _build_quantization_config(self, torch_module, bitsandbytes_config_cls, *, mode: str, enable_cpu_offload: bool):
+        if mode == "4bit":
+            return bitsandbytes_config_cls(
+                load_in_4bit=True,
+                bnb_4bit_quant_type=self.quant_type,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=self._resolve_dtype(torch_module, self.compute_dtype),
+                llm_int8_enable_fp32_cpu_offload=bool(enable_cpu_offload),
+            )
+        if mode == "8bit":
+            return bitsandbytes_config_cls(
+                load_in_8bit=True,
+                llm_int8_enable_fp32_cpu_offload=bool(enable_cpu_offload),
+            )
+        raise SystemExit(f"unsupported quantization mode: {mode}")
 
     def _load_model_with_fallback(self, *, AutoModelForImageTextToText, quantization_config, torch_module, BitsAndBytesConfig):
         common_kwargs = {
@@ -222,13 +246,15 @@ class GUIOwlRawPythonRuntime:
             )
         except ValueError as exc:
             message = str(exc)
-            if not self.load_in_4bit or not self.enable_fp32_cpu_offload:
+            quantization_mode = "4bit" if self.load_in_4bit else "8bit" if self.load_in_8bit else None
+            if not quantization_mode or not self.enable_fp32_cpu_offload:
                 raise
             if "dispatched on the CPU or the disk" not in message:
                 raise
             fallback_quantization_config = self._build_quantization_config(
                 torch_module,
                 BitsAndBytesConfig,
+                mode=quantization_mode,
                 enable_cpu_offload=True,
             )
             return AutoModelForImageTextToText.from_pretrained(
