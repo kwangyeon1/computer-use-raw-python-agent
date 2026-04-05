@@ -45,6 +45,8 @@ class Qwen35SGLangRuntime:
         server_extra_args: list[str] | None = None,
         trust_remote_code: bool = True,
         dtype: str = "auto",
+        load_format: str | None = None,
+        quantization: str | None = None,
         tp_size: int = 1,
         mem_fraction_static: float | None = None,
         served_model_name: str | None = None,
@@ -60,6 +62,8 @@ class Qwen35SGLangRuntime:
         self.server_extra_args = [str(arg) for arg in (server_extra_args or [])]
         self.trust_remote_code = bool(trust_remote_code)
         self.dtype = str(dtype)
+        self.load_format = str(load_format) if load_format else None
+        self.quantization = str(quantization) if quantization else None
         self.tp_size = int(tp_size)
         self.mem_fraction_static = None if mem_fraction_static is None else float(mem_fraction_static)
         self.served_model_name = str(served_model_name) if served_model_name else None
@@ -162,6 +166,10 @@ class Qwen35SGLangRuntime:
             "--tp-size",
             str(self.tp_size),
         ]
+        if self.load_format:
+            command.extend(["--load-format", self.load_format])
+        if self.quantization:
+            command.extend(["--quantization", self.quantization])
         if self.trust_remote_code:
             command.append("--trust-remote-code")
         if self.mem_fraction_static is not None:

@@ -18,7 +18,9 @@
   "sglang_server_ready_timeout_s": 180,
   "sglang_request_timeout_s": 180,
   "sglang_trust_remote_code": true,
-  "sglang_dtype": "auto",
+  "sglang_dtype": "float16",
+  "sglang_load_format": "bitsandbytes",
+  "sglang_quantization": "bitsandbytes",
   "sglang_tp_size": 1,
   "sglang_server_extra_args": []
 }

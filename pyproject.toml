@@ -13,6 +13,7 @@ dependencies = []
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 runtime = ["pillow"]
+sglang = ["sglang"]
 train = ["accelerate", "bitsandbytes", "datasets", "peft", "pillow", "torch", "torchvision", "transformers"]
 
 [project.scripts]

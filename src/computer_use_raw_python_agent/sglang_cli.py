@@ -50,6 +50,8 @@ def _collect_explicit_overrides(args: argparse.Namespace) -> dict:
         "sglang_request_timeout_s",
         "sglang_server_python",
         "sglang_dtype",
+        "sglang_load_format",
+        "sglang_quantization",
         "sglang_tp_size",
         "sglang_mem_fraction_static",
         "sglang_served_model_name",
@@ -239,6 +241,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sglang-server-extra-arg", action="append")
     parser.add_argument("--sglang-trust-remote-code", action="store_true", default=None)
     parser.add_argument("--sglang-dtype")
+    parser.add_argument("--sglang-load-format")
+    parser.add_argument("--sglang-quantization")
     parser.add_argument("--sglang-tp-size", type=int)
     parser.add_argument("--sglang-mem-fraction-static", type=float)
     parser.add_argument("--sglang-served-model-name")

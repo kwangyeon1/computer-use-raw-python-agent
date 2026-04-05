@@ -37,6 +37,10 @@ def load_sglang_agent_config(path: str | None) -> tuple[dict[str, Any], Path | N
         normalized["sglang_trust_remote_code"] = bool(data["sglang_trust_remote_code"])
     if "sglang_dtype" in data:
         normalized["sglang_dtype"] = str(data["sglang_dtype"])
+    if "sglang_load_format" in data:
+        normalized["sglang_load_format"] = str(data["sglang_load_format"])
+    if "sglang_quantization" in data:
+        normalized["sglang_quantization"] = str(data["sglang_quantization"])
     if "sglang_tp_size" in data:
         normalized["sglang_tp_size"] = int(data["sglang_tp_size"])
     if "sglang_mem_fraction_static" in data:
