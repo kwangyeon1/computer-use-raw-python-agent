@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 try:
     from .runtime import GUIOwlRawPythonRuntime
@@ -9,8 +10,22 @@ except ImportError:  # pragma: no cover - direct script execution fallback
 
 
 def default_qwen35_model_id() -> str:
-    repo_root = Path(__file__).resolve().parents[2]
-    return str((repo_root.parent / "models" / "Qwen3.5-9B").resolve())
+    candidates: list[Path] = []
+    cwd = Path.cwd()
+    candidates.append((cwd / "models" / "Qwen3.5-9B").resolve())
+    candidates.append((cwd.parent / "models" / "Qwen3.5-9B").resolve())
+    argv0 = Path(sys.argv[0]).resolve()
+    for parent in argv0.parents:
+        candidates.append((parent / "models" / "Qwen3.5-9B").resolve())
+        candidates.append((parent.parent / "models" / "Qwen3.5-9B").resolve())
+    module_path = Path(__file__).resolve()
+    for parent in module_path.parents:
+        candidates.append((parent / "models" / "Qwen3.5-9B").resolve())
+        candidates.append((parent.parent / "models" / "Qwen3.5-9B").resolve())
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str((cwd.parent / "models" / "Qwen3.5-9B").resolve())
 
 
 class Qwen35RawPythonRuntime(GUIOwlRawPythonRuntime):

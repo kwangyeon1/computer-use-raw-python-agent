@@ -37,6 +37,7 @@ class PromptBundle:
     user_prompt: str
     session_prompt: str
     policy: dict[str, Any]
+    reasoning_enabled: bool = False
     observation_text: str | None = None
     last_execution: dict[str, Any] = field(default_factory=dict)
     stderr_tail: str | None = None
@@ -70,6 +71,7 @@ class StepRequest:
     replan_requested: bool = False
     replan_reasons: list[str] = field(default_factory=list)
     strong_visual_grounding: bool = False
+    reasoning_enabled: bool = False
     screenshot_path: str | None = None
     screenshot_base64: str | None = None
     screenshot_media_type: str | None = None
@@ -88,6 +90,7 @@ class StepRequest:
             replan_requested=bool(data.get("replan_requested", False)),
             replan_reasons=[str(item) for item in data.get("replan_reasons", [])],
             strong_visual_grounding=bool(data.get("strong_visual_grounding", False)),
+            reasoning_enabled=bool(data.get("reasoning_enabled", False)),
             screenshot_path=data.get("screenshot_path"),
             screenshot_base64=data.get("screenshot_base64"),
             screenshot_media_type=data.get("screenshot_media_type"),

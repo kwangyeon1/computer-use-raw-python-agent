@@ -208,6 +208,7 @@ def _handle_run(daemon_state: AgentDaemonState, payload: dict[str, Any]) -> dict
             max_iterations=int(defaults.get("max_iterations", 5)),
             max_new_tokens=int(defaults.get("max_new_tokens", 256)),
             strong_visual_grounding=bool(defaults.get("strong_visual_grounding", False)),
+            reasoning_enabled=bool(defaults.get("reasoning_enabled", False)),
             replan_enabled=bool(defaults.get("replan_enabled", False)),
             replan_max_attempts=int(defaults.get("replan_max_attempts", 1)),
             dependency_repair_enabled=bool(defaults.get("dependency_repair_enabled", False)),

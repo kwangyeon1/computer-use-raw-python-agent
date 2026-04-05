@@ -182,6 +182,7 @@ def _attempt_dependency_repair(
     user_prompt: str,
     policy: dict[str, Any],
     strong_visual_grounding: bool,
+    reasoning_enabled: bool,
     state: dict[str, Any],
     history: list[str],
     last_execution: dict[str, Any],
@@ -218,6 +219,7 @@ def _attempt_dependency_repair(
                 "stderr_tail": last_execution.get("stderr_tail"),
             },
             strong_visual_grounding=strong_visual_grounding,
+            reasoning_enabled=reasoning_enabled,
             screenshot_path=state.get("screenshot_path"),
             screenshot_base64=state.get("screenshot_base64"),
             screenshot_media_type=state.get("screenshot_media_type"),
@@ -315,6 +317,7 @@ def run_agent_control_loop(
     max_iterations: int,
     max_new_tokens: int,
     strong_visual_grounding: bool = False,
+    reasoning_enabled: bool = False,
     replan_enabled: bool = False,
     replan_max_attempts: int = 1,
     dependency_repair_enabled: bool = False,
@@ -358,6 +361,7 @@ def run_agent_control_loop(
             replan_requested=bool(active_replan_reasons),
             replan_reasons=active_replan_reasons,
             strong_visual_grounding=strong_visual_grounding,
+            reasoning_enabled=reasoning_enabled,
             screenshot_path=state.get("screenshot_path"),
             screenshot_base64=state.get("screenshot_base64"),
             screenshot_media_type=state.get("screenshot_media_type"),
@@ -383,6 +387,7 @@ def run_agent_control_loop(
                 replan_requested=bool(active_replan_reasons),
                 replan_reasons=active_replan_reasons,
                 strong_visual_grounding=strong_visual_grounding,
+                reasoning_enabled=reasoning_enabled,
                 screenshot_path=state.get("screenshot_path"),
                 screenshot_base64=state.get("screenshot_base64"),
                 screenshot_media_type=state.get("screenshot_media_type"),
@@ -450,6 +455,7 @@ def run_agent_control_loop(
                 user_prompt=user_prompt,
                 policy=policy,
                 strong_visual_grounding=strong_visual_grounding,
+                reasoning_enabled=reasoning_enabled,
                 state=state,
                 history=history,
                 last_execution=last_execution,
@@ -506,6 +512,7 @@ def run_agent_control_loop(
         "final_response": final_response,
         "stopped_reason": stopped_reason,
         "strong_visual_grounding": strong_visual_grounding,
+        "reasoning_enabled": reasoning_enabled,
         "replan_enabled": replan_enabled,
         "replan_max_attempts": replan_max_attempts,
         "replans_used": replans_used,
@@ -533,6 +540,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-iterations", type=int, default=5)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--strong-visual-grounding", action="store_true")
+    parser.add_argument("--reasoning-enabled", action="store_true")
     parser.add_argument("--replan-enabled", action="store_true")
     parser.add_argument("--replan-max-attempts", type=int, default=1)
     parser.add_argument("--dependency-repair-enabled", action="store_true")
@@ -574,6 +582,7 @@ def main() -> None:
             max_iterations=args.max_iterations,
             max_new_tokens=args.max_new_tokens,
             strong_visual_grounding=args.strong_visual_grounding,
+            reasoning_enabled=args.reasoning_enabled,
             replan_enabled=args.replan_enabled,
             replan_max_attempts=args.replan_max_attempts,
             dependency_repair_enabled=args.dependency_repair_enabled,
