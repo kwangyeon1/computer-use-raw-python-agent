@@ -7,8 +7,9 @@ from pathlib import Path
 import signal
 import time
 
-from .config_utils import load_agent_config
-from .qwen_daemon import (
+from .qwen_runtime import default_qwen35_model_id
+from .sglang_config import default_sglang_config_path, load_sglang_agent_config
+from .sglang_daemon import (
     _send_request,
     daemon_is_responding,
     daemon_process_alive,
@@ -16,17 +17,6 @@ from .qwen_daemon import (
     start_daemon_process,
     wait_for_daemon_ready,
 )
-from .qwen_runtime import default_qwen35_model_id
-
-
-def _default_qwen_config_path() -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    return (repo_root / "config" / "agent.qwen35.default.json").resolve()
-
-
-def _load_qwen_agent_config(path: str | None) -> tuple[dict, Path | None]:
-    config_path = str(Path(path).resolve()) if path else str(_default_qwen_config_path())
-    return load_agent_config(config_path)
 
 
 def _state_or_empty() -> dict:
@@ -54,12 +44,24 @@ def _collect_explicit_overrides(args: argparse.Namespace) -> dict:
         "dependency_repair_allow_shell_fallback",
         "load_request_timeout_s",
         "run_request_timeout_s",
+        "sglang_server_host",
+        "sglang_server_port",
+        "sglang_server_ready_timeout_s",
+        "sglang_request_timeout_s",
+        "sglang_server_python",
+        "sglang_dtype",
+        "sglang_tp_size",
+        "sglang_mem_fraction_static",
+        "sglang_served_model_name",
+        "sglang_trust_remote_code",
     ):
         value = getattr(args, key, None)
         if value is not None:
             overrides[key] = value
     if args.mcp_command:
         overrides["mcp_command"] = list(args.mcp_command)
+    if args.sglang_server_extra_arg:
+        overrides["sglang_server_extra_args"] = list(args.sglang_server_extra_arg)
     return overrides
 
 
@@ -99,46 +101,6 @@ def _resolve_run_timeout(args: argparse.Namespace, overrides: dict) -> float:
     return 900.0
 
 
-def _resolve_compute_dtype(args: argparse.Namespace, config_defaults: dict) -> str:
-    if args.compute_dtype is not None:
-        return str(args.compute_dtype)
-    if "compute_dtype" in config_defaults:
-        return str(config_defaults["compute_dtype"])
-    return "bfloat16"
-
-
-def _resolve_device_map(args: argparse.Namespace, config_defaults: dict) -> str:
-    if args.device_map is not None:
-        return str(args.device_map)
-    if "device_map" in config_defaults:
-        return str(config_defaults["device_map"])
-    return "auto"
-
-
-def _resolve_disable_4bit(args: argparse.Namespace, config_defaults: dict) -> bool:
-    if args.disable_4bit is not None:
-        return bool(args.disable_4bit)
-    if "load_in_4bit" in config_defaults:
-        return not bool(config_defaults["load_in_4bit"])
-    return False
-
-
-def _resolve_load_in_8bit(args: argparse.Namespace, config_defaults: dict) -> bool:
-    if args.load_in_8bit is not None:
-        return bool(args.load_in_8bit)
-    if "load_in_8bit" in config_defaults:
-        return bool(config_defaults["load_in_8bit"])
-    return False
-
-
-def _resolve_disable_cpu_offload(args: argparse.Namespace, config_defaults: dict) -> bool:
-    if args.disable_cpu_offload is not None:
-        return bool(args.disable_cpu_offload)
-    if "enable_fp32_cpu_offload" in config_defaults:
-        return not bool(config_defaults["enable_fp32_cpu_offload"])
-    return False
-
-
 def cmd_status(_: argparse.Namespace) -> int:
     if daemon_is_responding():
         response = _send_request({"action": "status"})
@@ -154,6 +116,24 @@ def cmd_status(_: argparse.Namespace) -> int:
     return 0
 
 
+def _kill_pid(pid: int | None, *, grace_s: float = 5.0) -> bool:
+    if not isinstance(pid, int):
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.05)
+    os.kill(pid, signal.SIGKILL)
+    return True
+
+
 def cmd_stop(_: argparse.Namespace) -> int:
     if daemon_is_responding():
         response = _send_request({"action": "shutdown"})
@@ -161,56 +141,45 @@ def cmd_stop(_: argparse.Namespace) -> int:
         return 0
     state = _state_or_empty()
     pid = state.get("pid")
+    server_pid = state.get("sglang_server_pid")
     if not (isinstance(pid, int) and daemon_process_alive()):
+        if _kill_pid(server_pid):
+            daemon_state_path().unlink(missing_ok=True)
+            print(json.dumps({"ok": True, "forced": True, "sglang_server_pid": server_pid}, ensure_ascii=False, indent=2))
+            return 0
         print(json.dumps({"running": False}, ensure_ascii=False, indent=2))
         return 0
-    os.kill(pid, signal.SIGTERM)
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        if not daemon_process_alive():
-            daemon_state_path().unlink(missing_ok=True)
-            print(json.dumps({"ok": True, "forced": True, "pid": pid}, ensure_ascii=False, indent=2))
-            return 0
-        time.sleep(0.05)
-    os.kill(pid, signal.SIGKILL)
+    _kill_pid(pid)
+    _kill_pid(server_pid)
     daemon_state_path().unlink(missing_ok=True)
-    print(json.dumps({"ok": True, "forced": True, "signal": "SIGKILL", "pid": pid}, ensure_ascii=False, indent=2))
+    print(json.dumps({"ok": True, "forced": True, "pid": pid, "sglang_server_pid": server_pid}, ensure_ascii=False, indent=2))
     return 0
 
 
 def cmd_main(args: argparse.Namespace) -> int:
-    config_defaults, config_path = _load_qwen_agent_config(args.config)
+    config_defaults, config_path = load_sglang_agent_config(args.config)
     default_overrides = _build_default_overrides(args, config_defaults)
 
     if args.model_id:
         _ensure_daemon_started()
-        load_in_8bit = _resolve_load_in_8bit(args, config_defaults)
-        disable_4bit = _resolve_disable_4bit(args, config_defaults)
-        if load_in_8bit and not disable_4bit:
-            raise SystemExit("8bit mode requires 4bit to be disabled; set load_in_4bit=false or pass --disable-4bit")
         response = _send_request(
             {
                 "action": "reload",
                 "model_id": args.model_id,
                 "processor_id": args.processor_id,
-                "compute_dtype": _resolve_compute_dtype(args, config_defaults),
-                "device_map": _resolve_device_map(args, config_defaults),
-                "disable_4bit": disable_4bit,
-                "load_in_8bit": load_in_8bit,
-                "disable_cpu_offload": _resolve_disable_cpu_offload(args, config_defaults),
                 "defaults": default_overrides,
             },
             timeout_s=_resolve_load_timeout(args, default_overrides),
         )
         if not response.get("ok", False):
-            raise SystemExit(response.get("error", "qwen agent reload failed"))
+            raise SystemExit(response.get("error", "sglang agent reload failed"))
         if not args.prompt:
             print(
                 json.dumps(
                     {
                         "ok": True,
                         "daemon": response.get("status", {}),
-                        "config_path": str(config_path) if config_path else None,
+                        "config_path": str(config_path) if config_path else str(default_sglang_config_path()),
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -220,7 +189,7 @@ def cmd_main(args: argparse.Namespace) -> int:
 
     if args.prompt:
         if not daemon_is_responding():
-            raise SystemExit("qwen agent daemon is not running; start it once with --model-id")
+            raise SystemExit("sglang agent daemon is not running; start it once with --model-id")
         run_overrides = _build_run_overrides(args, config_defaults)
         response = _send_request(
             {
@@ -231,7 +200,7 @@ def cmd_main(args: argparse.Namespace) -> int:
             timeout_s=_resolve_run_timeout(args, run_overrides),
         )
         if not response.get("ok", False):
-            raise SystemExit(response.get("error", "qwen agent run failed"))
+            raise SystemExit(response.get("error", "sglang agent run failed"))
         print(json.dumps(response, ensure_ascii=False, indent=2))
         return 0
 
@@ -243,7 +212,7 @@ def cmd_main(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m computer_use_raw_python_agent.qwen_cli")
+    parser = argparse.ArgumentParser(prog="qwen-sglang")
     parser.add_argument("--model-id")
     parser.add_argument("--processor-id")
     parser.add_argument("--prompt")
@@ -262,11 +231,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dependency-repair-enabled", action="store_true", default=None)
     parser.add_argument("--dependency-repair-max-attempts", type=int)
     parser.add_argument("--dependency-repair-allow-shell-fallback", action="store_true", default=None)
-    parser.add_argument("--compute-dtype")
-    parser.add_argument("--device-map")
-    parser.add_argument("--disable-4bit", action="store_true", default=None)
-    parser.add_argument("--load-in-8bit", action="store_true", default=None)
-    parser.add_argument("--disable-cpu-offload", action="store_true", default=None)
+    parser.add_argument("--sglang-server-host")
+    parser.add_argument("--sglang-server-port", type=int)
+    parser.add_argument("--sglang-server-ready-timeout-s", type=float)
+    parser.add_argument("--sglang-request-timeout-s", type=float)
+    parser.add_argument("--sglang-server-python")
+    parser.add_argument("--sglang-server-extra-arg", action="append")
+    parser.add_argument("--sglang-trust-remote-code", action="store_true", default=None)
+    parser.add_argument("--sglang-dtype")
+    parser.add_argument("--sglang-tp-size", type=int)
+    parser.add_argument("--sglang-mem-fraction-static", type=float)
+    parser.add_argument("--sglang-served-model-name")
     parser.add_argument("--load-request-timeout-s", type=float)
     parser.add_argument("--run-request-timeout-s", type=float)
     parser.add_argument("--status", action="store_true")

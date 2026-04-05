@@ -45,6 +45,14 @@ If replan_requested is true:
 - Do not repeat the same mechanism unless the screen state clearly changed and justifies it.
 """
 
+REASONING_ENABLED_APPEND = """
+If reasoning_enabled is true:
+- You may reason privately before answering.
+- Do not expose chain-of-thought in the final answer.
+- The final answer must still be executable Python only.
+- If you include internal reasoning tags such as <think>, ensure the final executable code remains clearly separable.
+"""
+
 STRONG_VISUAL_GROUNDING_APPEND = """
 If strong_visual_grounding is true:
 - Treat the latest screenshot as primary evidence for the current computer state.
@@ -59,6 +67,7 @@ If strong_visual_grounding is true:
 def render_user_prompt(
     session_prompt: str,
     policy: RuntimePolicy,
+    reasoning_enabled: bool = False,
     observation_text: str | None = None,
     recent_history: Iterable[str] | None = None,
     last_execution: dict | None = None,
@@ -74,6 +83,7 @@ def render_user_prompt(
         "runtime_policy": policy.to_dict(),
         "request_kind": "task_step",
         "repair_context": None,
+        "reasoning_enabled": reasoning_enabled,
         "replan_requested": replan_requested,
         "replan_reasons": replan_reason_list,
         "strong_visual_grounding": strong_visual_grounding,
@@ -89,6 +99,7 @@ def render_user_prompt(
 def render_prompt_bundle(
     session_prompt: str,
     policy: RuntimePolicy,
+    reasoning_enabled: bool = False,
     observation_text: str | None = None,
     recent_history: Iterable[str] | None = None,
     last_execution: dict | None = None,
@@ -100,13 +111,16 @@ def render_prompt_bundle(
     last_execution_payload = dict(last_execution or {})
     replan_reason_list = [str(item) for item in (replan_reasons or [])]
     system_prompt = RAW_PYTHON_SYSTEM_PROMPT
+    if reasoning_enabled:
+        system_prompt = system_prompt + "\n" + REASONING_ENABLED_APPEND.strip() + "\n"
     if strong_visual_grounding:
-        system_prompt = RAW_PYTHON_SYSTEM_PROMPT + "\n" + STRONG_VISUAL_GROUNDING_APPEND.strip() + "\n"
+        system_prompt = system_prompt + "\n" + STRONG_VISUAL_GROUNDING_APPEND.strip() + "\n"
     return PromptBundle(
         system_prompt=system_prompt,
         user_prompt=render_user_prompt(
             session_prompt=session_prompt,
             policy=policy,
+            reasoning_enabled=reasoning_enabled,
             observation_text=observation_text,
             recent_history=history,
             last_execution=last_execution_payload,
@@ -116,6 +130,7 @@ def render_prompt_bundle(
         ),
         session_prompt=session_prompt,
         policy=policy.to_dict(),
+        reasoning_enabled=reasoning_enabled,
         observation_text=observation_text,
         last_execution=last_execution_payload,
         stderr_tail=last_execution_payload.get("stderr_tail"),
@@ -131,6 +146,7 @@ def render_prompt_bundle_from_step_request(request: StepRequest) -> PromptBundle
     bundle = render_prompt_bundle(
         session_prompt=request.user_prompt,
         policy=policy,
+        reasoning_enabled=request.reasoning_enabled,
         observation_text=request.observation_text,
         recent_history=history,
         last_execution=request.last_execution,
@@ -141,6 +157,7 @@ def render_prompt_bundle_from_step_request(request: StepRequest) -> PromptBundle
     user_payload = json.loads(bundle.user_prompt)
     user_payload["request_kind"] = request.request_kind
     user_payload["repair_context"] = request.repair_context or None
+    user_payload["reasoning_enabled"] = request.reasoning_enabled
     user_payload["replan_requested"] = request.replan_requested
     user_payload["replan_reasons"] = request.replan_reasons
     user_payload["strong_visual_grounding"] = request.strong_visual_grounding

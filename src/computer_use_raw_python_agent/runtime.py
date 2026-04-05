@@ -30,6 +30,9 @@ def extract_python_code(text: str) -> str:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         return "\n".join(lines).strip()
+    without_think = re.sub(r"<think>.*?</think>", "", stripped, flags=re.DOTALL | re.IGNORECASE).strip()
+    if without_think != stripped:
+        return without_think
     return stripped
 
 

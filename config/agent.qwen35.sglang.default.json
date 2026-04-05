@@ -1,11 +1,7 @@
 {
   "endpoint": "http://127.0.0.1:8790",
   "policy": "policy.unrestricted.local.json",
-  "run_dir": "../data/runs-qwen35",
-  "load_in_4bit": false,
-  "load_in_8bit": true,
-  "compute_dtype": "float16",
-  "device_map": "auto",
+  "run_dir": "../data/runs-qwen35-sglang",
   "max_iterations": 5,
   "max_new_tokens": 1024,
   "reasoning_enabled": false,
@@ -15,6 +11,14 @@
   "dependency_repair_enabled": true,
   "dependency_repair_max_attempts": 2,
   "dependency_repair_allow_shell_fallback": false,
-  "load_request_timeout_s": 120,
-  "run_request_timeout_s": 120
+  "load_request_timeout_s": 180,
+  "run_request_timeout_s": 120,
+  "sglang_server_host": "127.0.0.1",
+  "sglang_server_port": 31000,
+  "sglang_server_ready_timeout_s": 180,
+  "sglang_request_timeout_s": 180,
+  "sglang_trust_remote_code": true,
+  "sglang_dtype": "auto",
+  "sglang_tp_size": 1,
+  "sglang_server_extra_args": []
 }

@@ -36,6 +36,8 @@ def load_agent_config(path: str | None) -> tuple[dict[str, Any], Path | None]:
         normalized["max_iterations"] = int(data["max_iterations"])
     if "max_new_tokens" in data:
         normalized["max_new_tokens"] = int(data["max_new_tokens"])
+    if "reasoning_enabled" in data:
+        normalized["reasoning_enabled"] = bool(data["reasoning_enabled"])
     if "compute_dtype" in data:
         normalized["compute_dtype"] = str(data["compute_dtype"])
     if "device_map" in data:

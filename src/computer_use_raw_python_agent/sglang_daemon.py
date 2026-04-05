@@ -12,13 +12,14 @@ import traceback
 import uuid
 
 from .config_utils import load_policy_from_path
-from .qwen_runtime import Qwen35RawPythonRuntime
 from .service import build_executor_client, run_agent_control_loop
+from .sglang_runtime import Qwen35SGLangRuntime
 
 
-_STATE_DIR = Path("/tmp/computer_use_raw_python_agent_qwen35")
+_STATE_DIR = Path("/tmp/computer_use_raw_python_agent_qwen35_sglang")
 _STATE_PATH = _STATE_DIR / "agent.state.json"
 _LOG_PATH = _STATE_DIR / "agent.log"
+_SERVER_LOG_PATH = _STATE_DIR / "sglang.server.log"
 _REQUESTS_DIR = _STATE_DIR / "requests"
 _RESPONSES_DIR = _STATE_DIR / "responses"
 
@@ -31,6 +32,11 @@ def daemon_state_path() -> Path:
 def daemon_log_path() -> Path:
     _STATE_DIR.mkdir(parents=True, exist_ok=True)
     return _LOG_PATH
+
+
+def daemon_server_log_path() -> Path:
+    _STATE_DIR.mkdir(parents=True, exist_ok=True)
+    return _SERVER_LOG_PATH
 
 
 def daemon_requests_dir() -> Path:
@@ -47,41 +53,41 @@ def daemon_responses_dir() -> Path:
 class AgentDaemonState:
     model_id: str
     processor_id: str | None
-    compute_dtype: str
-    device_map: str
-    load_in_4bit: bool
-    load_in_8bit: bool
-    enable_fp32_cpu_offload: bool
     defaults: dict[str, Any]
     phase: str = "idle"
-    runtime: Qwen35RawPythonRuntime | None = None
+    runtime: Qwen35SGLangRuntime | None = None
 
-    def ensure_runtime(self) -> Qwen35RawPythonRuntime:
+    def ensure_runtime(self) -> Qwen35SGLangRuntime:
         if self.runtime is None:
-            self.runtime = Qwen35RawPythonRuntime(
+            self.runtime = Qwen35SGLangRuntime(
                 model_id=self.model_id,
-                processor_id=self.processor_id,
                 max_new_tokens=int(self.defaults.get("max_new_tokens", 256)),
-                load_in_4bit=self.load_in_4bit,
-                load_in_8bit=self.load_in_8bit,
-                compute_dtype=self.compute_dtype,
-                device_map=self.device_map,
-                enable_fp32_cpu_offload=self.enable_fp32_cpu_offload,
+                server_host=str(self.defaults.get("sglang_server_host", "127.0.0.1")),
+                server_port=int(self.defaults.get("sglang_server_port", 31000)),
+                server_ready_timeout_s=float(self.defaults.get("sglang_server_ready_timeout_s", 180.0)),
+                request_timeout_s=float(self.defaults.get("sglang_request_timeout_s", 180.0)),
+                server_python=self.defaults.get("sglang_server_python"),
+                server_extra_args=list(self.defaults.get("sglang_server_extra_args", [])),
+                trust_remote_code=bool(self.defaults.get("sglang_trust_remote_code", True)),
+                dtype=str(self.defaults.get("sglang_dtype", "auto")),
+                tp_size=int(self.defaults.get("sglang_tp_size", 1)),
+                mem_fraction_static=self.defaults.get("sglang_mem_fraction_static"),
+                served_model_name=self.defaults.get("sglang_served_model_name"),
+                server_log_path=str(daemon_server_log_path()),
             )
             self.runtime.ensure_loaded()
         return self.runtime
 
     def to_public_dict(self) -> dict[str, Any]:
+        runtime = self.runtime
         return {
             "model_id": self.model_id,
             "processor_id": self.processor_id,
-            "compute_dtype": self.compute_dtype,
-            "device_map": self.device_map,
-            "load_in_4bit": self.load_in_4bit,
-            "load_in_8bit": self.load_in_8bit,
-            "enable_fp32_cpu_offload": self.enable_fp32_cpu_offload,
             "defaults": self.defaults,
             "phase": self.phase,
+            "sglang_api_base": runtime.api_base if runtime else None,
+            "sglang_served_model_name": runtime.served_model_name if runtime else self.defaults.get("sglang_served_model_name"),
+            "sglang_server_pid": runtime.server_pid if runtime else None,
         }
 
 
@@ -116,7 +122,7 @@ def _send_request(payload: dict[str, Any], *, timeout_s: float = 5.0) -> dict[st
                 request_path.unlink(missing_ok=True)
         time.sleep(0.05)
     request_path.unlink(missing_ok=True)
-    raise RuntimeError(f"qwen agent daemon did not respond within {timeout_s}s")
+    raise RuntimeError(f"sglang agent daemon did not respond within {timeout_s}s")
 
 
 def daemon_is_responding() -> bool:
@@ -150,7 +156,7 @@ def start_daemon_process() -> None:
         path.unlink()
     log_handle = daemon_log_path().open("a", encoding="utf-8")
     subprocess.Popen(
-        [sys.executable, "-m", "computer_use_raw_python_agent.qwen_daemon", "serve"],
+        [sys.executable, "-m", "computer_use_raw_python_agent.sglang_daemon", "serve"],
         stdin=subprocess.DEVNULL,
         stdout=log_handle,
         stderr=log_handle,
@@ -165,7 +171,7 @@ def wait_for_daemon_ready(timeout_s: float = 10.0) -> None:
         if daemon_is_responding():
             return
         time.sleep(0.1)
-    raise RuntimeError(f"qwen agent daemon did not become ready within {timeout_s}s")
+    raise RuntimeError(f"sglang agent daemon did not become ready within {timeout_s}s")
 
 
 def _merge_defaults(current: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
@@ -229,29 +235,29 @@ def _handle_reload(daemon_state: AgentDaemonState, payload: dict[str, Any]) -> d
     model_id = str(payload.get("model_id") or daemon_state.model_id)
     processor_id = payload.get("processor_id")
     defaults = _merge_defaults(daemon_state.defaults, dict(payload.get("defaults", {})))
+    if daemon_state.runtime is not None:
+        daemon_state.runtime.shutdown()
+        daemon_state.runtime = None
     daemon_state.model_id = model_id
     daemon_state.processor_id = str(processor_id) if processor_id else None
-    daemon_state.compute_dtype = str(payload.get("compute_dtype") or daemon_state.compute_dtype)
-    daemon_state.device_map = str(payload.get("device_map") or daemon_state.device_map)
-    daemon_state.load_in_4bit = bool(payload.get("load_in_4bit", not bool(payload.get("disable_4bit", False))))
-    daemon_state.load_in_8bit = bool(payload.get("load_in_8bit", daemon_state.load_in_8bit))
-    if daemon_state.load_in_4bit and daemon_state.load_in_8bit:
-        raise RuntimeError("load_in_4bit and load_in_8bit cannot both be enabled")
-    daemon_state.enable_fp32_cpu_offload = bool(
-        payload.get("enable_fp32_cpu_offload", not bool(payload.get("disable_cpu_offload", False)))
-    )
     daemon_state.defaults = defaults
     daemon_state.phase = "loading"
     _write_state_file(os.getpid(), daemon_state.to_public_dict())
-    daemon_state.runtime = Qwen35RawPythonRuntime(
+    daemon_state.runtime = Qwen35SGLangRuntime(
         model_id=daemon_state.model_id,
-        processor_id=daemon_state.processor_id,
         max_new_tokens=int(defaults.get("max_new_tokens", 256)),
-        load_in_4bit=daemon_state.load_in_4bit,
-        load_in_8bit=daemon_state.load_in_8bit,
-        compute_dtype=daemon_state.compute_dtype,
-        device_map=daemon_state.device_map,
-        enable_fp32_cpu_offload=daemon_state.enable_fp32_cpu_offload,
+        server_host=str(defaults.get("sglang_server_host", "127.0.0.1")),
+        server_port=int(defaults.get("sglang_server_port", 31000)),
+        server_ready_timeout_s=float(defaults.get("sglang_server_ready_timeout_s", 180.0)),
+        request_timeout_s=float(defaults.get("sglang_request_timeout_s", 180.0)),
+        server_python=defaults.get("sglang_server_python"),
+        server_extra_args=list(defaults.get("sglang_server_extra_args", [])),
+        trust_remote_code=bool(defaults.get("sglang_trust_remote_code", True)),
+        dtype=str(defaults.get("sglang_dtype", "auto")),
+        tp_size=int(defaults.get("sglang_tp_size", 1)),
+        mem_fraction_static=defaults.get("sglang_mem_fraction_static"),
+        served_model_name=defaults.get("sglang_served_model_name"),
+        server_log_path=str(daemon_server_log_path()),
     )
     daemon_state.runtime.ensure_loaded()
     daemon_state.phase = "ready"
@@ -265,11 +271,6 @@ def _serve() -> int:
     daemon_state = AgentDaemonState(
         model_id="",
         processor_id=None,
-        compute_dtype="bfloat16",
-        device_map="auto",
-        load_in_4bit=True,
-        load_in_8bit=False,
-        enable_fp32_cpu_offload=True,
         defaults={},
         phase="idle",
     )
@@ -290,6 +291,8 @@ def _serve() -> int:
                     elif action == "run":
                         response = _handle_run(daemon_state, payload)
                     elif action == "shutdown":
+                        if daemon_state.runtime is not None:
+                            daemon_state.runtime.shutdown()
                         response = {"ok": True}
                         response_path.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
                         request_path.unlink(missing_ok=True)
@@ -310,12 +313,14 @@ def _serve() -> int:
             if not handled_any:
                 time.sleep(0.05)
     finally:
+        if daemon_state.runtime is not None:
+            daemon_state.runtime.shutdown()
         daemon_state_path().unlink(missing_ok=True)
 
 
 def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] != "serve":
-        raise SystemExit("usage: python -m computer_use_raw_python_agent.qwen_daemon serve")
+        raise SystemExit("usage: python -m computer_use_raw_python_agent.sglang_daemon serve")
     raise SystemExit(_serve())
 
 

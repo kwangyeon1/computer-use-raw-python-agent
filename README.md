@@ -90,6 +90,47 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-ag
 - `dependency_repair_allow_shell_fallback = true` 또는 `--dependency-repair-allow-shell-fallback`
   - pip 기반 복구 뒤에도 필요하면 subprocess 기반 shell/batch 설치 경로를 한 번 더 시도할 수 있게 합니다.
 
+## Qwen Variants
+
+`transformers` 기반 Qwen 경로는 기존대로 [qwen-computer-use-agent](/home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-agent/pyproject.toml) 를 사용합니다.
+
+SGLang으로 같은 agent loop / executor I/O 계약을 유지하면서 모델 서빙을 분리하려면 `qwen-sglang`를 사용합니다.
+
+이 경로는 agent와 같은 Python 환경에서 `python -m sglang.launch_server`를 실행하므로, `sglang` 패키지가 해당 `.venv`에 설치되어 있어야 합니다.
+
+```bash
+./.venv/bin/qwen-sglang \
+  --model-id /home/kss930/model-projects/gui-owl-8B-think-1.0.0/models/Qwen3.5-9B \
+  --endpoint http://127.0.0.1:8790
+```
+
+이 경로는 별도 daemon/runtime 파일을 사용합니다.
+- `src/computer_use_raw_python_agent/sglang_cli.py`
+- `src/computer_use_raw_python_agent/sglang_daemon.py`
+- `src/computer_use_raw_python_agent/sglang_runtime.py`
+- `src/computer_use_raw_python_agent/sglang_config.py`
+
+기본 설정은 [config/agent.qwen35.sglang.default.json](/home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-agent/config/agent.qwen35.sglang.default.json) 에 있습니다.
+
+SGLang variant의 모델/서버 설정은 `transformers` 경로와 다릅니다.
+- `sglang_server_host`
+- `sglang_server_port`
+- `sglang_server_ready_timeout_s`
+- `sglang_request_timeout_s`
+- `sglang_dtype`
+- `sglang_tp_size`
+- `sglang_mem_fraction_static`
+- `sglang_server_extra_args`
+
+하지만 executor에 주고받는 입력/출력 계약은 기존 Qwen agent와 동일합니다.
+
+Qwen 경로와 SGLang 경로 모두 `reasoning_enabled`를 지원합니다.
+- 기본값: `false`
+- CLI: `--reasoning-enabled`
+- config: `"reasoning_enabled": true`
+
+이 옵션은 모델이 내부 추론을 사용할 수 있게 허용하지만, 최종 출력 계약은 그대로 `executable Python only`입니다.
+
 ## 남긴 파일
 
 - `src/computer_use_raw_python_agent/cli.py`

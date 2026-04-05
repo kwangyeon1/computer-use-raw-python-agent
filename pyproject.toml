@@ -18,6 +18,7 @@ train = ["accelerate", "bitsandbytes", "datasets", "peft", "pillow", "torch", "t
 [project.scripts]
 computer-use-raw-python-agent = "computer_use_raw_python_agent.cli:main"
 qwen-computer-use-agent = "computer_use_raw_python_agent.qwen_cli:main"
+qwen-sglang = "computer_use_raw_python_agent.sglang_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
