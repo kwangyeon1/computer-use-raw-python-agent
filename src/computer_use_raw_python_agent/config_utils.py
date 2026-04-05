@@ -48,6 +48,8 @@ def load_agent_config(path: str | None) -> tuple[dict[str, Any], Path | None]:
         normalized["enable_fp32_cpu_offload"] = bool(data["enable_fp32_cpu_offload"])
     if "strong_visual_grounding" in data:
         normalized["strong_visual_grounding"] = bool(data["strong_visual_grounding"])
+    if "reasoning_enabled" in data:
+        normalized["reasoning_enabled"] = bool(data["reasoning_enabled"])
     if "replan_enabled" in data:
         normalized["replan_enabled"] = bool(data["replan_enabled"])
     if "replan_max_attempts" in data:

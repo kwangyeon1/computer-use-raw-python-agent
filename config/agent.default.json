@@ -5,6 +5,7 @@
   "max_iterations": 5,
   "max_new_tokens": 256,
   "strong_visual_grounding": false,
+  "reasoning_enabled": false,
   "replan_enabled": false,
   "replan_max_attempts": 1,
   "dependency_repair_enabled": false,

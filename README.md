@@ -56,6 +56,7 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-ag
   "max_iterations": 5,
   "max_new_tokens": 256,
   "strong_visual_grounding": false,
+  "reasoning_enabled": false,
   "replan_enabled": false,
   "replan_max_attempts": 1,
   "dependency_repair_enabled": false,
@@ -71,6 +72,12 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-ag
 - `strong_visual_grounding = true` 또는 `--strong-visual-grounding`
   - system/user prompt에 현재 스크린샷을 1차 근거로 사용하라는 규칙을 추가합니다.
   - 같은 사용자 요청만 반복적으로 따르기보다, 현재 화면 변화와 최근 실행 결과를 더 강하게 반영하도록 유도합니다.
+
+추론 기능도 옵션으로만 켤 수 있습니다.
+- 기본값: `reasoning_enabled = false`
+- `reasoning_enabled = true` 또는 `--reasoning-enabled`
+  - 모델이 다음 행동을 정할 때 추가 추론을 허용합니다.
+  - 그래도 최종 출력 계약은 그대로 유지되며, agent는 실행 가능한 Python만 추출해서 executor로 보냅니다.
 
 `replan_enabled`를 켜면 agent는 다음 조건에서 새 전략을 유도합니다.
 - 직전과 같은 Python 코드가 다시 실행됨

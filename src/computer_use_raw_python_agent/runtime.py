@@ -16,11 +16,12 @@ _DEFAULT_BLANK_IMAGE_COLOR = (255, 255, 255)
 
 
 def extract_python_code(text: str) -> str:
-    stripped = text.strip()
-    fenced = re.search(r"```python\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    without_think = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    stripped = without_think.strip()
+    fenced = re.search(r"```python\s*(.*?)```", without_think, flags=re.DOTALL | re.IGNORECASE)
     if fenced:
         return fenced.group(1).strip()
-    generic = re.search(r"```\s*(.*?)```", text, flags=re.DOTALL)
+    generic = re.search(r"```\s*(.*?)```", without_think, flags=re.DOTALL)
     if generic:
         return generic.group(1).strip()
     if stripped.startswith("```"):
@@ -30,6 +31,8 @@ def extract_python_code(text: str) -> str:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         return "\n".join(lines).strip()
+    if "</think>" in text:
+        return text.rsplit("</think>", 1)[-1].strip()
     return stripped
 
 

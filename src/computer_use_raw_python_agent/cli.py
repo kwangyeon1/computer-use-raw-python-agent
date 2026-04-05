@@ -34,6 +34,7 @@ def _collect_explicit_overrides(args: argparse.Namespace) -> dict:
         "max_iterations",
         "max_new_tokens",
         "strong_visual_grounding",
+        "reasoning_enabled",
         "replan_enabled",
         "replan_max_attempts",
         "dependency_repair_enabled",
@@ -198,6 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-iterations", type=int)
     parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--strong-visual-grounding", action="store_true", default=None)
+    parser.add_argument("--reasoning-enabled", action="store_true", default=None)
     parser.add_argument("--replan-enabled", action="store_true", default=None)
     parser.add_argument("--replan-max-attempts", type=int)
     parser.add_argument("--dependency-repair-enabled", action="store_true", default=None)

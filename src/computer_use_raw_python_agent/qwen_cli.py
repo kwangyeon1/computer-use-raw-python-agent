@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sys
 import time
 
 from .config_utils import load_agent_config
@@ -19,9 +20,31 @@ from .qwen_daemon import (
 from .qwen_runtime import default_qwen35_model_id
 
 
+def _find_existing_path(candidates: list[Path]) -> Path | None:
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved.exists():
+            return resolved
+    return None
+
+
 def _default_qwen_config_path() -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    return (repo_root / "config" / "agent.qwen35.default.json").resolve()
+    candidates: list[Path] = []
+    cwd = Path.cwd()
+    candidates.append(cwd / "config" / "agent.qwen35.default.json")
+    argv0 = Path(sys.argv[0]).resolve()
+    for parent in argv0.parents:
+        candidates.append(parent / "config" / "agent.qwen35.default.json")
+    module_path = Path(__file__).resolve()
+    for parent in module_path.parents:
+        candidates.append(parent / "config" / "agent.qwen35.default.json")
+    resolved = _find_existing_path(candidates)
+    if resolved is not None:
+        return resolved
+    return (cwd / "config" / "agent.qwen35.default.json").resolve()
 
 
 def _load_qwen_agent_config(path: str | None) -> tuple[dict, Path | None]:
@@ -46,6 +69,7 @@ def _collect_explicit_overrides(args: argparse.Namespace) -> dict:
         "max_iterations",
         "max_new_tokens",
         "strong_visual_grounding",
+        "reasoning_enabled",
         "replan_enabled",
         "replan_max_attempts",
         "dependency_repair_enabled",
@@ -255,6 +279,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-iterations", type=int)
     parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--strong-visual-grounding", action="store_true", default=None)
+    parser.add_argument("--reasoning-enabled", action="store_true", default=None)
     parser.add_argument("--replan-enabled", action="store_true", default=None)
     parser.add_argument("--replan-max-attempts", type=int)
     parser.add_argument("--dependency-repair-enabled", action="store_true", default=None)
