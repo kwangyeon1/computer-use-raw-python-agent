@@ -37,6 +37,12 @@ def _collect_explicit_overrides(args: argparse.Namespace) -> dict:
         "reasoning_enabled",
         "replan_enabled",
         "replan_max_attempts",
+        "web_search_enabled",
+        "web_search_engine",
+        "searxng_base_url",
+        "web_search_top_k",
+        "web_search_max_uses",
+        "web_search_timeout_s",
         "dependency_repair_enabled",
         "dependency_repair_max_attempts",
         "dependency_repair_allow_shell_fallback",
@@ -202,6 +208,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reasoning-enabled", action="store_true", default=None)
     parser.add_argument("--replan-enabled", action="store_true", default=None)
     parser.add_argument("--replan-max-attempts", type=int)
+    parser.add_argument("--web-search-enabled", action="store_true", default=None)
+    parser.add_argument("--web-search-engine")
+    parser.add_argument("--searxng-base-url")
+    parser.add_argument("--web-search-top-k", type=int)
+    parser.add_argument("--web-search-max-uses", type=int)
+    parser.add_argument("--web-search-timeout-s", type=float)
     parser.add_argument("--dependency-repair-enabled", action="store_true", default=None)
     parser.add_argument("--dependency-repair-max-attempts", type=int)
     parser.add_argument("--dependency-repair-allow-shell-fallback", action="store_true", default=None)

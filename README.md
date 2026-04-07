@@ -59,6 +59,12 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-ag
   "reasoning_enabled": false,
   "replan_enabled": false,
   "replan_max_attempts": 1,
+  "web_search_enabled": false,
+  "web_search_engine": "searxng",
+  "searxng_base_url": "http://127.0.0.1:8080",
+  "web_search_top_k": 5,
+  "web_search_max_uses": 3,
+  "web_search_timeout_s": 10,
   "dependency_repair_enabled": false,
   "dependency_repair_max_attempts": 2,
   "dependency_repair_allow_shell_fallback": false,
@@ -85,6 +91,34 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-ag
 - 최신 스크린샷 해시가 직전과 같아서 화면 변화가 없음
 
 `replan_max_attempts`는 세션당 이 재계획 유도 신호를 몇 번까지 보낼지 정합니다.
+
+웹서치도 옵션으로만 켤 수 있습니다.
+- 기본값: `web_search_enabled = false`
+- `web_search_enabled = true` 또는 `--web-search-enabled`
+  - agent는 매 step마다 먼저 모델에게 `지금 웹서치가 필요한지`를 JSON으로 결정하게 합니다.
+  - 검색 타이밍은 하드코딩 규칙이 아니라 모델이 현재 화면, 직전 실행 결과, replan 상태를 보고 정합니다.
+  - 검색이 필요하다고 결정되면 `SearXNG` JSON API를 호출하고, 상위 결과를 다음 Python 생성 프롬프트에 `web_search_context`로 주입합니다.
+- `web_search_engine`
+  - 현재는 `searxng`만 지원합니다.
+- `searxng_base_url`
+  - 예: `http://127.0.0.1:8080`
+- `web_search_top_k`
+  - 모델 프롬프트에 넣을 검색 결과 개수입니다.
+- `web_search_max_uses`
+  - 세션당 실제 웹 검색 최대 횟수입니다.
+- `web_search_timeout_s`
+  - SearXNG 요청 timeout입니다.
+
+예:
+
+```bash
+./.venv/bin/qwen-computer-use-agent \
+  --model-id /home/kss930/model-projects/gui-owl-8B-think-1.0.0/models/Qwen3.5-9B \
+  --endpoint http://127.0.0.1:8790 \
+  --reasoning-enabled \
+  --web-search-enabled \
+  --searxng-base-url http://127.0.0.1:8080
+```
 
 의존성 자동 복구도 옵션으로만 켤 수 있습니다.
 - 기본값: `dependency_repair_enabled = false`

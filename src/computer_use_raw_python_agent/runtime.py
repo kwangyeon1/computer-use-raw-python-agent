@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .models import GeneratedCode, PromptBundle
+    from .models import GeneratedCode, GeneratedText, PromptBundle
 except ImportError:  # pragma: no cover - direct script execution fallback
-    from models import GeneratedCode, PromptBundle
+    from models import GeneratedCode, GeneratedText, PromptBundle
 
 
 _DEFAULT_BLANK_IMAGE_SIZE = (64, 64)
@@ -127,6 +127,56 @@ class GUIOwlRawPythonRuntime:
         use_blank_image: bool = True,
         max_new_tokens: int | None = None,
     ) -> GeneratedCode:
+        raw_text, rendered_prompt = self._generate_raw_text(
+            prompt_bundle=prompt_bundle,
+            image_path=image_path,
+            image_bytes=image_bytes,
+            use_blank_image=use_blank_image,
+            max_new_tokens=max_new_tokens,
+        )
+        code = extract_python_code(raw_text)
+        return GeneratedCode(
+            code=code,
+            raw_text=raw_text,
+            rendered_prompt=str(rendered_prompt),
+            model_id=self.model_id,
+            prompt_bundle=prompt_bundle.to_dict(),
+            screenshot_path=str(Path(image_path).resolve()) if image_path else None,
+        )
+
+    def generate_text(
+        self,
+        *,
+        prompt_bundle: PromptBundle,
+        image_path: str | Path | None = None,
+        image_bytes: bytes | None = None,
+        use_blank_image: bool = True,
+        max_new_tokens: int | None = None,
+    ) -> GeneratedText:
+        raw_text, rendered_prompt = self._generate_raw_text(
+            prompt_bundle=prompt_bundle,
+            image_path=image_path,
+            image_bytes=image_bytes,
+            use_blank_image=use_blank_image,
+            max_new_tokens=max_new_tokens,
+        )
+        return GeneratedText(
+            text=raw_text,
+            rendered_prompt=str(rendered_prompt),
+            model_id=self.model_id,
+            prompt_bundle=prompt_bundle.to_dict(),
+            screenshot_path=str(Path(image_path).resolve()) if image_path else None,
+        )
+
+    def _generate_raw_text(
+        self,
+        *,
+        prompt_bundle: PromptBundle,
+        image_path: str | Path | None = None,
+        image_bytes: bytes | None = None,
+        use_blank_image: bool = True,
+        max_new_tokens: int | None = None,
+    ) -> tuple[str, str]:
         self.ensure_loaded()
         image = self._load_image(image_path, image_bytes=image_bytes, use_blank_image=use_blank_image)
         messages = [
@@ -163,15 +213,7 @@ class GUIOwlRawPythonRuntime:
         prompt_length = int(batch["input_ids"].shape[-1])
         generated = outputs[:, prompt_length:]
         raw_text = self.processor.batch_decode(generated, skip_special_tokens=True)[0].strip()
-        code = extract_python_code(raw_text)
-        return GeneratedCode(
-            code=code,
-            raw_text=raw_text,
-            rendered_prompt=str(rendered_prompt),
-            model_id=self.model_id,
-            prompt_bundle=prompt_bundle.to_dict(),
-            screenshot_path=str(Path(image_path).resolve()) if image_path else None,
-        )
+        return raw_text, str(rendered_prompt)
 
     def _move_batch_to_target_device(self, batch: dict[str, Any]) -> dict[str, Any]:
         if self._target_device is None:
