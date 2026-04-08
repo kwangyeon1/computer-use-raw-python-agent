@@ -41,6 +41,7 @@ class PromptBundle:
     observation_text: str | None = None
     last_execution: dict[str, Any] = field(default_factory=dict)
     stderr_tail: str | None = None
+    web_search_context: dict[str, Any] = field(default_factory=dict)
     recent_history: list[str] = field(default_factory=list)
     replan_requested: bool = False
     replan_reasons: list[str] = field(default_factory=list)
@@ -53,6 +54,18 @@ class PromptBundle:
 class GeneratedCode:
     code: str
     raw_text: str
+    rendered_prompt: str
+    model_id: str
+    prompt_bundle: dict[str, Any]
+    screenshot_path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class GeneratedText:
+    text: str
     rendered_prompt: str
     model_id: str
     prompt_bundle: dict[str, Any]
@@ -76,6 +89,7 @@ class StepRequest:
     screenshot_base64: str | None = None
     screenshot_media_type: str | None = None
     observation_text: str | None = None
+    web_search_context: dict[str, Any] = field(default_factory=dict)
     recent_history: list[str] = field(default_factory=list)
     last_execution: dict[str, Any] = field(default_factory=dict)
     step_index: int = 0
@@ -95,6 +109,7 @@ class StepRequest:
             screenshot_base64=data.get("screenshot_base64"),
             screenshot_media_type=data.get("screenshot_media_type"),
             observation_text=data.get("observation_text"),
+            web_search_context=dict(data.get("web_search_context", {})),
             recent_history=[str(item) for item in data.get("recent_history", [])],
             last_execution=dict(data.get("last_execution", {})),
             step_index=int(data.get("step_index", 0)),

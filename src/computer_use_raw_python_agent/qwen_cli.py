@@ -72,6 +72,16 @@ def _collect_explicit_overrides(args: argparse.Namespace) -> dict:
         "reasoning_enabled",
         "replan_enabled",
         "replan_max_attempts",
+        "web_search_enabled",
+        "web_search_engine",
+        "searxng_base_url",
+        "searxng_preferred_engines",
+        "web_search_decision_use_image",
+        "web_search_decision_reasoning_enabled",
+        "web_search_decision_max_new_tokens",
+        "web_search_top_k",
+        "web_search_max_uses",
+        "web_search_timeout_s",
         "dependency_repair_enabled",
         "dependency_repair_max_attempts",
         "dependency_repair_allow_shell_fallback",
@@ -83,6 +93,8 @@ def _collect_explicit_overrides(args: argparse.Namespace) -> dict:
             overrides[key] = value
     if args.mcp_command:
         overrides["mcp_command"] = list(args.mcp_command)
+    if args.searxng_preferred_engine:
+        overrides["searxng_preferred_engines"] = list(args.searxng_preferred_engine)
     return overrides
 
 
@@ -282,6 +294,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reasoning-enabled", action="store_true", default=None)
     parser.add_argument("--replan-enabled", action="store_true", default=None)
     parser.add_argument("--replan-max-attempts", type=int)
+    parser.add_argument("--web-search-enabled", action="store_true", default=None)
+    parser.add_argument("--web-search-engine")
+    parser.add_argument("--searxng-base-url")
+    parser.add_argument("--searxng-preferred-engine", action="append")
+    parser.add_argument("--web-search-decision-use-image", action="store_true", default=None)
+    parser.add_argument("--web-search-decision-reasoning-enabled", action="store_true", default=None)
+    parser.add_argument("--web-search-decision-max-new-tokens", type=int)
+    parser.add_argument("--web-search-top-k", type=int)
+    parser.add_argument("--web-search-max-uses", type=int)
+    parser.add_argument("--web-search-timeout-s", type=float)
     parser.add_argument("--dependency-repair-enabled", action="store_true", default=None)
     parser.add_argument("--dependency-repair-max-attempts", type=int)
     parser.add_argument("--dependency-repair-allow-shell-fallback", action="store_true", default=None)

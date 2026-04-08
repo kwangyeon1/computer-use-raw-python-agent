@@ -6,34 +6,64 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .models import GeneratedCode, PromptBundle
+    from .models import GeneratedCode, GeneratedText, PromptBundle
 except ImportError:  # pragma: no cover - direct script execution fallback
-    from models import GeneratedCode, PromptBundle
+    from models import GeneratedCode, GeneratedText, PromptBundle
 
 
 _DEFAULT_BLANK_IMAGE_SIZE = (64, 64)
 _DEFAULT_BLANK_IMAGE_COLOR = (255, 255, 255)
 
 
+def _is_compilable_python(code: str) -> bool:
+    try:
+        compile(code, "<agent-generated>", "exec")
+        return True
+    except SyntaxError:
+        return False
+
+
+def _trim_to_compilable_python(code: str) -> str:
+    stripped = code.rstrip()
+    if not stripped or _is_compilable_python(stripped):
+        return stripped
+
+    lines = stripped.splitlines()
+    while lines:
+        lines = lines[:-1]
+        candidate = "\n".join(lines).rstrip()
+        if not candidate:
+            break
+        if _is_compilable_python(candidate):
+            return candidate
+    return stripped
+
+
+def _extract_code_from_candidate(text: str) -> str:
+    stripped = text.strip()
+    fenced = re.search(r"```python\s*(.*?)```", stripped, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        return _trim_to_compilable_python(fenced.group(1).strip())
+    generic = re.search(r"```\s*(.*?)```", stripped, flags=re.DOTALL)
+    if generic:
+        return _trim_to_compilable_python(generic.group(1).strip())
+    opening_fence = re.search(r"```(?:python)?\s*", stripped, flags=re.IGNORECASE)
+    if opening_fence:
+        candidate = stripped[opening_fence.end() :]
+        closing_fence = re.search(r"\n```", candidate)
+        if closing_fence:
+            candidate = candidate[: closing_fence.start()]
+        return _trim_to_compilable_python(candidate.strip())
+    return _trim_to_compilable_python(stripped)
+
+
 def extract_python_code(text: str) -> str:
     without_think = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    stripped = without_think.strip()
-    fenced = re.search(r"```python\s*(.*?)```", without_think, flags=re.DOTALL | re.IGNORECASE)
-    if fenced:
-        return fenced.group(1).strip()
-    generic = re.search(r"```\s*(.*?)```", without_think, flags=re.DOTALL)
-    if generic:
-        return generic.group(1).strip()
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        if lines:
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        return "\n".join(lines).strip()
-    if "</think>" in text:
-        return text.rsplit("</think>", 1)[-1].strip()
-    return stripped
+    if "</think>" in without_think:
+        tail = without_think.rsplit("</think>", 1)[-1]
+        if tail.strip():
+            return _extract_code_from_candidate(tail)
+    return _extract_code_from_candidate(without_think)
 
 
 class GUIOwlRawPythonRuntime:
@@ -127,6 +157,56 @@ class GUIOwlRawPythonRuntime:
         use_blank_image: bool = True,
         max_new_tokens: int | None = None,
     ) -> GeneratedCode:
+        raw_text, rendered_prompt = self._generate_raw_text(
+            prompt_bundle=prompt_bundle,
+            image_path=image_path,
+            image_bytes=image_bytes,
+            use_blank_image=use_blank_image,
+            max_new_tokens=max_new_tokens,
+        )
+        code = extract_python_code(raw_text)
+        return GeneratedCode(
+            code=code,
+            raw_text=raw_text,
+            rendered_prompt=str(rendered_prompt),
+            model_id=self.model_id,
+            prompt_bundle=prompt_bundle.to_dict(),
+            screenshot_path=str(Path(image_path).resolve()) if image_path else None,
+        )
+
+    def generate_text(
+        self,
+        *,
+        prompt_bundle: PromptBundle,
+        image_path: str | Path | None = None,
+        image_bytes: bytes | None = None,
+        use_blank_image: bool = True,
+        max_new_tokens: int | None = None,
+    ) -> GeneratedText:
+        raw_text, rendered_prompt = self._generate_raw_text(
+            prompt_bundle=prompt_bundle,
+            image_path=image_path,
+            image_bytes=image_bytes,
+            use_blank_image=use_blank_image,
+            max_new_tokens=max_new_tokens,
+        )
+        return GeneratedText(
+            text=raw_text,
+            rendered_prompt=str(rendered_prompt),
+            model_id=self.model_id,
+            prompt_bundle=prompt_bundle.to_dict(),
+            screenshot_path=str(Path(image_path).resolve()) if image_path else None,
+        )
+
+    def _generate_raw_text(
+        self,
+        *,
+        prompt_bundle: PromptBundle,
+        image_path: str | Path | None = None,
+        image_bytes: bytes | None = None,
+        use_blank_image: bool = True,
+        max_new_tokens: int | None = None,
+    ) -> tuple[str, str]:
         self.ensure_loaded()
         image = self._load_image(image_path, image_bytes=image_bytes, use_blank_image=use_blank_image)
         messages = [
@@ -143,6 +223,7 @@ class GUIOwlRawPythonRuntime:
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=bool(prompt_bundle.reasoning_enabled),
         )
         processor_kwargs: dict[str, Any] = {
             "text": [rendered_prompt],
@@ -163,15 +244,7 @@ class GUIOwlRawPythonRuntime:
         prompt_length = int(batch["input_ids"].shape[-1])
         generated = outputs[:, prompt_length:]
         raw_text = self.processor.batch_decode(generated, skip_special_tokens=True)[0].strip()
-        code = extract_python_code(raw_text)
-        return GeneratedCode(
-            code=code,
-            raw_text=raw_text,
-            rendered_prompt=str(rendered_prompt),
-            model_id=self.model_id,
-            prompt_bundle=prompt_bundle.to_dict(),
-            screenshot_path=str(Path(image_path).resolve()) if image_path else None,
-        )
+        return raw_text, str(rendered_prompt)
 
     def _move_batch_to_target_device(self, batch: dict[str, Any]) -> dict[str, Any]:
         if self._target_device is None:

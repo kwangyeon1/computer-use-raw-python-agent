@@ -54,6 +54,26 @@ def load_agent_config(path: str | None) -> tuple[dict[str, Any], Path | None]:
         normalized["replan_enabled"] = bool(data["replan_enabled"])
     if "replan_max_attempts" in data:
         normalized["replan_max_attempts"] = int(data["replan_max_attempts"])
+    if "web_search_enabled" in data:
+        normalized["web_search_enabled"] = bool(data["web_search_enabled"])
+    if "web_search_engine" in data:
+        normalized["web_search_engine"] = str(data["web_search_engine"])
+    if "searxng_base_url" in data:
+        normalized["searxng_base_url"] = str(data["searxng_base_url"])
+    if "searxng_preferred_engines" in data:
+        normalized["searxng_preferred_engines"] = [str(item) for item in data["searxng_preferred_engines"]]
+    if "web_search_decision_use_image" in data:
+        normalized["web_search_decision_use_image"] = bool(data["web_search_decision_use_image"])
+    if "web_search_decision_reasoning_enabled" in data:
+        normalized["web_search_decision_reasoning_enabled"] = bool(data["web_search_decision_reasoning_enabled"])
+    if "web_search_decision_max_new_tokens" in data:
+        normalized["web_search_decision_max_new_tokens"] = int(data["web_search_decision_max_new_tokens"])
+    if "web_search_top_k" in data:
+        normalized["web_search_top_k"] = int(data["web_search_top_k"])
+    if "web_search_max_uses" in data:
+        normalized["web_search_max_uses"] = int(data["web_search_max_uses"])
+    if "web_search_timeout_s" in data:
+        normalized["web_search_timeout_s"] = float(data["web_search_timeout_s"])
     if "dependency_repair_enabled" in data:
         normalized["dependency_repair_enabled"] = bool(data["dependency_repair_enabled"])
     if "dependency_repair_max_attempts" in data:
