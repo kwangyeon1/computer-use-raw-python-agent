@@ -15,11 +15,16 @@ RAW_PYTHON_SYSTEM_PROMPT = """You are a vision-conditioned local computer-use co
 Return executable Python only.
 Do not return markdown.
 Do not explain your reasoning.
+Return exactly one standalone Python script and then stop.
+The first non-empty line of the final answer must be Python code or a Python comment.
+Never start the final answer with prose, bullets, JSON, XML, or markdown fences.
+Never wrap code in ``` fences.
 
 You may use unrestricted local Python if the runtime policy allows it.
 You may perform GUI actions, file operations, subprocess execution, and network calls.
 
 Prefer concise, deterministic code.
+Prefer the shortest script that can correctly complete the next step.
 Prefer helper functions when possible:
 - focus_window
 - press_key
@@ -33,6 +38,12 @@ Prefer helper functions when possible:
 If helper functions are not sufficient, direct library usage is allowed.
 Always generate code that can run as a standalone script.
 When using keyboard automation, pay attention to the currently focused window and the active input locale / IME (for example Korean vs English) before typing.
+
+If the task is already complete from the current screenshot and latest execution state:
+- Return a minimal Python no-op or confirmation script only.
+- Put `# task_complete` on the first line.
+- Do not continue exploring or retrying alternate approaches in that response.
+- Do not use `# task_complete` unless the task is already complete.
 
 If request_kind is dependency_repair:
 - Generate Python only for repairing the reported dependency issue.
@@ -57,8 +68,10 @@ REASONING_ENABLED_APPEND = """
 If reasoning_enabled is true:
 - You may use extra internal reasoning to choose the next action.
 - Keep the final answer strictly executable Python only.
+- Keep all reasoning internal and never reveal it in the final answer.
 - Do not include prose outside Python.
-- If the model emits <think> or similar reasoning markers, ensure the executable Python remains extractable as the final output.
+- End generation as soon as the Python script is complete.
+- If the task is complete, emit `# task_complete` on the first line of the final Python script.
 """
 
 STRONG_VISUAL_GROUNDING_APPEND = """
@@ -256,6 +269,7 @@ def render_prompt_bundle_from_step_request(request: StepRequest) -> PromptBundle
 def render_web_search_decision_bundle_from_step_request(
     request: StepRequest,
     *,
+    reasoning_enabled: bool,
     web_search_max_uses: int,
     web_search_uses: int,
     web_search_queries: Iterable[str] | None = None,
@@ -263,7 +277,7 @@ def render_web_search_decision_bundle_from_step_request(
     policy = RuntimePolicy.from_dict(request.policy)
     current_month_year = datetime.now().astimezone().strftime("%B %Y")
     system_prompt = WEB_SEARCH_DECISION_SYSTEM_PROMPT + f"\nCurrent local month/year: {current_month_year}\n"
-    if request.reasoning_enabled:
+    if reasoning_enabled:
         system_prompt += "\nKeep all reasoning internal. Never reveal chain-of-thought. Output only the JSON object.\n"
     last_execution_payload = _compact_last_execution_for_prompt(request.last_execution)
     payload = {
@@ -290,7 +304,7 @@ def render_web_search_decision_bundle_from_step_request(
         user_prompt=json.dumps(payload, ensure_ascii=False, indent=2),
         session_prompt=request.user_prompt,
         policy=policy.to_dict(),
-        reasoning_enabled=False,
+        reasoning_enabled=reasoning_enabled,
         observation_text=request.observation_text,
         last_execution=last_execution_payload,
         stderr_tail=last_execution_payload.get("stderr_tail"),

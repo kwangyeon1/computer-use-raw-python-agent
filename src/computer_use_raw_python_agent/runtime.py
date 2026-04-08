@@ -15,25 +15,55 @@ _DEFAULT_BLANK_IMAGE_SIZE = (64, 64)
 _DEFAULT_BLANK_IMAGE_COLOR = (255, 255, 255)
 
 
+def _is_compilable_python(code: str) -> bool:
+    try:
+        compile(code, "<agent-generated>", "exec")
+        return True
+    except SyntaxError:
+        return False
+
+
+def _trim_to_compilable_python(code: str) -> str:
+    stripped = code.rstrip()
+    if not stripped or _is_compilable_python(stripped):
+        return stripped
+
+    lines = stripped.splitlines()
+    while lines:
+        lines = lines[:-1]
+        candidate = "\n".join(lines).rstrip()
+        if not candidate:
+            break
+        if _is_compilable_python(candidate):
+            return candidate
+    return stripped
+
+
+def _extract_code_from_candidate(text: str) -> str:
+    stripped = text.strip()
+    fenced = re.search(r"```python\s*(.*?)```", stripped, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        return _trim_to_compilable_python(fenced.group(1).strip())
+    generic = re.search(r"```\s*(.*?)```", stripped, flags=re.DOTALL)
+    if generic:
+        return _trim_to_compilable_python(generic.group(1).strip())
+    opening_fence = re.search(r"```(?:python)?\s*", stripped, flags=re.IGNORECASE)
+    if opening_fence:
+        candidate = stripped[opening_fence.end() :]
+        closing_fence = re.search(r"\n```", candidate)
+        if closing_fence:
+            candidate = candidate[: closing_fence.start()]
+        return _trim_to_compilable_python(candidate.strip())
+    return _trim_to_compilable_python(stripped)
+
+
 def extract_python_code(text: str) -> str:
     without_think = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    stripped = without_think.strip()
-    fenced = re.search(r"```python\s*(.*?)```", without_think, flags=re.DOTALL | re.IGNORECASE)
-    if fenced:
-        return fenced.group(1).strip()
-    generic = re.search(r"```\s*(.*?)```", without_think, flags=re.DOTALL)
-    if generic:
-        return generic.group(1).strip()
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        if lines:
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        return "\n".join(lines).strip()
-    if "</think>" in text:
-        return text.rsplit("</think>", 1)[-1].strip()
-    return stripped
+    if "</think>" in without_think:
+        tail = without_think.rsplit("</think>", 1)[-1]
+        if tail.strip():
+            return _extract_code_from_candidate(tail)
+    return _extract_code_from_candidate(without_think)
 
 
 class GUIOwlRawPythonRuntime:

@@ -79,6 +79,56 @@ def _is_empty_python_code(code: str) -> bool:
     return not bool(_normalize_python_code(code))
 
 
+def _has_task_complete_marker(code: str) -> bool:
+    for line in str(code or "").splitlines():
+        stripped = line.strip().lower()
+        if not stripped:
+            continue
+        return stripped.startswith("# task_complete")
+    return False
+
+
+def _looks_like_completion_noop(code: str, raw_text: str) -> bool:
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    risky_tokens = (
+        "pyautogui",
+        "subprocess",
+        "webbrowser",
+        "selenium",
+        "requests",
+        "urllib",
+        "winget",
+        "pip install",
+        "click(",
+        "press(",
+        "hotkey(",
+        "typewrite(",
+        "write(",
+        "os.startfile",
+    )
+    if any(token in normalized for token in risky_tokens):
+        return False
+    completion_phrases = (
+        "task is complete",
+        "task has been completed",
+        "already complete",
+        "already completed",
+        "completed successfully",
+        "already open and on",
+        "already on the",
+    )
+    raw_lower = str(raw_text or "").lower()
+    if not any(phrase in raw_lower for phrase in completion_phrases):
+        return False
+    return len(normalized.splitlines()) <= 20
+
+
+def _infer_response_done(*, python_code: str, raw_text: str) -> bool:
+    return _has_task_complete_marker(python_code) or _looks_like_completion_noop(python_code, raw_text)
+
+
 def _tail_history(history: list[str], *, limit: int = 2) -> list[str]:
     if limit <= 0:
         return []
@@ -154,7 +204,7 @@ def generate_step_response(
         raw_text=generated.raw_text,
         model_id=generated.model_id,
         step_index=request.step_index,
-        done=False,
+        done=_infer_response_done(python_code=generated.code, raw_text=generated.raw_text),
         notes=[],
     )
 
@@ -164,25 +214,32 @@ def generate_web_search_decision(
     request: StepRequest,
     *,
     max_new_tokens: int,
+    decision_max_new_tokens: int,
+    use_image: bool,
+    reasoning_enabled: bool,
     web_search_max_uses: int,
     web_search_uses: int,
     web_search_queries: list[str],
 ) -> tuple[WebSearchDecision, dict[str, Any]]:
     image_bytes = None
-    if request.screenshot_base64:
+    image_path = None
+    if use_image and request.screenshot_base64:
         image_bytes = base64.b64decode(request.screenshot_base64)
+    if use_image and request.screenshot_path:
+        image_path = request.screenshot_path
     bundle = render_web_search_decision_bundle_from_step_request(
         request,
+        reasoning_enabled=reasoning_enabled,
         web_search_max_uses=web_search_max_uses,
         web_search_uses=web_search_uses,
         web_search_queries=web_search_queries,
     )
     generated = runtime.generate_text(
         prompt_bundle=bundle,
-        image_path=request.screenshot_path,
+        image_path=image_path,
         image_bytes=image_bytes,
-        use_blank_image=not bool(request.screenshot_path or image_bytes),
-        max_new_tokens=min(int(max_new_tokens), 128),
+        use_blank_image=False,
+        max_new_tokens=min(int(max_new_tokens), int(decision_max_new_tokens)),
     )
     decision = WebSearchDecision.from_text(generated.text)
     return decision, generated.to_dict()
@@ -234,6 +291,9 @@ def _maybe_perform_web_search(
     step_id: str,
     history: list[str],
     max_new_tokens: int,
+    web_search_decision_use_image: bool,
+    web_search_decision_reasoning_enabled: bool,
+    web_search_decision_max_new_tokens: int,
     web_search_max_uses: int,
     web_search_uses: int,
     web_search_queries: list[str],
@@ -250,10 +310,10 @@ def _maybe_perform_web_search(
         replan_requested=request.replan_requested,
         replan_reasons=request.replan_reasons,
         strong_visual_grounding=request.strong_visual_grounding,
-        reasoning_enabled=request.reasoning_enabled,
-        screenshot_path=request.screenshot_path,
-        screenshot_base64=request.screenshot_base64,
-        screenshot_media_type=request.screenshot_media_type,
+        reasoning_enabled=web_search_decision_reasoning_enabled,
+        screenshot_path=request.screenshot_path if web_search_decision_use_image else None,
+        screenshot_base64=request.screenshot_base64 if web_search_decision_use_image else None,
+        screenshot_media_type=request.screenshot_media_type if web_search_decision_use_image else None,
         observation_text=request.observation_text,
         web_search_context={},
         recent_history=_history_for_web_search(history),
@@ -266,6 +326,9 @@ def _maybe_perform_web_search(
         runtime,
         search_request,
         max_new_tokens=max_new_tokens,
+        decision_max_new_tokens=web_search_decision_max_new_tokens,
+        use_image=web_search_decision_use_image,
+        reasoning_enabled=web_search_decision_reasoning_enabled,
         web_search_max_uses=web_search_max_uses,
         web_search_uses=web_search_uses,
         web_search_queries=web_search_queries[-3:],
@@ -491,6 +554,9 @@ def run_agent_control_loop(
     web_search_max_uses: int = 3,
     web_search_timeout_s: float = 10.0,
     searxng_preferred_engines: list[str] | None = None,
+    web_search_decision_use_image: bool = False,
+    web_search_decision_reasoning_enabled: bool = False,
+    web_search_decision_max_new_tokens: int = 64,
     dependency_repair_enabled: bool = False,
     dependency_repair_max_attempts: int = 2,
     dependency_repair_allow_shell_fallback: bool = False,
@@ -558,6 +624,9 @@ def run_agent_control_loop(
                 step_id=step_id,
                 history=history,
                 max_new_tokens=max_new_tokens,
+                web_search_decision_use_image=web_search_decision_use_image,
+                web_search_decision_reasoning_enabled=web_search_decision_reasoning_enabled,
+                web_search_decision_max_new_tokens=web_search_decision_max_new_tokens,
                 web_search_max_uses=web_search_max_uses,
                 web_search_uses=web_search_uses,
                 web_search_queries=web_search_queries,
@@ -668,6 +737,12 @@ def run_agent_control_loop(
                 last_execution = dict(repair_result.get("last_execution") or last_execution)
                 state = dict(repair_result.get("state") or state)
 
+        if response.done and int(last_execution.get("return_code", 0) or 0) == 0:
+            history.append(f"{step_id}_completed=1")
+            final_response = response.to_dict()
+            stopped_reason = stopped_reason or "task_completed"
+            break
+
         current_visual_hash = _state_visual_hash(state)
         replan_reasons: list[str] = []
         if previous_executed_code and normalized_code and normalized_code == previous_executed_code:
@@ -718,6 +793,9 @@ def run_agent_control_loop(
         "web_search_engine": web_search_engine if web_search_enabled else None,
         "searxng_base_url": searxng_base_url if web_search_enabled else None,
         "searxng_preferred_engines": normalized_preferred_search_engines if web_search_enabled else [],
+        "web_search_decision_use_image": web_search_decision_use_image if web_search_enabled else False,
+        "web_search_decision_reasoning_enabled": web_search_decision_reasoning_enabled if web_search_enabled else False,
+        "web_search_decision_max_new_tokens": web_search_decision_max_new_tokens,
         "web_search_top_k": web_search_top_k,
         "web_search_max_uses": web_search_max_uses,
         "web_search_uses": web_search_uses,
@@ -752,6 +830,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--web-search-engine", default="searxng")
     parser.add_argument("--searxng-base-url", default="http://127.0.0.1:8080")
     parser.add_argument("--searxng-preferred-engine", action="append")
+    parser.add_argument("--web-search-decision-use-image", action="store_true")
+    parser.add_argument("--web-search-decision-reasoning-enabled", action="store_true")
+    parser.add_argument("--web-search-decision-max-new-tokens", type=int, default=64)
     parser.add_argument("--web-search-top-k", type=int, default=5)
     parser.add_argument("--web-search-max-uses", type=int, default=3)
     parser.add_argument("--web-search-timeout-s", type=float, default=10.0)
@@ -801,6 +882,9 @@ def main() -> None:
             web_search_engine=args.web_search_engine,
             searxng_base_url=args.searxng_base_url,
             searxng_preferred_engines=list(args.searxng_preferred_engine or []),
+            web_search_decision_use_image=args.web_search_decision_use_image,
+            web_search_decision_reasoning_enabled=args.web_search_decision_reasoning_enabled,
+            web_search_decision_max_new_tokens=args.web_search_decision_max_new_tokens,
             web_search_top_k=args.web_search_top_k,
             web_search_max_uses=args.web_search_max_uses,
             web_search_timeout_s=args.web_search_timeout_s,
