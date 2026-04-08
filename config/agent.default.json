@@ -11,6 +11,7 @@
   "web_search_enabled": false,
   "web_search_engine": "searxng",
   "searxng_base_url": "http://127.0.0.1:8080",
+  "searxng_preferred_engines": ["google"],
   "web_search_top_k": 5,
   "web_search_max_uses": 3,
   "web_search_timeout_s": 10,

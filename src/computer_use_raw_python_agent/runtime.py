@@ -193,6 +193,7 @@ class GUIOwlRawPythonRuntime:
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=bool(prompt_bundle.reasoning_enabled),
         )
         processor_kwargs: dict[str, Any] = {
             "text": [rendered_prompt],

@@ -182,7 +182,7 @@ def generate_web_search_decision(
         image_path=request.screenshot_path,
         image_bytes=image_bytes,
         use_blank_image=not bool(request.screenshot_path or image_bytes),
-        max_new_tokens=min(int(max_new_tokens), 256),
+        max_new_tokens=min(int(max_new_tokens), 128),
     )
     decision = WebSearchDecision.from_text(generated.text)
     return decision, generated.to_dict()
@@ -240,6 +240,7 @@ def _maybe_perform_web_search(
     web_search_cache: dict[str, dict[str, Any]],
     searxng_client: SearXNGClient,
     web_search_top_k: int,
+    searxng_preferred_engines: list[str],
 ) -> tuple[dict[str, Any], int, list[str]]:
     search_request = StepRequest(
         user_prompt=request.user_prompt,
@@ -287,6 +288,7 @@ def _maybe_perform_web_search(
         decision.query,
         allowed_domains=decision.allowed_domains,
         blocked_domains=decision.blocked_domains,
+        preferred_engines=searxng_preferred_engines,
     )
     if cache_key in web_search_cache:
         cached_payload = dict(web_search_cache[cache_key])
@@ -314,6 +316,7 @@ def _maybe_perform_web_search(
             top_k=web_search_top_k,
             allowed_domains=decision.allowed_domains,
             blocked_domains=decision.blocked_domains,
+            preferred_engines=searxng_preferred_engines,
         ).to_dict()
     except Exception as exc:
         result = make_web_search_error_result(
@@ -487,6 +490,7 @@ def run_agent_control_loop(
     web_search_top_k: int = 5,
     web_search_max_uses: int = 3,
     web_search_timeout_s: float = 10.0,
+    searxng_preferred_engines: list[str] | None = None,
     dependency_repair_enabled: bool = False,
     dependency_repair_max_attempts: int = 2,
     dependency_repair_allow_shell_fallback: bool = False,
@@ -523,6 +527,7 @@ def run_agent_control_loop(
     web_search_cache: dict[str, dict[str, Any]] = {}
     dependency_repairs_used = 0
     empty_generation_retries_used = 0
+    normalized_preferred_search_engines = [str(engine).strip().lower() for engine in (searxng_preferred_engines or []) if str(engine).strip()]
     searxng_client = SearXNGClient(base_url=searxng_base_url, timeout_s=web_search_timeout_s) if web_search_enabled else None
 
     for step_index in range(max_iterations):
@@ -559,6 +564,7 @@ def run_agent_control_loop(
                 web_search_cache=web_search_cache,
                 searxng_client=searxng_client,
                 web_search_top_k=web_search_top_k,
+                searxng_preferred_engines=normalized_preferred_search_engines,
             )
             request.web_search_context = web_search_context
         request_path = root / "payloads" / f"step-{step_index:03d}.request.json"
@@ -711,6 +717,7 @@ def run_agent_control_loop(
         "web_search_enabled": web_search_enabled,
         "web_search_engine": web_search_engine if web_search_enabled else None,
         "searxng_base_url": searxng_base_url if web_search_enabled else None,
+        "searxng_preferred_engines": normalized_preferred_search_engines if web_search_enabled else [],
         "web_search_top_k": web_search_top_k,
         "web_search_max_uses": web_search_max_uses,
         "web_search_uses": web_search_uses,
@@ -744,6 +751,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--web-search-enabled", action="store_true")
     parser.add_argument("--web-search-engine", default="searxng")
     parser.add_argument("--searxng-base-url", default="http://127.0.0.1:8080")
+    parser.add_argument("--searxng-preferred-engine", action="append")
     parser.add_argument("--web-search-top-k", type=int, default=5)
     parser.add_argument("--web-search-max-uses", type=int, default=3)
     parser.add_argument("--web-search-timeout-s", type=float, default=10.0)
@@ -792,6 +800,7 @@ def main() -> None:
             web_search_enabled=args.web_search_enabled,
             web_search_engine=args.web_search_engine,
             searxng_base_url=args.searxng_base_url,
+            searxng_preferred_engines=list(args.searxng_preferred_engine or []),
             web_search_top_k=args.web_search_top_k,
             web_search_max_uses=args.web_search_max_uses,
             web_search_timeout_s=args.web_search_timeout_s,

@@ -217,6 +217,7 @@ def _handle_run(daemon_state: AgentDaemonState, payload: dict[str, Any]) -> dict
             web_search_enabled=bool(defaults.get("web_search_enabled", False)),
             web_search_engine=str(defaults.get("web_search_engine", "searxng")),
             searxng_base_url=str(defaults.get("searxng_base_url", "http://127.0.0.1:8080")),
+            searxng_preferred_engines=[str(item) for item in defaults.get("searxng_preferred_engines", ["google"])],
             web_search_top_k=int(defaults.get("web_search_top_k", 5)),
             web_search_max_uses=int(defaults.get("web_search_max_uses", 3)),
             web_search_timeout_s=float(defaults.get("web_search_timeout_s", 10.0)),

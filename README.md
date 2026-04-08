@@ -62,6 +62,7 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-ag
   "web_search_enabled": false,
   "web_search_engine": "searxng",
   "searxng_base_url": "http://127.0.0.1:8080",
+  "searxng_preferred_engines": ["google"],
   "web_search_top_k": 5,
   "web_search_max_uses": 3,
   "web_search_timeout_s": 10,
@@ -102,6 +103,10 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-ag
   - 현재는 `searxng`만 지원합니다.
 - `searxng_base_url`
   - 예: `http://127.0.0.1:8080`
+- `searxng_preferred_engines`
+  - 기본값은 `["google"]` 입니다.
+  - agent는 먼저 `google` 엔진으로 검색하고, 결과가 비면 SearXNG 전체 엔진 결과로 fallback 합니다.
+  - 같은 응답 안에 여러 엔진 결과가 섞여 있으면 `google` 결과를 앞쪽에 우선 배치합니다.
 - `web_search_top_k`
   - 모델 프롬프트에 넣을 검색 결과 개수입니다.
 - `web_search_max_uses`

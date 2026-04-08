@@ -13,6 +13,15 @@ from urllib.request import Request, urlopen
 _FENCED_JSON_PATTERN = re.compile(r"```json\s*(.*?)```", flags=re.DOTALL | re.IGNORECASE)
 _THINK_PATTERN = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
 _WHITESPACE_PATTERN = re.compile(r"\s+")
+_BOOL_FIELD_PATTERN = re.compile(r'"use_web_search"\s*:\s*(true|false)', flags=re.IGNORECASE)
+_STRING_FIELD_PATTERNS = {
+    "query": re.compile(r'"query"\s*:\s*"((?:[^"\\]|\\.)*)"', flags=re.DOTALL),
+    "reason": re.compile(r'"reason"\s*:\s*"((?:[^"\\]|\\.)*)', flags=re.DOTALL),
+}
+_ARRAY_FIELD_PATTERNS = {
+    "allowed_domains": re.compile(r'"allowed_domains"\s*:\s*\[(.*?)\]', flags=re.DOTALL),
+    "blocked_domains": re.compile(r'"blocked_domains"\s*:\s*\[(.*?)\]', flags=re.DOTALL),
+}
 
 
 def _strip_reasoning_and_fences(text: str) -> str:
@@ -72,6 +81,41 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     return {}
 
 
+def _extract_partial_json_payload(text: str) -> dict[str, Any]:
+    candidate = _strip_reasoning_and_fences(text)
+    payload: dict[str, Any] = {}
+
+    match = _BOOL_FIELD_PATTERN.search(candidate)
+    if match:
+        payload["use_web_search"] = match.group(1).lower() == "true"
+
+    for field, pattern in _STRING_FIELD_PATTERNS.items():
+        match = pattern.search(candidate)
+        if not match:
+            continue
+        raw_value = match.group(1)
+        try:
+            payload[field] = json.loads(f'"{raw_value}"')
+        except json.JSONDecodeError:
+            payload[field] = raw_value.replace('\\"', '"').replace("\\n", " ").strip()
+
+    for field, pattern in _ARRAY_FIELD_PATTERNS.items():
+        match = pattern.search(candidate)
+        if not match:
+            continue
+        inner = match.group(1)
+        values = re.findall(r'"((?:[^"\\]|\\.)*)"', inner)
+        parsed_values: list[str] = []
+        for raw_value in values:
+            try:
+                parsed_values.append(json.loads(f'"{raw_value}"'))
+            except json.JSONDecodeError:
+                parsed_values.append(raw_value.replace('\\"', '"').strip())
+        payload[field] = parsed_values
+
+    return payload
+
+
 def _normalize_domain(value: str) -> str:
     text = str(value or "").strip().lower()
     if not text:
@@ -102,6 +146,18 @@ def normalize_query(value: str) -> str:
     return _WHITESPACE_PATTERN.sub(" ", str(value or "").strip())
 
 
+def _normalize_engine(value: str) -> str:
+    return _WHITESPACE_PATTERN.sub(" ", str(value or "").strip().lower())
+
+
+def _engine_priority(engine: str, preferred_engines: list[str]) -> tuple[int, str]:
+    normalized_engine = _normalize_engine(engine)
+    try:
+        return preferred_engines.index(normalized_engine), normalized_engine
+    except ValueError:
+        return len(preferred_engines), normalized_engine
+
+
 @dataclass
 class WebSearchDecision:
     use_web_search: bool = False
@@ -116,7 +172,12 @@ class WebSearchDecision:
     def from_text(cls, text: str) -> "WebSearchDecision":
         payload = _extract_json_object(text)
         if not payload:
-            return cls(raw_text=str(text), parse_error="invalid_json")
+            payload = _extract_partial_json_payload(text)
+            if not payload:
+                return cls(raw_text=str(text), parse_error="invalid_json")
+            parse_error = "partial_json_recovered"
+        else:
+            parse_error = None
         query = normalize_query(str(payload.get("query", "")))
         return cls(
             use_web_search=bool(payload.get("use_web_search", False)) and bool(query),
@@ -125,7 +186,7 @@ class WebSearchDecision:
             blocked_domains=[domain for domain in (_normalize_domain(item) for item in payload.get("blocked_domains", [])) if domain],
             reason=_sanitize_text(payload.get("reason"), max_chars=240),
             raw_text=str(text),
-            parse_error=None,
+            parse_error=parse_error,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -166,42 +227,82 @@ class SearXNGClient:
         top_k: int = 5,
         allowed_domains: list[str] | None = None,
         blocked_domains: list[str] | None = None,
+        preferred_engines: list[str] | None = None,
     ) -> WebSearchResult:
         normalized_query = normalize_query(query)
         normalized_allowed = [domain for domain in (_normalize_domain(item) for item in (allowed_domains or [])) if domain]
         normalized_blocked = [domain for domain in (_normalize_domain(item) for item in (blocked_domains or [])) if domain]
-        params = urlencode({"q": normalized_query, "format": "json"})
-        request = Request(
-            f"{self.base_url}/search?{params}",
-            headers={
-                "Accept": "application/json",
-                "User-Agent": self.user_agent,
-            },
-        )
-        with urlopen(request, timeout=self.timeout_s) as response:
-            payload = json.loads(response.read().decode("utf-8", errors="replace"))
-        raw_results = payload.get("results", [])
-        parsed_results: list[dict[str, Any]] = []
-        for item in raw_results:
-            url = str(item.get("url") or "").strip()
-            if not url:
-                continue
-            domain = _normalize_domain(url)
-            if normalized_allowed and not any(_domain_matches(domain, expected) for expected in normalized_allowed):
-                continue
-            if normalized_blocked and any(_domain_matches(domain, blocked) for blocked in normalized_blocked):
-                continue
-            parsed_results.append(
-                {
-                    "title": _sanitize_text(item.get("title"), max_chars=180),
-                    "url": url,
-                    "content": _sanitize_text(item.get("content"), max_chars=320),
-                    "domain": domain,
-                    "engine": _sanitize_text(item.get("engine"), max_chars=48),
-                }
+        normalized_preferred_engines = [
+            engine for engine in (_normalize_engine(item) for item in (preferred_engines or [])) if engine
+        ]
+
+        def _fetch_payload(*, engines: list[str] | None) -> dict[str, Any]:
+            query_params: dict[str, str] = {"q": normalized_query, "format": "json"}
+            if engines:
+                query_params["engines"] = ",".join(engines)
+            params = urlencode(query_params)
+            request = Request(
+                f"{self.base_url}/search?{params}",
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": self.user_agent,
+                },
             )
-            if len(parsed_results) >= max(1, int(top_k)):
+            with urlopen(request, timeout=self.timeout_s) as response:
+                return json.loads(response.read().decode("utf-8", errors="replace"))
+
+        def _parse_results(raw_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            sorted_results = list(raw_results)
+            if normalized_preferred_engines:
+                sorted_results.sort(
+                    key=lambda item: _engine_priority(str(item.get("engine") or ""), normalized_preferred_engines)
+                )
+            parsed_results: list[dict[str, Any]] = []
+            for item in sorted_results:
+                url = str(item.get("url") or "").strip()
+                if not url:
+                    continue
+                domain = _normalize_domain(url)
+                if normalized_allowed and not any(_domain_matches(domain, expected) for expected in normalized_allowed):
+                    continue
+                if normalized_blocked and any(_domain_matches(domain, blocked) for blocked in normalized_blocked):
+                    continue
+                parsed_results.append(
+                    {
+                        "title": _sanitize_text(item.get("title"), max_chars=180),
+                        "url": url,
+                        "content": _sanitize_text(item.get("content"), max_chars=320),
+                        "domain": domain,
+                        "engine": _sanitize_text(item.get("engine"), max_chars=48),
+                    }
+                )
+                if len(parsed_results) >= max(1, int(top_k)):
+                    break
+            return parsed_results
+
+        last_error: Exception | None = None
+        payloads_to_try: list[dict[str, Any]] = []
+        if normalized_preferred_engines:
+            try:
+                payloads_to_try.append(_fetch_payload(engines=normalized_preferred_engines))
+            except Exception as exc:
+                last_error = exc
+        if not payloads_to_try:
+            payloads_to_try.append(_fetch_payload(engines=None))
+
+        parsed_results: list[dict[str, Any]] = []
+        for payload in payloads_to_try:
+            parsed_results = _parse_results(payload.get("results", []))
+            if parsed_results:
                 break
+        if not parsed_results and normalized_preferred_engines:
+            try:
+                fallback_payload = _fetch_payload(engines=None)
+            except Exception:
+                if last_error is not None:
+                    raise last_error
+                raise
+            parsed_results = _parse_results(fallback_payload.get("results", []))
         return WebSearchResult(
             source="searxng",
             query=normalized_query,
@@ -257,9 +358,17 @@ def make_web_search_skipped_result(
     )
 
 
-def web_search_cache_key(query: str, *, allowed_domains: list[str] | None = None, blocked_domains: list[str] | None = None) -> str:
+def web_search_cache_key(
+    query: str,
+    *,
+    allowed_domains: list[str] | None = None,
+    blocked_domains: list[str] | None = None,
+    preferred_engines: list[str] | None = None,
+) -> str:
     normalized_allowed_list = [domain for domain in (_normalize_domain(item) for item in (allowed_domains or [])) if domain]
     normalized_blocked_list = [domain for domain in (_normalize_domain(item) for item in (blocked_domains or [])) if domain]
+    normalized_preferred_engines = [engine for engine in (_normalize_engine(item) for item in (preferred_engines or [])) if engine]
     normalized_allowed = ",".join(sorted(normalized_allowed_list))
     normalized_blocked = ",".join(sorted(normalized_blocked_list))
-    return f"{normalize_query(query)}|allow={normalized_allowed}|block={normalized_blocked}"
+    normalized_engines = ",".join(normalized_preferred_engines)
+    return f"{normalize_query(query)}|allow={normalized_allowed}|block={normalized_blocked}|engines={normalized_engines}"

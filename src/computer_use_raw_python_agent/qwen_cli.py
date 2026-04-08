@@ -75,6 +75,7 @@ def _collect_explicit_overrides(args: argparse.Namespace) -> dict:
         "web_search_enabled",
         "web_search_engine",
         "searxng_base_url",
+        "searxng_preferred_engines",
         "web_search_top_k",
         "web_search_max_uses",
         "web_search_timeout_s",
@@ -89,6 +90,8 @@ def _collect_explicit_overrides(args: argparse.Namespace) -> dict:
             overrides[key] = value
     if args.mcp_command:
         overrides["mcp_command"] = list(args.mcp_command)
+    if args.searxng_preferred_engine:
+        overrides["searxng_preferred_engines"] = list(args.searxng_preferred_engine)
     return overrides
 
 
@@ -291,6 +294,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--web-search-enabled", action="store_true", default=None)
     parser.add_argument("--web-search-engine")
     parser.add_argument("--searxng-base-url")
+    parser.add_argument("--searxng-preferred-engine", action="append")
     parser.add_argument("--web-search-top-k", type=int)
     parser.add_argument("--web-search-max-uses", type=int)
     parser.add_argument("--web-search-timeout-s", type=float)
