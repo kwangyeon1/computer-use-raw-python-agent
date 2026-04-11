@@ -216,6 +216,91 @@ def _state_visual_hash(state: dict[str, Any]) -> str | None:
     return None
 
 
+def _looks_like_download_or_install_task(user_prompt: str) -> bool:
+    text = str(user_prompt or "").lower()
+    keywords = (
+        "download",
+        "installer",
+        "install",
+        "setup",
+        "다운",
+        "다운로드",
+        "설치",
+        "인스톨",
+        "setup.exe",
+    )
+    return any(keyword in text for keyword in keywords)
+
+
+def _looks_like_opened_page_only_step(python_code: str) -> bool:
+    normalized = _normalize_python_code(python_code).lower()
+    if not normalized:
+        return False
+    opened_url = (
+        "webbrowser.open(" in normalized
+        or "driver.get(" in normalized
+        or ".goto(" in normalized
+        or ('os.startfile(' in normalized and "http" in normalized)
+    )
+    if not opened_url:
+        return False
+    stronger_progress_tokens = (
+        ".click(",
+        "click(",
+        "downloads",
+        "path(",
+        "requests.",
+        "urllib",
+        "urlretrieve",
+        "urlopen(",
+        "powershell",
+        "invoke-webrequest",
+        "start-bitstransfer",
+        "winget",
+        ".exe",
+        "glob(",
+        "exists(",
+        "stat(",
+        "subprocess.run(",
+        "shutil.move(",
+        "rename(",
+        "listdir(",
+        "iterdir(",
+    )
+    return not any(token in normalized for token in stronger_progress_tokens)
+
+
+def _looks_like_reported_failure(last_execution: dict[str, Any]) -> bool:
+    if not last_execution:
+        return False
+    error_info = last_execution.get("error_info")
+    if error_info:
+        return True
+    combined = "\n".join(
+        str(last_execution.get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    ).lower()
+    if not combined.strip():
+        return False
+    failure_markers = (
+        "error:",
+        "error ",
+        "exception",
+        "traceback",
+        "failed",
+        "failure",
+        "non-zero exit status",
+        "download failed",
+        "not found",
+        "cannot find",
+        "timed out",
+        "invoke-webrequest",
+        "오류",
+        "실패",
+    )
+    return any(marker in combined for marker in failure_markers)
+
+
 def build_executor_client(*, endpoint: str | None, mcp_command: list[str] | None, mcp_cwd: str | None):
     if bool(endpoint) == bool(mcp_command):
         raise RuntimeError("provide exactly one of endpoint or mcp_command")
@@ -844,8 +929,13 @@ def run_agent_control_loop(
         replan_reasons: list[str] = []
         if previous_executed_code and normalized_code and normalized_code == previous_executed_code:
             replan_reasons.append("repeated_code_execution")
+        if _looks_like_download_or_install_task(user_prompt) and _looks_like_opened_page_only_step(response.python_code):
+            replan_reasons.append("partial_progress_opened_page_only")
         dependency_error_handled = repairable_missing_module and dependency_repairs_used > repair_attempt_index if repairable_missing_module else False
-        if int(last_execution.get("return_code", 0) or 0) != 0 and not dependency_error_handled:
+        if (
+            (int(last_execution.get("return_code", 0) or 0) != 0 or _looks_like_reported_failure(last_execution))
+            and not dependency_error_handled
+        ):
             replan_reasons.append("execution_error")
         if previous_visual_hash and current_visual_hash and previous_visual_hash == current_visual_hash:
             replan_reasons.append("no_visual_change")
