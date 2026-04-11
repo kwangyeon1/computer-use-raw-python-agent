@@ -131,6 +131,58 @@ Codex 세션 유지형 backend가 필요하면 repo 안의 wrapper를 그대로 
   --prompt "Chrome을 열고 북마크 관리자 페이지로 이동해줘"
 ```
 
+## Training-Generator 연계
+
+`computer-use-training-generator`에서 이 repo daemon을 agent backend로 그대로 재사용할 수 있습니다.
+
+Codex backend 예시:
+
+```bash
+cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-agent
+
+./.venv/bin/computer-use-raw-python-agent --status
+./.venv/bin/computer-use-raw-python-agent --config config/agent.codex.gpt54.json
+```
+
+Qwen backend 예시:
+
+```bash
+cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-agent
+
+./.venv/bin/qwen-computer-use-agent --status
+./.venv/bin/qwen-computer-use-agent --config config/agent.qwen35.default.json
+```
+
+`training-generator` 쪽 실행 예시:
+
+```bash
+cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-training-generator
+
+PYTHONPATH=src ./.venv/bin/python -m computer_use_training_generator.cli \
+  --config config/generator.codex.gpt54.json \
+  run-session \
+  --task "dbeaver를 설치해줘" \
+  --skip-bootstrap
+```
+
+Qwen agent backend를 쓸 때는 전용 config를 그대로 쓰면 됩니다.
+
+```bash
+cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-training-generator
+
+PYTHONPATH=src ./.venv/bin/python -m computer_use_training_generator.cli \
+  --config config/generator.qwen35.json \
+  run-session \
+  --task "dbeaver를 설치해줘" \
+  --skip-bootstrap
+```
+
+현재 training-generator는 아래 흐름을 지원합니다.
+- `computer-use-raw-python-agent`
+- `qwen-computer-use-agent`
+
+둘 다 subprocess로 `--prompt`를 호출하는 대신, daemon request/response 디렉터리를 직접 써서 실행할 수 있습니다. 그래서 이미 떠 있는 agent daemon 하나를 재사용하면서 세션 데이터를 수집할 수 있습니다.
+
 프로필 내용 예시:
 
 ```json
