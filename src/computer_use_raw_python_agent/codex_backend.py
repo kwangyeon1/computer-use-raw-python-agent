@@ -255,29 +255,31 @@ def _build_codex_command(
     output_path: Path,
 ) -> list[str]:
     command = [codex_bin, "exec"]
-    if session_id:
-        command.extend(["resume", session_id, "-"])
-    else:
-        command.append("-")
+    option_args: list[str] = []
     if model:
-        command.extend(["-m", model])
+        option_args.extend(["-m", model])
     for item in config_overrides:
-        command.extend(["-c", item])
-    if cwd:
-        command.extend(["-C", cwd])
-    for item in add_dirs:
-        command.extend(["--add-dir", item])
+        option_args.extend(["-c", item])
+    if not session_id and cwd:
+        option_args.extend(["-C", cwd])
+    if not session_id:
+        for item in add_dirs:
+            option_args.extend(["--add-dir", item])
     if skip_git_repo_check:
-        command.append("--skip-git-repo-check")
+        option_args.append("--skip-git-repo-check")
     if full_auto:
-        command.append("--full-auto")
+        option_args.append("--full-auto")
     if bypass:
-        command.append("--dangerously-bypass-approvals-and-sandbox")
-    if search:
-        command.append("--search")
+        option_args.append("--dangerously-bypass-approvals-and-sandbox")
+    if search and not session_id:
+        option_args.append("--search")
     if image_path is not None:
-        command.extend(["-i", str(image_path)])
-    command.extend(["-o", str(output_path)])
+        option_args.extend(["-i", str(image_path)])
+    option_args.extend(["-o", str(output_path)])
+    if session_id:
+        command.extend(["resume", *option_args, session_id, "-"])
+    else:
+        command.extend([*option_args, "-"])
     return command
 
 
@@ -285,6 +287,7 @@ def _invoke_codex(
     command: list[str],
     *,
     prompt: str,
+    cwd: str | None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         command,
@@ -292,6 +295,7 @@ def _invoke_codex(
         text=True,
         capture_output=True,
         check=False,
+        cwd=cwd,
     )
 
 
@@ -352,7 +356,7 @@ def main() -> None:
         image_path=image_path,
         output_path=output_path,
     )
-    completed = _invoke_codex(command, prompt=prompt_text)
+    completed = _invoke_codex(command, prompt=prompt_text, cwd=codex_cwd)
     if completed.returncode != 0 and session_id:
         lower_stderr = str(completed.stderr or "").lower()
         if "session" in lower_stderr and ("not found" in lower_stderr or "unknown" in lower_stderr or "invalid" in lower_stderr):
@@ -372,7 +376,7 @@ def main() -> None:
                 output_path=output_path,
             )
             started_at_s = time.time()
-            completed = _invoke_codex(command, prompt=prompt_text)
+            completed = _invoke_codex(command, prompt=prompt_text, cwd=codex_cwd)
             session_id = None
             resumed_existing_session = False
     if completed.returncode != 0:

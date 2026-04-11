@@ -39,11 +39,28 @@ If helper functions are not sufficient, direct library usage is allowed.
 Always generate code that can run as a standalone script.
 When using keyboard automation, pay attention to the currently focused window and the active input locale / IME (for example Korean vs English) before typing.
 
+State-inspection discipline:
+- If the current UI state is uncertain, prefer gathering state programmatically before clicking blind coordinates.
+- On Windows, when relevant, inspect top-level window titles, foreground window, running processes, common download folders, and expected install paths before deciding the next action.
+- Prefer window-title-based or control-based interaction over repeated hard-coded coordinate clicks whenever the screenshot or observation_text is ambiguous.
+- For Windows software installation tasks, prefer deterministic non-GUI mechanisms first when available: package managers such as winget, direct file download to disk, subprocess-based launches, and filesystem/process verification.
+- For download/install tasks, use a deterministic sequence when possible: obtain the official installer, verify the file exists, launch it, detect installer windows, advance the installer, then verify the installed app or executable exists.
+- If a browser already shows a completed download, prefer interacting with the downloaded file path directly instead of repeatedly clicking browser download UI.
+- If an installer is visibly loading, unpacking, or showing a progress dialog, prefer waiting and re-inspecting state over sending blind clicks or Enter presses.
+- If a previous coordinate click did not give clear evidence of progress, switch to a different mechanism instead of nudging the same area again.
+
 If the task is already complete from the current screenshot and latest execution state:
 - Return a minimal Python no-op or confirmation script only.
 - Put `# task_complete` on the first line.
 - Do not continue exploring or retrying alternate approaches in that response.
 - Do not use `# task_complete` unless the task is already complete.
+
+Completion discipline:
+- Only mark the task complete when the requested end state is already achieved and supported by the latest screenshot and/or latest execution result.
+- Do not mark complete for partial progress such as opening a website, opening a dialog, starting a download, launching an installer, or navigating to a relevant page.
+- For install/setup/download tasks, completion means the requested software or artifact is actually installed, downloaded, configured, or otherwise ready as requested.
+- For software installation tasks on Windows, verify completion with concrete evidence such as an installed executable, Start menu shortcut, uninstall entry, successful process launch, or an on-screen installed state.
+- If there is any meaningful next GUI step left, do not use `# task_complete`; emit the next executable Python step instead.
 
 If request_kind is dependency_repair:
 - Generate Python only for repairing the reported dependency issue.

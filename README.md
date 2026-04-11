@@ -93,7 +93,9 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-ag
 }
 ```
 
-선택적으로 아래 키를 추가하면 agent backend를 외부 CLI로 고정할 수 있습니다.
+`agent.default.json`은 backend-neutral config 입니다. 공통 loop/prompt 정책만 담고, 어떤 생성기를 붙일지는 CLI 인자나 별도 프로필에서 정합니다.
+
+선택적으로 아래 키를 추가하면 특정 config를 외부 CLI backend로 고정할 수 있습니다.
 
 ```json
 {
@@ -115,10 +117,30 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-ag
 
 `agent_cli_command`는 prompt template 문자열이 아니라 argv 배열입니다. 그래서 `"{prompt}"` 치환은 하지 않고, wrapper가 stdin JSON을 직접 읽어야 합니다. wrapper 자체 플래그가 많으면 CLI 인자보다 config JSON의 `agent_cli_command` 배열에 넣는 편이 안전합니다. package 내부 module wrapper를 쓸 때는 bare `python`보다 현재 venv Python 경로를 넣는 편이 안전합니다.
 
-Codex 세션 유지형 backend가 필요하면 repo 안의 wrapper를 그대로 쓸 수 있습니다.
+Codex 세션 유지형 backend가 필요하면 repo 안의 wrapper를 그대로 쓸 수 있습니다. 이 repo에는 Codex 전용 프로필 [config/agent.codex.gpt54.json](/home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-agent/config/agent.codex.gpt54.json) 도 포함되어 있습니다.
+
+```bash
+./.venv/bin/computer-use-raw-python-agent \
+  --config config/agent.codex.gpt54.json
+```
+
+이후 prompt 실행:
+
+```bash
+./.venv/bin/computer-use-raw-python-agent \
+  --prompt "Chrome을 열고 북마크 관리자 페이지로 이동해줘"
+```
+
+프로필 내용 예시:
 
 ```json
 {
+  "max_iterations": 20,
+  "max_new_tokens": 512,
+  "strong_visual_grounding": true,
+  "reasoning_enabled": true,
+  "replan_enabled": true,
+  "replan_max_attempts": 8,
   "agent_cli_command": [
     "../.venv/bin/python",
     "-m",

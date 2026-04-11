@@ -88,6 +88,48 @@ def _has_task_complete_marker(code: str) -> bool:
     return False
 
 
+def _is_task_complete_confirmation_script(code: str) -> bool:
+    normalized = _normalize_python_code(code)
+    if not normalized:
+        return False
+    if not _has_task_complete_marker(normalized):
+        return False
+    lines = normalized.splitlines()
+    body_lines: list[str] = []
+    marker_consumed = False
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if not marker_consumed:
+            marker_consumed = True
+            continue
+        if stripped.startswith("#"):
+            continue
+        body_lines.append(stripped)
+    if len(body_lines) > 12:
+        return False
+    allowed_prefixes = (
+        "pass",
+        "print(",
+        "capture_note(",
+        "sleep(",
+        "time.sleep(",
+    )
+    for line in body_lines:
+        if line.startswith("import "):
+            module_name = line.removeprefix("import ").split(" as ", 1)[0].split(",", 1)[0].strip()
+            if module_name not in {"time"}:
+                return False
+            continue
+        if line.startswith("from "):
+            return False
+        if any(line.startswith(prefix) for prefix in allowed_prefixes):
+            continue
+        return False
+    return True
+
+
 def _looks_like_completion_noop(code: str, raw_text: str) -> bool:
     normalized = _normalize_python_code(code).lower()
     if not normalized:
@@ -126,7 +168,7 @@ def _looks_like_completion_noop(code: str, raw_text: str) -> bool:
 
 
 def _infer_response_done(*, python_code: str, raw_text: str) -> bool:
-    return _has_task_complete_marker(python_code) or _looks_like_completion_noop(python_code, raw_text)
+    return _is_task_complete_confirmation_script(python_code) or _looks_like_completion_noop(python_code, raw_text)
 
 
 def _tail_history(history: list[str], *, limit: int = 2) -> list[str]:

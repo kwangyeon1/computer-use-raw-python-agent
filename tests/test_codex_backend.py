@@ -29,11 +29,16 @@ def _arg_value(flag: str, args: list[str]) -> str | None:
 
 args = sys.argv[1:]
 assert args and args[0] == "exec"
+command_args = args[1:]
 resume = len(args) > 1 and args[1] == "resume"
-session_id = args[2] if resume else "session-123"
+session_id = args[-2] if resume else "session-123"
 cwd = _arg_value("-C", args) or os.getcwd()
 output_path = _arg_value("-o", args)
 assert output_path
+if resume:
+    resume_index = command_args.index("resume")
+    assert "-C" not in command_args[resume_index:], command_args
+    assert args[-1] == "-", args
 prompt = sys.stdin.read()
 log_path = Path(os.environ["FAKE_CODEX_LOG"])
 with log_path.open("a", encoding="utf-8") as handle:
