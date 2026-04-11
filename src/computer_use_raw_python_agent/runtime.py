@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
+import json
 import re
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+import subprocess
+from typing import Any, Protocol
 
 try:
     from .models import GeneratedCode, GeneratedText, PromptBundle
@@ -64,6 +67,214 @@ def extract_python_code(text: str) -> str:
         if tail.strip():
             return _extract_code_from_candidate(tail)
     return _extract_code_from_candidate(without_think)
+
+
+class AgentRuntime(Protocol):
+    def ensure_loaded(self) -> None: ...
+
+    def generate_code(
+        self,
+        *,
+        prompt_bundle: PromptBundle,
+        image_path: str | Path | None = None,
+        image_bytes: bytes | None = None,
+        use_blank_image: bool = True,
+        max_new_tokens: int | None = None,
+        generation_context: dict[str, Any] | None = None,
+    ) -> GeneratedCode: ...
+
+    def generate_text(
+        self,
+        *,
+        prompt_bundle: PromptBundle,
+        image_path: str | Path | None = None,
+        image_bytes: bytes | None = None,
+        use_blank_image: bool = True,
+        max_new_tokens: int | None = None,
+        generation_context: dict[str, Any] | None = None,
+    ) -> GeneratedText: ...
+
+
+def _render_external_cli_prompt(prompt_bundle: PromptBundle) -> str:
+    sections = [
+        ("system", prompt_bundle.system_prompt),
+        ("user", prompt_bundle.user_prompt),
+    ]
+    rendered_sections: list[str] = []
+    for label, content in sections:
+        text = str(content or "").strip()
+        if not text:
+            continue
+        rendered_sections.append(f"[{label}]\n{text}")
+    return "\n\n".join(rendered_sections).strip()
+
+
+def _parse_external_cli_stdout(stdout: str) -> tuple[str, str | None, str | None]:
+    stripped = str(stdout or "").strip()
+    if not stripped:
+        raise RuntimeError("external CLI returned empty stdout")
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return stripped, None, None
+
+    if not isinstance(payload, dict):
+        return stripped, None, None
+    if payload.get("ok") is False:
+        raise RuntimeError(str(payload.get("error") or "external CLI returned ok=false"))
+
+    explicit_python_code = payload.get("python_code")
+    if explicit_python_code is not None and not isinstance(explicit_python_code, str):
+        explicit_python_code = str(explicit_python_code)
+
+    raw_text = None
+    for key in ("raw_text", "text", "content", "output_text", "message"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        raw_text = str(value)
+        break
+    if raw_text is None and explicit_python_code is not None:
+        raw_text = explicit_python_code
+    if raw_text is None:
+        known_control_keys = {
+            "ok",
+            "error",
+            "python_code",
+            "raw_text",
+            "text",
+            "content",
+            "output_text",
+            "message",
+            "model_id",
+            "backend_id",
+            "agent_id",
+        }
+        if not (set(payload.keys()) & known_control_keys):
+            return stripped, explicit_python_code, None
+    if raw_text is None:
+        raise RuntimeError("external CLI JSON response must include raw_text/text/content/output_text/message or python_code")
+
+    backend_id = payload.get("model_id") or payload.get("backend_id") or payload.get("agent_id")
+    return raw_text, explicit_python_code, str(backend_id) if backend_id else None
+
+
+class ExternalCliRawPythonRuntime:
+    def __init__(
+        self,
+        *,
+        command: list[str],
+        cwd: str | Path | None = None,
+        max_new_tokens: int = 256,
+        backend_id: str | None = None,
+    ) -> None:
+        if not command:
+            raise ValueError("external CLI command must not be empty")
+        self.command = [str(part) for part in command]
+        self.cwd = str(Path(cwd).resolve()) if cwd else None
+        self.max_new_tokens = max_new_tokens
+        self.model_id = str(backend_id or f"external-cli:{Path(self.command[0]).name}")
+
+    def ensure_loaded(self) -> None:
+        if not self.command:
+            raise RuntimeError("external CLI command must not be empty")
+
+    def generate_code(
+        self,
+        *,
+        prompt_bundle: PromptBundle,
+        image_path: str | Path | None = None,
+        image_bytes: bytes | None = None,
+        use_blank_image: bool = True,
+        max_new_tokens: int | None = None,
+        generation_context: dict[str, Any] | None = None,
+    ) -> GeneratedCode:
+        raw_text, rendered_prompt, explicit_python_code, backend_id = self._generate_raw_text(
+            prompt_bundle=prompt_bundle,
+            image_path=image_path,
+            image_bytes=image_bytes,
+            use_blank_image=use_blank_image,
+            max_new_tokens=max_new_tokens,
+            response_format="python_code",
+            generation_context=generation_context,
+        )
+        code = explicit_python_code if explicit_python_code is not None else extract_python_code(raw_text)
+        return GeneratedCode(
+            code=code,
+            raw_text=raw_text,
+            rendered_prompt=rendered_prompt,
+            model_id=backend_id,
+            prompt_bundle=prompt_bundle.to_dict(),
+            screenshot_path=str(Path(image_path).resolve()) if image_path else None,
+        )
+
+    def generate_text(
+        self,
+        *,
+        prompt_bundle: PromptBundle,
+        image_path: str | Path | None = None,
+        image_bytes: bytes | None = None,
+        use_blank_image: bool = True,
+        max_new_tokens: int | None = None,
+        generation_context: dict[str, Any] | None = None,
+    ) -> GeneratedText:
+        raw_text, rendered_prompt, _, backend_id = self._generate_raw_text(
+            prompt_bundle=prompt_bundle,
+            image_path=image_path,
+            image_bytes=image_bytes,
+            use_blank_image=use_blank_image,
+            max_new_tokens=max_new_tokens,
+            response_format="text",
+            generation_context=generation_context,
+        )
+        return GeneratedText(
+            text=raw_text,
+            rendered_prompt=rendered_prompt,
+            model_id=backend_id,
+            prompt_bundle=prompt_bundle.to_dict(),
+            screenshot_path=str(Path(image_path).resolve()) if image_path else None,
+        )
+
+    def _generate_raw_text(
+        self,
+        *,
+        prompt_bundle: PromptBundle,
+        image_path: str | Path | None = None,
+        image_bytes: bytes | None = None,
+        use_blank_image: bool = True,
+        max_new_tokens: int | None = None,
+        response_format: str,
+        generation_context: dict[str, Any] | None = None,
+    ) -> tuple[str, str, str | None, str]:
+        self.ensure_loaded()
+        resolved_image_path = str(Path(image_path).resolve()) if image_path else None
+        rendered_prompt = _render_external_cli_prompt(prompt_bundle)
+        payload = {
+            "action": "generate",
+            "response_format": response_format,
+            "max_new_tokens": int(max_new_tokens or self.max_new_tokens),
+            "prompt_bundle": prompt_bundle.to_dict(),
+            "rendered_prompt": rendered_prompt,
+            "image_path": resolved_image_path,
+            "image_base64": base64.b64encode(image_bytes).decode("ascii") if image_bytes else None,
+            "use_blank_image": bool(use_blank_image),
+            "generation_context": dict(generation_context or {}),
+        }
+        completed = subprocess.run(
+            self.command,
+            input=json.dumps(payload, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            cwd=self.cwd,
+            check=False,
+        )
+        if completed.returncode != 0:
+            stderr = str(completed.stderr or "").strip()
+            stdout = str(completed.stdout or "").strip()
+            detail = stderr or stdout or f"return code {completed.returncode}"
+            raise RuntimeError(f"external CLI command failed: {detail}")
+        raw_text, explicit_python_code, backend_id = _parse_external_cli_stdout(completed.stdout)
+        return raw_text, rendered_prompt, explicit_python_code, str(backend_id or self.model_id)
 
 
 class GUIOwlRawPythonRuntime:
@@ -156,6 +367,7 @@ class GUIOwlRawPythonRuntime:
         image_bytes: bytes | None = None,
         use_blank_image: bool = True,
         max_new_tokens: int | None = None,
+        generation_context: dict[str, Any] | None = None,
     ) -> GeneratedCode:
         raw_text, rendered_prompt = self._generate_raw_text(
             prompt_bundle=prompt_bundle,
@@ -182,6 +394,7 @@ class GUIOwlRawPythonRuntime:
         image_bytes: bytes | None = None,
         use_blank_image: bool = True,
         max_new_tokens: int | None = None,
+        generation_context: dict[str, Any] | None = None,
     ) -> GeneratedText:
         raw_text, rendered_prompt = self._generate_raw_text(
             prompt_bundle=prompt_bundle,

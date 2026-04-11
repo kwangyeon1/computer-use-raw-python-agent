@@ -109,6 +109,30 @@ def _build_run_overrides(args: argparse.Namespace, config_defaults: dict) -> dic
     return explicit_overrides
 
 
+def _resolve_backend_spec(args: argparse.Namespace, config_defaults: dict) -> dict | None:
+    if args.model_id and args.agent_cli_command:
+        raise SystemExit("--model-id and --agent-cli-command are mutually exclusive")
+    if args.agent_cli_command:
+        return {
+            "backend_kind": "external_cli",
+            "agent_cli_command": list(args.agent_cli_command),
+            "agent_cli_cwd": args.agent_cli_cwd,
+        }
+    if args.model_id:
+        return {
+            "backend_kind": "model",
+            "model_id": args.model_id,
+            "processor_id": args.processor_id,
+        }
+    if config_defaults.get("agent_cli_command"):
+        return {
+            "backend_kind": "external_cli",
+            "agent_cli_command": [str(part) for part in config_defaults.get("agent_cli_command", [])],
+            "agent_cli_cwd": args.agent_cli_cwd if args.agent_cli_cwd is not None else config_defaults.get("agent_cli_cwd"),
+        }
+    return None
+
+
 def _ensure_daemon_started() -> None:
     if daemon_is_responding():
         return
@@ -216,27 +240,31 @@ def cmd_stop(_: argparse.Namespace) -> int:
 def cmd_main(args: argparse.Namespace) -> int:
     config_defaults, config_path = _load_qwen_agent_config(args.config)
     default_overrides = _build_default_overrides(args, config_defaults)
+    backend_spec = _resolve_backend_spec(args, config_defaults)
 
-    if args.model_id:
+    if backend_spec:
         _ensure_daemon_started()
-        load_in_8bit = _resolve_load_in_8bit(args, config_defaults)
-        disable_4bit = _resolve_disable_4bit(args, config_defaults)
-        if load_in_8bit and not disable_4bit:
-            raise SystemExit("8bit mode requires 4bit to be disabled; set load_in_4bit=false or pass --disable-4bit")
-        response = _send_request(
-            {
-                "action": "reload",
-                "model_id": args.model_id,
-                "processor_id": args.processor_id,
-                "compute_dtype": _resolve_compute_dtype(args, config_defaults),
-                "device_map": _resolve_device_map(args, config_defaults),
-                "disable_4bit": disable_4bit,
-                "load_in_8bit": load_in_8bit,
-                "disable_cpu_offload": _resolve_disable_cpu_offload(args, config_defaults),
-                "defaults": default_overrides,
-            },
-            timeout_s=_resolve_load_timeout(args, default_overrides),
-        )
+        payload = {
+            "action": "reload",
+            "backend_kind": backend_spec["backend_kind"],
+            "defaults": default_overrides,
+        }
+        if backend_spec["backend_kind"] == "external_cli":
+            payload["agent_cli_command"] = backend_spec["agent_cli_command"]
+            payload["agent_cli_cwd"] = backend_spec.get("agent_cli_cwd")
+        else:
+            load_in_8bit = _resolve_load_in_8bit(args, config_defaults)
+            disable_4bit = _resolve_disable_4bit(args, config_defaults)
+            if load_in_8bit and not disable_4bit:
+                raise SystemExit("8bit mode requires 4bit to be disabled; set load_in_4bit=false or pass --disable-4bit")
+            payload["model_id"] = backend_spec["model_id"]
+            payload["processor_id"] = backend_spec.get("processor_id")
+            payload["compute_dtype"] = _resolve_compute_dtype(args, config_defaults)
+            payload["device_map"] = _resolve_device_map(args, config_defaults)
+            payload["disable_4bit"] = disable_4bit
+            payload["load_in_8bit"] = load_in_8bit
+            payload["disable_cpu_offload"] = _resolve_disable_cpu_offload(args, config_defaults)
+        response = _send_request(payload, timeout_s=_resolve_load_timeout(args, default_overrides))
         if not response.get("ok", False):
             raise SystemExit(response.get("error", "qwen agent reload failed"))
         if not args.prompt:
@@ -255,7 +283,7 @@ def cmd_main(args: argparse.Namespace) -> int:
 
     if args.prompt:
         if not daemon_is_responding():
-            raise SystemExit("qwen agent daemon is not running; start it once with --model-id")
+            raise SystemExit("qwen agent daemon is not running; start it once with --model-id or --agent-cli-command")
         run_overrides = _build_run_overrides(args, config_defaults)
         response = _send_request(
             {
@@ -270,7 +298,7 @@ def cmd_main(args: argparse.Namespace) -> int:
         print(json.dumps(response, ensure_ascii=False, indent=2))
         return 0
 
-    if args.model_id:
+    if backend_spec:
         return 0
 
     print(json.dumps({"running": daemon_is_responding(), "state": _state_or_empty()}, ensure_ascii=False, indent=2))
@@ -280,6 +308,8 @@ def cmd_main(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m computer_use_raw_python_agent.qwen_cli")
     parser.add_argument("--model-id")
+    parser.add_argument("--agent-cli-command", nargs="+")
+    parser.add_argument("--agent-cli-cwd")
     parser.add_argument("--processor-id")
     parser.add_argument("--prompt")
     parser.add_argument("--config")
@@ -326,7 +356,15 @@ def main() -> None:
         raise SystemExit(cmd_status(args))
     if args.stop:
         raise SystemExit(cmd_stop(args))
-    if args.model_id is None and not args.prompt and not args.status and not args.stop:
+    config_defaults, _ = _load_qwen_agent_config(args.config)
+    if (
+        args.model_id is None
+        and not args.prompt
+        and not args.status
+        and not args.stop
+        and not args.agent_cli_command
+        and not config_defaults.get("agent_cli_command")
+    ):
         args.model_id = default_qwen35_model_id()
     raise SystemExit(cmd_main(args))
 

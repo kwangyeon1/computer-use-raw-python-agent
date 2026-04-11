@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 import json
@@ -13,7 +13,7 @@ import uuid
 
 from .config_utils import load_policy_from_path
 from .service import build_executor_client, run_agent_control_loop
-from .runtime import GUIOwlRawPythonRuntime
+from .runtime import AgentRuntime, ExternalCliRawPythonRuntime, GUIOwlRawPythonRuntime
 
 
 _STATE_DIR = Path("/tmp/computer_use_raw_python_agent")
@@ -45,6 +45,7 @@ def daemon_responses_dir() -> Path:
 
 @dataclass
 class AgentDaemonState:
+    backend_kind: str
     model_id: str
     processor_id: str | None
     compute_dtype: str
@@ -52,27 +53,44 @@ class AgentDaemonState:
     load_in_4bit: bool
     enable_fp32_cpu_offload: bool
     defaults: dict[str, Any]
+    agent_cli_command: list[str] = field(default_factory=list)
+    agent_cli_cwd: str | None = None
     phase: str = "idle"
-    runtime: GUIOwlRawPythonRuntime | None = None
+    runtime: AgentRuntime | None = None
 
-    def ensure_runtime(self) -> GUIOwlRawPythonRuntime:
+    def ensure_runtime(self) -> AgentRuntime:
         if self.runtime is None:
-            self.runtime = GUIOwlRawPythonRuntime(
-                model_id=self.model_id,
-                processor_id=self.processor_id,
-                max_new_tokens=int(self.defaults.get("max_new_tokens", 256)),
-                load_in_4bit=self.load_in_4bit,
-                compute_dtype=self.compute_dtype,
-                device_map=self.device_map,
-                enable_fp32_cpu_offload=self.enable_fp32_cpu_offload,
-            )
+            if self.backend_kind == "external_cli":
+                self.runtime = ExternalCliRawPythonRuntime(
+                    command=self.agent_cli_command,
+                    cwd=self.agent_cli_cwd,
+                    max_new_tokens=int(self.defaults.get("max_new_tokens", 256)),
+                )
+            else:
+                self.runtime = GUIOwlRawPythonRuntime(
+                    model_id=self.model_id,
+                    processor_id=self.processor_id,
+                    max_new_tokens=int(self.defaults.get("max_new_tokens", 256)),
+                    load_in_4bit=self.load_in_4bit,
+                    compute_dtype=self.compute_dtype,
+                    device_map=self.device_map,
+                    enable_fp32_cpu_offload=self.enable_fp32_cpu_offload,
+                )
             self.runtime.ensure_loaded()
         return self.runtime
 
+    def has_backend(self) -> bool:
+        if self.backend_kind == "external_cli":
+            return bool(self.agent_cli_command)
+        return bool(self.model_id)
+
     def to_public_dict(self) -> dict[str, Any]:
         return {
+            "backend_kind": self.backend_kind,
             "model_id": self.model_id,
             "processor_id": self.processor_id,
+            "agent_cli_command": self.agent_cli_command,
+            "agent_cli_cwd": self.agent_cli_cwd,
             "compute_dtype": self.compute_dtype,
             "device_map": self.device_map,
             "load_in_4bit": self.load_in_4bit,
@@ -182,8 +200,8 @@ def _make_run_dir(base_run_dir: str | None, prompt: str) -> str:
 
 
 def _handle_run(daemon_state: AgentDaemonState, payload: dict[str, Any]) -> dict[str, Any]:
-    if not daemon_state.model_id:
-        return {"ok": False, "error": "no model is loaded; start once with --model-id"}
+    if not daemon_state.has_backend():
+        return {"ok": False, "error": "no backend is loaded; start once with --model-id or --agent-cli-command"}
     prompt = str(payload["prompt"]).strip()
     overrides = dict(payload.get("overrides", {}))
     defaults = _merge_defaults(daemon_state.defaults, overrides)
@@ -233,27 +251,58 @@ def _handle_run(daemon_state: AgentDaemonState, payload: dict[str, Any]) -> dict
 
 
 def _handle_reload(daemon_state: AgentDaemonState, payload: dict[str, Any]) -> dict[str, Any]:
-    model_id = str(payload.get("model_id") or daemon_state.model_id)
-    processor_id = payload.get("processor_id")
     defaults = _merge_defaults(daemon_state.defaults, dict(payload.get("defaults", {})))
-    daemon_state.model_id = model_id
-    daemon_state.processor_id = str(processor_id) if processor_id else None
-    daemon_state.compute_dtype = str(payload.get("compute_dtype") or daemon_state.compute_dtype)
-    daemon_state.device_map = str(payload.get("device_map") or daemon_state.device_map)
-    daemon_state.load_in_4bit = not bool(payload.get("disable_4bit", False))
-    daemon_state.enable_fp32_cpu_offload = not bool(payload.get("disable_cpu_offload", False))
+    backend_kind = str(payload.get("backend_kind") or daemon_state.backend_kind or "").strip().lower()
+    if not backend_kind:
+        backend_kind = "external_cli" if payload.get("agent_cli_command") else "model"
+
+    daemon_state.backend_kind = backend_kind
     daemon_state.defaults = defaults
     daemon_state.phase = "loading"
     _write_state_file(os.getpid(), daemon_state.to_public_dict())
-    daemon_state.runtime = GUIOwlRawPythonRuntime(
-        model_id=daemon_state.model_id,
-        processor_id=daemon_state.processor_id,
-        max_new_tokens=int(defaults.get("max_new_tokens", 256)),
-        load_in_4bit=daemon_state.load_in_4bit,
-        compute_dtype=daemon_state.compute_dtype,
-        device_map=daemon_state.device_map,
-        enable_fp32_cpu_offload=daemon_state.enable_fp32_cpu_offload,
-    )
+
+    if daemon_state.backend_kind == "external_cli":
+        agent_cli_command = [str(part) for part in (payload.get("agent_cli_command") or daemon_state.agent_cli_command)]
+        if not agent_cli_command:
+            raise RuntimeError("agent_cli_command is required when backend_kind=external_cli")
+        daemon_state.model_id = ""
+        daemon_state.processor_id = None
+        daemon_state.agent_cli_command = agent_cli_command
+        daemon_state.agent_cli_cwd = (
+            str(payload.get("agent_cli_cwd"))
+            if payload.get("agent_cli_cwd") is not None
+            else daemon_state.agent_cli_cwd
+        )
+        daemon_state.runtime = ExternalCliRawPythonRuntime(
+            command=daemon_state.agent_cli_command,
+            cwd=daemon_state.agent_cli_cwd,
+            max_new_tokens=int(defaults.get("max_new_tokens", 256)),
+        )
+    elif daemon_state.backend_kind == "model":
+        model_id = str(payload.get("model_id") or daemon_state.model_id)
+        processor_id = payload.get("processor_id")
+        if not model_id:
+            raise RuntimeError("model_id is required when backend_kind=model")
+        daemon_state.model_id = model_id
+        daemon_state.processor_id = str(processor_id) if processor_id else None
+        daemon_state.agent_cli_command = []
+        daemon_state.agent_cli_cwd = None
+        daemon_state.compute_dtype = str(payload.get("compute_dtype") or daemon_state.compute_dtype)
+        daemon_state.device_map = str(payload.get("device_map") or daemon_state.device_map)
+        daemon_state.load_in_4bit = not bool(payload.get("disable_4bit", False))
+        daemon_state.enable_fp32_cpu_offload = not bool(payload.get("disable_cpu_offload", False))
+        daemon_state.runtime = GUIOwlRawPythonRuntime(
+            model_id=daemon_state.model_id,
+            processor_id=daemon_state.processor_id,
+            max_new_tokens=int(defaults.get("max_new_tokens", 256)),
+            load_in_4bit=daemon_state.load_in_4bit,
+            compute_dtype=daemon_state.compute_dtype,
+            device_map=daemon_state.device_map,
+            enable_fp32_cpu_offload=daemon_state.enable_fp32_cpu_offload,
+        )
+    else:
+        raise RuntimeError(f"unsupported backend_kind: {daemon_state.backend_kind}")
+
     daemon_state.runtime.ensure_loaded()
     daemon_state.phase = "ready"
     _write_state_file(os.getpid(), daemon_state.to_public_dict())
@@ -264,8 +313,11 @@ def _serve() -> int:
     requests_dir = daemon_requests_dir()
     responses_dir = daemon_responses_dir()
     daemon_state = AgentDaemonState(
+        backend_kind="",
         model_id="",
         processor_id=None,
+        agent_cli_command=[],
+        agent_cli_cwd=None,
         compute_dtype="bfloat16",
         device_map="auto",
         load_in_4bit=True,

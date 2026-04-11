@@ -5,6 +5,7 @@ executor endpoint에 붙어서 `현재 화면 + 사용자 프롬프트 + 직전 
 다음 `raw Python` 코드를 생성하는 최소 agent repo입니다.
 
 - 역할: loop controller + vision-conditioned raw Python code generator
+- agent backend: `--model-id` 또는 `--agent-cli-command`
 - 기본 모델: `../models/gui-owl-1.5-8b-think-base`
 - 입력: `--prompt`, config JSON, executor state
 - 출력: next-step Python 코드와 loop artifact
@@ -15,7 +16,7 @@ executor endpoint에 붙어서 `현재 화면 + 사용자 프롬프트 + 직전 
 ```text
 agent owns prompt and loop
   -> observe current state from executor
-  -> model generates raw python
+  -> model or external CLI generates raw python
   -> send python code to executor
   -> executor runs code locally and returns next state
   -> repeat
@@ -45,6 +46,21 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-ag
 - prompt 실행: `run_request_timeout_s`
 
 각각 CLI에서 `--load-request-timeout-s`, `--run-request-timeout-s`로 따로 덮어쓸 수 있습니다.
+
+외부 CLI backend를 쓰려면 같은 daemon 흐름에서 `--agent-cli-command`를 쓰면 됩니다.
+
+```bash
+./.venv/bin/computer-use-raw-python-agent \
+  --agent-cli-command python /abs/path/to/your_cli_wrapper.py \
+  --config config/agent.default.json
+```
+
+이후 prompt 실행은 동일합니다.
+
+```bash
+./.venv/bin/computer-use-raw-python-agent \
+  --prompt "Chrome을 열고 북마크 관리자 페이지로 이동해줘"
+```
 
 기본 config 예시는 [config/agent.default.json](/home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-agent/config/agent.default.json) 입니다.
 
@@ -76,6 +92,76 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-ag
   "run_request_timeout_s": 100
 }
 ```
+
+`agent.default.json`은 backend-neutral config 입니다. 공통 loop/prompt 정책만 담고, 어떤 생성기를 붙일지는 CLI 인자나 별도 프로필에서 정합니다.
+
+선택적으로 아래 키를 추가하면 특정 config를 외부 CLI backend로 고정할 수 있습니다.
+
+```json
+{
+  "agent_cli_command": ["../.venv/bin/python", "/abs/path/to/your_cli_wrapper.py"],
+  "agent_cli_cwd": ".."
+}
+```
+
+외부 CLI는 agent가 매 생성 요청마다 JSON을 stdin으로 보내고, CLI가 stdout으로 결과를 돌려주는 계약입니다.
+- stdin:
+  - `action`, `response_format`, `max_new_tokens`
+  - `prompt_bundle`, `rendered_prompt`
+  - `image_path`, `image_base64`, `use_blank_image`
+  - `generation_context` (`run_dir`, `step_id`, `request_kind`, `step_index`)
+- stdout:
+  - plain text 전체를 그대로 출력해도 됨
+  - 또는 JSON으로 `raw_text` / `text` / `python_code` / `model_id` 중 필요한 값을 반환 가능
+  - 비정상 종료 시 stderr나 stdout에 오류를 남기고 non-zero exit code를 반환
+
+`agent_cli_command`는 prompt template 문자열이 아니라 argv 배열입니다. 그래서 `"{prompt}"` 치환은 하지 않고, wrapper가 stdin JSON을 직접 읽어야 합니다. wrapper 자체 플래그가 많으면 CLI 인자보다 config JSON의 `agent_cli_command` 배열에 넣는 편이 안전합니다. package 내부 module wrapper를 쓸 때는 bare `python`보다 현재 venv Python 경로를 넣는 편이 안전합니다.
+
+Codex 세션 유지형 backend가 필요하면 repo 안의 wrapper를 그대로 쓸 수 있습니다. 이 repo에는 Codex 전용 프로필 [config/agent.codex.gpt54.json](/home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-agent/config/agent.codex.gpt54.json) 도 포함되어 있습니다.
+
+```bash
+./.venv/bin/computer-use-raw-python-agent \
+  --config config/agent.codex.gpt54.json
+```
+
+이후 prompt 실행:
+
+```bash
+./.venv/bin/computer-use-raw-python-agent \
+  --prompt "Chrome을 열고 북마크 관리자 페이지로 이동해줘"
+```
+
+프로필 내용 예시:
+
+```json
+{
+  "max_iterations": 20,
+  "max_new_tokens": 512,
+  "strong_visual_grounding": true,
+  "reasoning_enabled": true,
+  "replan_enabled": true,
+  "replan_max_attempts": 8,
+  "agent_cli_command": [
+    "../.venv/bin/python",
+    "-m",
+    "computer_use_raw_python_agent.codex_backend",
+    "--model",
+    "gpt-5.4-mini",
+    "-c",
+    "model_reasoning_effort=\"low\"",
+    "-C",
+    "."
+  ],
+  "agent_cli_cwd": ".."
+}
+```
+
+이 wrapper는 같은 top-level run 디렉터리 안에서는 `codex exec resume <session_id>`를 재사용하고, 새 run 디렉터리에서는 새 Codex session을 엽니다. session state는 각 run 아래 `.codex-agent-session.json`에 저장합니다.
+
+Codex wrapper prompt는 아래 문맥만 유지하도록 줄였습니다.
+- 유지: `screenshot`, `observation_text`, `last_execution`, `replan_reasons`
+- 축소/생략: `recent_history`, `last_agent_response`, 반복되는 `web_search_context`
+- `web_search_context`는 내용이 바뀌었을 때만 다시 주입하고, 같으면 `web_search_context_status=unchanged_from_previous_step`만 남깁니다.
 
 시각 grounding 강제는 옵션으로만 켤 수 있습니다.
 - 기본값: `strong_visual_grounding = false`
