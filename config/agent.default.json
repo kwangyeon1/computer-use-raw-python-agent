@@ -22,5 +22,17 @@
   "dependency_repair_max_attempts": 2,
   "dependency_repair_allow_shell_fallback": false,
   "load_request_timeout_s": 120,
-  "run_request_timeout_s": 100
+  "run_request_timeout_s": 100,
+  "agent_cli_command": [
+    "../.venv/bin/python",
+    "-m",
+    "computer_use_raw_python_agent.codex_backend",
+    "--model",
+    "gpt-5.4-mini",
+    "-c",
+    "model_reasoning_effort=\"low\"",
+    "-C",
+    "."
+  ],
+  "agent_cli_cwd": ".."
 }

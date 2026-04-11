@@ -11,7 +11,7 @@ try:
     from .executor_client import ExecutorHttpClient, ExecutorStdioClient
     from .models import StepRequest, StepResponse
     from .prompting import render_prompt_bundle_from_step_request, render_web_search_decision_bundle_from_step_request
-    from .runtime import GUIOwlRawPythonRuntime
+    from .runtime import AgentRuntime, ExternalCliRawPythonRuntime, GUIOwlRawPythonRuntime
     from .web_search import (
         SearXNGClient,
         WebSearchDecision,
@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover - direct script execution fallback
     from executor_client import ExecutorHttpClient, ExecutorStdioClient
     from models import StepRequest, StepResponse
     from prompting import render_prompt_bundle_from_step_request, render_web_search_decision_bundle_from_step_request
-    from runtime import GUIOwlRawPythonRuntime
+    from runtime import AgentRuntime, ExternalCliRawPythonRuntime, GUIOwlRawPythonRuntime
     from web_search import (
         SearXNGClient,
         WebSearchDecision,
@@ -182,11 +182,27 @@ def build_executor_client(*, endpoint: str | None, mcp_command: list[str] | None
     return ExecutorStdioClient(mcp_command or [], cwd=mcp_cwd)
 
 
+def _make_generation_context(
+    *,
+    run_dir: str | Path,
+    step_id: str,
+    request_kind: str,
+    step_index: int,
+) -> dict[str, Any]:
+    return {
+        "run_dir": str(Path(run_dir)),
+        "step_id": str(step_id),
+        "request_kind": str(request_kind),
+        "step_index": int(step_index),
+    }
+
+
 def generate_step_response(
-    runtime: GUIOwlRawPythonRuntime,
+    runtime: AgentRuntime,
     request: StepRequest,
     *,
     max_new_tokens: int,
+    generation_context: dict[str, Any] | None = None,
 ) -> StepResponse:
     image_bytes = None
     if request.screenshot_base64:
@@ -198,6 +214,7 @@ def generate_step_response(
         image_bytes=image_bytes,
         use_blank_image=not bool(request.screenshot_path or image_bytes),
         max_new_tokens=max_new_tokens,
+        generation_context=generation_context,
     )
     return StepResponse(
         python_code=generated.code,
@@ -210,7 +227,7 @@ def generate_step_response(
 
 
 def generate_web_search_decision(
-    runtime: GUIOwlRawPythonRuntime,
+    runtime: AgentRuntime,
     request: StepRequest,
     *,
     max_new_tokens: int,
@@ -220,6 +237,7 @@ def generate_web_search_decision(
     web_search_max_uses: int,
     web_search_uses: int,
     web_search_queries: list[str],
+    generation_context: dict[str, Any] | None = None,
 ) -> tuple[WebSearchDecision, dict[str, Any]]:
     image_bytes = None
     image_path = None
@@ -240,6 +258,7 @@ def generate_web_search_decision(
         image_bytes=image_bytes,
         use_blank_image=False,
         max_new_tokens=min(int(max_new_tokens), int(decision_max_new_tokens)),
+        generation_context=generation_context,
     )
     decision = WebSearchDecision.from_text(generated.text)
     return decision, generated.to_dict()
@@ -285,7 +304,7 @@ def _execute_code_step(
 
 def _maybe_perform_web_search(
     *,
-    runtime: GUIOwlRawPythonRuntime,
+    runtime: AgentRuntime,
     request: StepRequest,
     root: Path,
     step_id: str,
@@ -332,6 +351,12 @@ def _maybe_perform_web_search(
         web_search_max_uses=web_search_max_uses,
         web_search_uses=web_search_uses,
         web_search_queries=web_search_queries[-3:],
+        generation_context=_make_generation_context(
+            run_dir=root,
+            step_id=f"{step_id}.web-search-decision",
+            request_kind=search_request.request_kind,
+            step_index=search_request.step_index,
+        ),
     )
     _write_json(
         root / "responses" / f"{step_id}.web-search-decision.response.json",
@@ -403,7 +428,7 @@ def _maybe_perform_web_search(
 
 def _attempt_dependency_repair(
     *,
-    runtime: GUIOwlRawPythonRuntime,
+    runtime: AgentRuntime,
     executor_client,
     root: Path,
     user_prompt: str,
@@ -457,7 +482,17 @@ def _attempt_dependency_repair(
         )
         repair_request_name = f"{original_step_id}.repair-{repair_attempt_index:02d}-{strategy_index:02d}"
         _write_json(root / "payloads" / f"{repair_request_name}.request.json", repair_request.to_dict())
-        repair_response = generate_step_response(runtime, repair_request, max_new_tokens=max_new_tokens)
+        repair_response = generate_step_response(
+            runtime,
+            repair_request,
+            max_new_tokens=max_new_tokens,
+            generation_context=_make_generation_context(
+                run_dir=root,
+                step_id=repair_request_name,
+                request_kind=repair_request.request_kind,
+                step_index=repair_request.step_index,
+            ),
+        )
         repair_response.notes.append("dependency_repair_mode=true")
         repair_response.notes.append(f"dependency_repair_strategy={strategy}")
         _write_json(root / "responses" / f"{repair_request_name}.response.json", repair_response.to_dict())
@@ -536,7 +571,7 @@ def _attempt_dependency_repair(
 
 def run_agent_control_loop(
     *,
-    runtime: GUIOwlRawPythonRuntime,
+    runtime: AgentRuntime,
     executor_client,
     user_prompt: str,
     policy: dict[str, Any],
@@ -639,7 +674,17 @@ def run_agent_control_loop(
         request_path = root / "payloads" / f"step-{step_index:03d}.request.json"
         _write_json(request_path, request.to_dict())
 
-        response = generate_step_response(runtime, request, max_new_tokens=max_new_tokens)
+        response = generate_step_response(
+            runtime,
+            request,
+            max_new_tokens=max_new_tokens,
+            generation_context=_make_generation_context(
+                run_dir=root,
+                step_id=step_id,
+                request_kind=request.request_kind,
+                step_index=request.step_index,
+            ),
+        )
         generated_steps += 1
         normalized_code = _normalize_python_code(response.python_code)
         response_path = root / "responses" / f"step-{step_index:03d}.response.json"
@@ -665,7 +710,17 @@ def run_agent_control_loop(
             )
             retry_request_path = root / "payloads" / f"step-{step_index:03d}.empty-retry-00.request.json"
             _write_json(retry_request_path, retry_request.to_dict())
-            retry_response = generate_step_response(runtime, retry_request, max_new_tokens=max_new_tokens)
+            retry_response = generate_step_response(
+                runtime,
+                retry_request,
+                max_new_tokens=max_new_tokens,
+                generation_context=_make_generation_context(
+                    run_dir=root,
+                    step_id=f"{step_id}.empty-retry-00",
+                    request_kind=retry_request.request_kind,
+                    step_index=retry_request.step_index,
+                ),
+            )
             generated_steps += 1
             empty_generation_retries_used += 1
             retry_response.notes.append("retry_due_to_empty_generation")
@@ -818,7 +873,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--endpoint")
     parser.add_argument("--mcp-command", nargs="+")
     parser.add_argument("--mcp-cwd")
-    parser.add_argument("--model-id", default=_default_model_id())
+    parser.add_argument("--model-id")
+    parser.add_argument("--agent-cli-command", nargs="+")
+    parser.add_argument("--agent-cli-cwd")
     parser.add_argument("--processor-id")
     parser.add_argument("--max-iterations", type=int, default=5)
     parser.add_argument("--max-new-tokens", type=int, default=256)
@@ -849,15 +906,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    runtime = GUIOwlRawPythonRuntime(
-        model_id=args.model_id,
-        processor_id=args.processor_id,
-        max_new_tokens=args.max_new_tokens,
-        load_in_4bit=not args.disable_4bit,
-        compute_dtype=args.compute_dtype,
-        device_map=args.device_map,
-        enable_fp32_cpu_offload=not args.disable_cpu_offload,
-    )
+    if args.model_id and args.agent_cli_command:
+        raise SystemExit("--model-id and --agent-cli-command are mutually exclusive")
+    if args.agent_cli_command:
+        runtime: AgentRuntime = ExternalCliRawPythonRuntime(
+            command=list(args.agent_cli_command),
+            cwd=args.agent_cli_cwd,
+            max_new_tokens=args.max_new_tokens,
+        )
+    else:
+        runtime = GUIOwlRawPythonRuntime(
+            model_id=args.model_id or _default_model_id(),
+            processor_id=args.processor_id,
+            max_new_tokens=args.max_new_tokens,
+            load_in_4bit=not args.disable_4bit,
+            compute_dtype=args.compute_dtype,
+            device_map=args.device_map,
+            enable_fp32_cpu_offload=not args.disable_cpu_offload,
+        )
     if args.preload:
         runtime.ensure_loaded()
     executor_client = build_executor_client(

@@ -3,11 +3,25 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import json
+import sys
 
 
 def default_config_path(cwd: str | Path | None = None) -> Path:
     base = Path(cwd or Path.cwd())
     return (base / "config" / "agent.default.json").resolve()
+
+
+def _should_use_current_python(command: list[str]) -> bool:
+    if len(command) < 3:
+        return False
+    if command[0] not in {"python", "python3"}:
+        return False
+    if command[1] != "-m":
+        return False
+    module_name = str(command[2] or "").strip()
+    return module_name == "computer_use_raw_python_agent.codex_backend" or module_name.startswith(
+        "computer_use_raw_python_agent."
+    )
 
 
 def load_agent_config(path: str | None) -> tuple[dict[str, Any], Path | None]:
@@ -24,6 +38,18 @@ def load_agent_config(path: str | None) -> tuple[dict[str, Any], Path | None]:
     if "mcp_cwd" in data:
         cwd_value = Path(str(data["mcp_cwd"]))
         normalized["mcp_cwd"] = str((base_dir / cwd_value).resolve()) if not cwd_value.is_absolute() else str(cwd_value)
+    if "agent_cli_command" in data:
+        command = [str(part) for part in data["agent_cli_command"]]
+        if command:
+            command_path = Path(command[0])
+            if not command_path.is_absolute() and (command[0].startswith(".") or "/" in command[0] or "\\" in command[0]):
+                command[0] = str((base_dir / command_path).absolute())
+            elif _should_use_current_python(command):
+                command[0] = sys.executable
+        normalized["agent_cli_command"] = command
+    if "agent_cli_cwd" in data:
+        cwd_value = Path(str(data["agent_cli_cwd"]))
+        normalized["agent_cli_cwd"] = str((base_dir / cwd_value).resolve()) if not cwd_value.is_absolute() else str(cwd_value)
     policy_value = data.get("policy", data.get("policy_path"))
     if policy_value is not None:
         policy_path = Path(str(policy_value))
