@@ -6,13 +6,13 @@
   "load_in_8bit": true,
   "compute_dtype": "float16",
   "device_map": "auto",
-  "max_iterations": 3,
-  "max_new_tokens": 1024,
+  "max_iterations": 8,
+  "max_new_tokens": 256,
   "strong_visual_grounding": true,
-  "reasoning_enabled": true,
+  "reasoning_enabled": false,
   "replan_enabled": true,
-  "replan_max_attempts": 1,
-  "web_search_enabled": true,
+  "replan_max_attempts": 4,
+  "web_search_enabled": false,
   "web_search_engine": "searxng",
   "searxng_base_url": "http://localhost:20001",
   "searxng_preferred_engines": ["google"],
@@ -26,5 +26,5 @@
   "dependency_repair_max_attempts": 2,
   "dependency_repair_allow_shell_fallback": false,
   "load_request_timeout_s": 120,
-  "run_request_timeout_s": 120
+  "run_request_timeout_s": 300
 }

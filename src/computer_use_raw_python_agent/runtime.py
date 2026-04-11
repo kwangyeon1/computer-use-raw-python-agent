@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - direct script execution fallback
 
 _DEFAULT_BLANK_IMAGE_SIZE = (64, 64)
 _DEFAULT_BLANK_IMAGE_COLOR = (255, 255, 255)
+_DEFAULT_MAX_IMAGE_DIMENSION = 1280
 
 
 def _is_compilable_python(code: str) -> bool:
@@ -471,10 +472,18 @@ class GUIOwlRawPythonRuntime:
         return moved
 
     def _load_image(self, image_path: str | Path | None, *, image_bytes: bytes | None = None, use_blank_image: bool):
+        image = None
         if image_bytes:
-            return self._image_cls.open(BytesIO(image_bytes)).convert("RGB")
-        if image_path:
-            return self._image_cls.open(image_path).convert("RGB")
+            image = self._image_cls.open(BytesIO(image_bytes)).convert("RGB")
+        elif image_path:
+            image = self._image_cls.open(image_path).convert("RGB")
+        if image is not None:
+            max_dimension = max(image.size)
+            if max_dimension > _DEFAULT_MAX_IMAGE_DIMENSION:
+                resample = getattr(self._image_cls, "Resampling", None)
+                filter_mode = resample.LANCZOS if resample is not None else self._image_cls.LANCZOS
+                image.thumbnail((_DEFAULT_MAX_IMAGE_DIMENSION, _DEFAULT_MAX_IMAGE_DIMENSION), filter_mode)
+            return image
         if use_blank_image:
             return self._image_cls.new("RGB", _DEFAULT_BLANK_IMAGE_SIZE, color=_DEFAULT_BLANK_IMAGE_COLOR)
         return None
