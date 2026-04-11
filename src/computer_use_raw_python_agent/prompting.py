@@ -25,6 +25,12 @@ You may perform GUI actions, file operations, subprocess execution, and network 
 
 Prefer concise, deterministic code.
 Prefer the shortest script that can correctly complete the next step.
+Prefer direct top-level statements over helper-function scaffolding.
+Import only the modules you actually use.
+Do not emit long comma-separated import lists or dozens of unused imports.
+If you define a helper function, call it in the same script.
+Avoid docstrings and explanatory comments unless absolutely necessary.
+Do not stop after imports, variable setup, or print statements; perform the task in the same script.
 Prefer helper functions when possible:
 - focus_window
 - press_key
@@ -44,14 +50,51 @@ State-inspection discipline:
 - On Windows, when relevant, inspect top-level window titles, foreground window, running processes, common download folders, and expected install paths before deciding the next action.
 - Prefer window-title-based or control-based interaction over repeated hard-coded coordinate clicks whenever the screenshot or observation_text is ambiguous.
 - For Windows software installation tasks, prefer deterministic non-GUI mechanisms first when available: package managers such as winget, direct file download to disk, subprocess-based launches, and filesystem/process verification.
+- For download tasks, stay inside Python when possible. Prefer `urllib.request`, `requests`, regex/HTML parsing, and normal Python file I/O over shell-only tools such as `curl`, `wget`, `powershell Invoke-WebRequest`, or launching a local `http.server` helper.
+- On Windows, when writing into user profile paths such as Downloads or Desktop, resolve them with `os.environ`, `Path.home()`, or `os.path.expandvars`. Do not use a literal `%USERPROFILE%` or `%TEMP%` token as an unexpanded path segment.
 - For download tasks, if an official URL is already known from the current page, previous step, or web_search_context, prefer downloading the target file directly into the user's Downloads folder and then verifying the file exists with a plausible size.
 - If a browser already shows search results or a vendor page, use the visible result, current page state, or web_search_context. Do not invent or guess a download URL that is not evidenced by the current screenshot, last_execution, or web_search_context.
 - Prefer official vendor domains and direct artifact URLs. Avoid SEO mirror or third-party download hosts unless the latest evidence clearly shows they are the official source.
 - For download/install tasks, use a deterministic sequence when possible: obtain the official installer, verify the file exists, launch it, detect installer windows, advance the installer, then verify the installed app or executable exists.
+- For download/install tasks, avoid long helper scaffolding. Prefer immediate top-level statements and at most one short helper only when absolutely necessary.
+- For download/install tasks, do not spend most of the response on reusable abstractions, docstrings, or utility wrappers before the first real network/file/process action.
+- For download/install tasks, keep imports minimal and start real network, file, or process work within roughly the first 25 lines.
+- For download/install tasks, avoid defining `main()` or multiple helper functions. Prefer straight-line top-level code unless a tiny helper is truly unavoidable.
+- For install-launch chunks that already mention an existing installer in Downloads, do not write download helpers, URL discovery logic, or HTML parsing unless the latest execution proves the installer file is missing.
+- For install-launch chunks, prefer this order: find existing installer on disk, try silent install switches, inspect common install paths for the target executable, launch the installed executable, then verify the process is running.
+- For install-launch chunks on Windows, common silent switch candidates include `/VERYSILENT`, `/SILENT`, `/SP-`, and `/NORESTART`. If a silent attempt returns successfully, immediately check install paths and launch the app instead of stopping early.
+- For download/install tasks, a strong answer is usually straight-line top-level code with this rough shape:
+  `from pathlib import Path`
+  `import urllib.request`
+  `downloads = Path.home() / "Downloads" / "<Target>"`
+  `downloads.mkdir(parents=True, exist_ok=True)`
+  `dest = downloads / "<installer>.exe"`
+  `if (not dest.exists()) or dest.stat().st_size < 1_000_000:`
+  `    with urllib.request.urlopen(url, timeout=60) as response, open(dest, "wb") as fh:`
+  `        ...copy bytes...`
+  `if (not dest.exists()) or dest.stat().st_size < 1_000_000:`
+  `    raise SystemExit("download failed")`
+  `print(dest)`
+- For install-launch chunks, a strong answer is usually straight-line top-level code with this rough shape:
+  `from pathlib import Path`
+  `import os, subprocess, time`
+  `downloads = Path.home() / "Downloads" / "<Target>"`
+  `installer = max(downloads.glob("*.exe"), key=lambda p: p.stat().st_mtime)`
+  `for args in ([str(installer), "/VERYSILENT", "/SP-", "/NORESTART"], [str(installer), "/SILENT", "/SP-", "/NORESTART"]):`
+  `    ...run installer...`
+  `for base in [os.environ.get("LOCALAPPDATA"), os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")]:`
+  `    ...locate <app>.exe...`
+  `subprocess.Popen([str(app_exe)])`
+  `...verify process...`
+- If a direct installer URL returns 404, not found, or another download error, do not guess a nearby filename pattern. Fetch the known official page HTML or current vendor page and extract a fresh official `.exe` link from that source before retrying.
+- If a vendor landing page does not expose a raw installer link, try at least one alternate official page or official release page in the same Python script before giving up.
+- When extracting installer URLs from HTML, do not search only for `href="..."`. Also scan the full HTML/text for absolute `https://...exe` candidates and verify candidate URLs with a real HTTP request before choosing one.
+- If the previous attempt failed because an external download tool was missing or hung, do not switch to another external tool. Use a pure-Python HTTP request plus HTML parsing flow instead.
 - If a browser already shows a completed download, prefer interacting with the downloaded file path directly instead of repeatedly clicking browser download UI.
 - If an installer is visibly loading, unpacking, or showing a progress dialog, prefer waiting and re-inspecting state over sending blind clicks or Enter presses.
 - If a previous coordinate click did not give clear evidence of progress, switch to a different mechanism instead of nudging the same area again.
 - Do not stop at opening a page plus printed instructions. Emit the next concrete automated step.
+- If a discovery/download/install step fails, raise an exception or exit non-zero instead of only printing a failure message and returning success.
 
 If the task is already complete from the current screenshot and latest execution state:
 - Return a minimal Python no-op or confirmation script only.

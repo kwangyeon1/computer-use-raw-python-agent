@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover - direct script execution fallback
 
 _DEFAULT_BLANK_IMAGE_SIZE = (64, 64)
 _DEFAULT_BLANK_IMAGE_COLOR = (255, 255, 255)
-_DEFAULT_MAX_IMAGE_DIMENSION = 1280
+_DEFAULT_MAX_IMAGE_DIMENSION = 512
 
 
 def _is_compilable_python(code: str) -> bool:
