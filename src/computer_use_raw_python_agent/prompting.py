@@ -53,6 +53,7 @@ State-inspection discipline:
 - For download tasks, stay inside Python when possible. Prefer `urllib.request`, `requests`, regex/HTML parsing, and normal Python file I/O over shell-only tools such as `curl`, `wget`, `powershell Invoke-WebRequest`, or launching a local `http.server` helper.
 - On Windows, when writing into user profile paths such as Downloads or Desktop, resolve them with `os.environ`, `Path.home()`, or `os.path.expandvars`. Do not use a literal `%USERPROFILE%` or `%TEMP%` token as an unexpanded path segment.
 - For download tasks, if an official URL is already known from the current page, previous step, or web_search_context, prefer downloading the target file directly into the user's Downloads folder and then verifying the file exists with a plausible size.
+- If the current prompt, current page, or web_search_context already provides one or more official vendor URLs, fetch those exact URLs first before inventing a nearby host, shortened domain, or guessed `latest` path.
 - If a browser already shows search results or a vendor page, use the visible result, current page state, or web_search_context. Do not invent or guess a download URL that is not evidenced by the current screenshot, last_execution, or web_search_context.
 - Prefer official vendor domains and direct artifact URLs. Avoid SEO mirror or third-party download hosts unless the latest evidence clearly shows they are the official source.
 - For download/install tasks, use a deterministic sequence when possible: obtain the official installer, verify the file exists, launch it, detect installer windows, advance the installer, then verify the installed app or executable exists.
@@ -87,8 +88,11 @@ State-inspection discipline:
   `subprocess.Popen([str(app_exe)])`
   `...verify process...`
 - If a direct installer URL returns 404, not found, or another download error, do not guess a nearby filename pattern. Fetch the known official page HTML or current vendor page and extract a fresh official `.exe` link from that source before retrying.
+- Do not treat guessed artifact directories such as `/files/latest`, `/download/latest`, or similar patterns as HTML pages unless that exact URL was already linked from fetched official vendor HTML or provided as an official URL in the prompt/context.
 - If a vendor landing page does not expose a raw installer link, try at least one alternate official page or official release page in the same Python script before giving up.
 - When extracting installer URLs from HTML, do not search only for `href="..."`. Also scan the full HTML/text for absolute `https://...exe` candidates and verify candidate URLs with a real HTTP request before choosing one.
+- When a vendor page contains relative download links, resolve them against the fetched official page with `urllib.parse.urljoin` before filtering or downloading.
+- Do not assume installer URLs contain a version number or match only digit-heavy regex patterns. Accept relative or absolute official `.exe` links when they resolve cleanly.
 - If the previous attempt failed because an external download tool was missing or hung, do not switch to another external tool. Use a pure-Python HTTP request plus HTML parsing flow instead.
 - If a browser already shows a completed download, prefer interacting with the downloaded file path directly instead of repeatedly clicking browser download UI.
 - If an installer is visibly loading, unpacking, or showing a progress dialog, prefer waiting and re-inspecting state over sending blind clicks or Enter presses.

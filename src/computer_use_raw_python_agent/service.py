@@ -7,6 +7,7 @@ import ast
 import base64
 import hashlib
 import json
+import re
 
 try:
     from .executor_client import ExecutorHttpClient, ExecutorStdioClient
@@ -389,6 +390,7 @@ def _history_for_invalid_python_retry_with_prompt(
     step_index: int,
     previous_code: str | None = None,
     duplicate_generation: bool = False,
+    prompt_url_violation: bool = False,
 ) -> list[str]:
     retry_history = _history_for_invalid_python_retry(
         history,
@@ -398,6 +400,16 @@ def _history_for_invalid_python_retry_with_prompt(
     if duplicate_generation:
         retry_history.append(
             "system_hint=the previous generation repeated the exact same script as the last executed step; produce a materially different script structure and control flow"
+        )
+    if prompt_url_violation:
+        prompt_urls = _extract_prompt_urls(user_prompt)
+        if prompt_urls:
+            retry_history.append(
+                "system_hint=this retry must start from one of the exact official URLs already present in the prompt before any other download URL guess: "
+                + ", ".join(prompt_urls[:4])
+            )
+        retry_history.append(
+            "system_hint=if you emit a direct download URL on this retry, it must be discovered from those exact prompt URLs or from official HTML fetched from them; otherwise the retry is invalid"
         )
     if _looks_like_existing_installer_launch_task(user_prompt):
         retry_history.append(
@@ -575,10 +587,15 @@ def _looks_like_download_or_install_task(user_prompt: str) -> bool:
 def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
     text = str(user_prompt or "").lower()
     launch_markers = (
-        "downloads\\",
-        "downloads/",
         "downloaded installer",
         "already exists in downloads",
+        "existing installer",
+        "existing installer file",
+        "already-downloaded installer",
+        "already downloaded installer",
+        "already present in downloads",
+        "use the installer already present in downloads",
+        "find the existing installer",
         "launch the installed app",
         "run it, finish the installation",
         "process is running",
@@ -742,7 +759,7 @@ def _rewrite_user_prompt_for_replan(
                 "Previous attempt failed while recursively scanning broad Windows directories. Do not rglob the whole of LOCALAPPDATA or Program Files."
             )
             override_lines.append(
-                "Check only likely install directories such as LOCALAPPDATA\\\\DBeaver, LOCALAPPDATA\\\\Programs\\\\DBeaver, Program Files\\\\DBeaver, and Program Files (x86)\\\\DBeaver, or use os.walk with onerror handling."
+                "Check only likely install directories such as LOCALAPPDATA\\\\<TargetApp>, LOCALAPPDATA\\\\Programs\\\\<TargetApp>, Program Files\\\\<TargetApp>, and Program Files (x86)\\\\<TargetApp>, or use a narrow os.walk with onerror handling."
             )
         if truncated_gui_repetition_failure:
             override_lines.append(
@@ -776,7 +793,10 @@ def _rewrite_user_prompt_for_replan(
 def _should_omit_screenshot_for_generation(*, user_prompt: str, last_execution: dict[str, Any]) -> bool:
     if _looks_like_existing_installer_launch_task(user_prompt):
         return False
-    return _looks_like_download_or_install_task(user_prompt) and not bool(last_execution)
+    return _looks_like_download_discovery_retry_without_useful_visual_state(
+        user_prompt=user_prompt,
+        last_execution=last_execution,
+    )
 
 
 def _generation_screenshot_fields(
@@ -942,6 +962,64 @@ def _looks_like_installer_url_discovery_failure(last_execution: dict[str, Any], 
     return any(token in normalized for token in discovery_tokens)
 
 
+def _extract_prompt_urls(text: str) -> list[str]:
+    matches = re.findall(r"https?://[^\s'\"`)>]+", str(text or ""))
+    seen: set[str] = set()
+    urls: list[str] = []
+    for raw in matches:
+        cleaned = raw.rstrip(".,;:])}>")
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        urls.append(cleaned)
+    return urls
+
+
+def _looks_like_download_discovery_retry_without_useful_visual_state(
+    *,
+    user_prompt: str,
+    last_execution: dict[str, Any],
+) -> bool:
+    if not _looks_like_download_or_install_task(user_prompt):
+        return False
+    if not last_execution:
+        return True
+    combined = "\n".join(
+        str(last_execution.get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    ).lower()
+    markers = (
+        "http error 404",
+        "404: not found",
+        "download failed:",
+        "failed to fetch page:",
+        "failed to find installer url",
+        "could not find installer url",
+        "no installer url found",
+        "failed to find download url",
+        "could not find download url",
+        "no download url found",
+    )
+    return any(marker in combined for marker in markers)
+
+
+def _generated_code_ignores_prompt_urls(
+    *,
+    user_prompt: str,
+    python_code: str,
+    active_replan_reasons: list[str],
+) -> bool:
+    if not _looks_like_download_or_install_task(user_prompt):
+        return False
+    prompt_urls = _extract_prompt_urls(user_prompt)
+    if not prompt_urls:
+        return False
+    normalized_code = _normalize_python_code(python_code).lower()
+    if "http" not in normalized_code:
+        return False
+    return not any(url.lower() in normalized_code for url in prompt_urls)
+
+
 def _looks_like_download_chunk_completed(*, user_prompt: str, last_execution: dict[str, Any]) -> bool:
     if not _looks_like_download_or_install_task(user_prompt):
         return False
@@ -994,6 +1072,209 @@ def _make_generation_context(
     }
 
 
+def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
+    words = re.findall(r"[a-z0-9][a-z0-9._-]{2,}", str(text or "").lower())
+    stop_words = {
+        "return",
+        "executable",
+        "python",
+        "only",
+        "chunk",
+        "download",
+        "downloads",
+        "installer",
+        "install",
+        "official",
+        "windows",
+        "current",
+        "target",
+        "machine",
+        "community",
+        "https",
+        "http",
+        "www",
+        "page",
+        "pages",
+        "html",
+        "link",
+        "links",
+        "prompt",
+        "from",
+        "into",
+        "task",
+    }
+    seen: set[str] = set()
+    result: list[str] = []
+    for word in words:
+        cleaned = word.strip("._-")
+        if len(cleaned) < 3 or cleaned in stop_words or cleaned in seen:
+            continue
+        if "." in cleaned and "/" not in cleaned:
+            continue
+        seen.add(cleaned)
+        result.append(cleaned)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _synthesized_official_download_recovery_code(*, user_prompt: str) -> str:
+    prompt_urls = _extract_prompt_urls(user_prompt)
+    keyword_candidates = _prompt_keyword_candidates(user_prompt)
+    return f"""from pathlib import Path
+from urllib.parse import urljoin, urlparse, unquote
+from html import unescape
+import json
+import os
+import re
+import sys
+import urllib.request
+
+PROMPT_URLS = {json.dumps(prompt_urls, ensure_ascii=False)}
+KEYWORDS = {json.dumps(keyword_candidates, ensure_ascii=False)}
+USER_AGENT = "Mozilla/5.0"
+
+downloads = Path.home() / "Downloads"
+downloads.mkdir(parents=True, exist_ok=True)
+
+generic_bad = ("portable", ".zip", ".7z", ".tar", ".gz", ".msi", ".pkg")
+preferred_markers = ("setup", "installer", "install", "win64", "windows", "x64")
+
+def score_url(url: str) -> int:
+    lowered = unquote(urlparse(url).path).lower()
+    score = 0
+    if lowered.endswith(".exe"):
+        score += 100
+    for keyword in KEYWORDS:
+        if keyword in lowered:
+            score += 20
+    for marker in preferred_markers:
+        if marker in lowered:
+            score += 8
+    for marker in generic_bad:
+        if marker in lowered:
+            score -= 200
+    return score
+
+def request_bytes(url: str) -> tuple[str, bytes]:
+    req = urllib.request.Request(url, headers={{"User-Agent": USER_AGENT}})
+    with urllib.request.urlopen(req, timeout=60) as response:
+        return response.geturl(), response.read()
+
+def extract_links(base_url: str, html_text: str) -> tuple[list[str], list[str]]:
+    page_links: list[str] = []
+    exe_links: list[str] = []
+    seen_pages = set()
+    seen_exe = set()
+    attr_matches = re.findall(r'''(?:href|src)\\s*=\\s*["\\']([^"\\']+)["\\']''', html_text, flags=re.IGNORECASE)
+    for raw in attr_matches:
+        resolved = urljoin(base_url, unescape(raw)).split("#", 1)[0]
+        lowered = resolved.lower()
+        if not lowered.startswith("http"):
+            continue
+        if lowered.endswith(".exe") and lowered not in seen_exe:
+            seen_exe.add(lowered)
+            exe_links.append(resolved)
+            continue
+        if any(token in lowered for token in ("download", "install", "release", "community", "edition")) and lowered not in seen_pages:
+            seen_pages.add(lowered)
+            page_links.append(resolved)
+    for raw in re.findall(r'https://[^\\s"\\'<>]+', html_text, flags=re.IGNORECASE):
+        resolved = raw.split("#", 1)[0]
+        lowered = resolved.lower()
+        if lowered.endswith(".exe") and lowered not in seen_exe:
+            seen_exe.add(lowered)
+            exe_links.append(resolved)
+    return page_links[:8], exe_links
+
+def candidate_destination(url: str) -> Path:
+    name = Path(unquote(urlparse(url).path)).name or "installer.exe"
+    if not name.lower().endswith(".exe"):
+        name = "installer.exe"
+    return downloads / name
+
+existing_candidates = []
+for path in downloads.glob("*.exe"):
+    lowered = path.name.lower()
+    if KEYWORDS and not any(keyword in lowered for keyword in KEYWORDS):
+        continue
+    if path.stat().st_size > 1_000_000:
+        existing_candidates.append(path)
+
+if existing_candidates:
+    existing = max(existing_candidates, key=lambda p: p.stat().st_mtime)
+    print(f"Found existing installer: {{existing}}")
+    sys.exit(0)
+
+visited_pages = set()
+page_queue = list(PROMPT_URLS)
+exe_candidates: list[str] = []
+seen_candidate_urls = set()
+
+while page_queue and len(visited_pages) < 10:
+    page_url = page_queue.pop(0)
+    if page_url in visited_pages:
+        continue
+    visited_pages.add(page_url)
+    try:
+        final_page_url, html_bytes = request_bytes(page_url)
+        html_text = html_bytes.decode("utf-8", errors="ignore")
+    except Exception as exc:
+        print(f"Failed to fetch page {{page_url}}: {{exc}}")
+        continue
+    extra_pages, exe_links = extract_links(final_page_url, html_text)
+    for extra_page in extra_pages:
+        if extra_page not in visited_pages:
+            page_queue.append(extra_page)
+    for exe_url in exe_links:
+        if exe_url.lower() in seen_candidate_urls:
+            continue
+        seen_candidate_urls.add(exe_url.lower())
+        exe_candidates.append(exe_url)
+
+exe_candidates.sort(key=score_url, reverse=True)
+
+if not exe_candidates:
+    raise SystemExit("No official Windows installer .exe candidate found from the prompt URLs.")
+
+for exe_url in exe_candidates:
+    dest = candidate_destination(exe_url)
+    print(f"Trying candidate: {{exe_url}}")
+    try:
+        req = urllib.request.Request(exe_url, headers={{"User-Agent": USER_AGENT}})
+        with urllib.request.urlopen(req, timeout=90) as response, open(dest, "wb") as fh:
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                fh.write(chunk)
+        size = dest.stat().st_size if dest.exists() else 0
+        if size > 1_000_000:
+            print(f"Downloaded: {{dest}} ({{size}} bytes)")
+            sys.exit(0)
+        if dest.exists():
+            dest.unlink(missing_ok=True)
+    except Exception as exc:
+        print(f"Candidate failed {{exe_url}}: {{exc}}")
+        continue
+
+raise SystemExit("All official installer candidates failed.")
+"""
+
+
+def _should_use_framework_official_download_recovery(request: StepRequest) -> bool:
+    if not request.replan_requested:
+        return False
+    if not _looks_like_download_or_install_task(request.user_prompt):
+        return False
+    if not _extract_prompt_urls(request.user_prompt):
+        return False
+    recovery_reasons = {"download_url_404", "installer_url_not_found", "execution_error"}
+    if not recovery_reasons.intersection(request.replan_reasons):
+        return False
+    return int(request.step_index or 0) >= 1
+
+
 def generate_step_response(
     runtime: AgentRuntime,
     request: StepRequest,
@@ -1001,6 +1282,16 @@ def generate_step_response(
     max_new_tokens: int,
     generation_context: dict[str, Any] | None = None,
 ) -> StepResponse:
+    if _should_use_framework_official_download_recovery(request):
+        code = _synthesized_official_download_recovery_code(user_prompt=request.user_prompt)
+        return StepResponse(
+            python_code=code,
+            raw_text=code,
+            model_id="framework:official-download-recovery",
+            step_index=request.step_index,
+            done=False,
+            notes=["framework_official_download_recovery_used"],
+        )
     image_bytes = None
     if request.screenshot_base64:
         image_bytes = base64.b64decode(request.screenshot_base64)
@@ -1561,11 +1852,17 @@ def run_agent_control_loop(
             normalized_code = retry_normalized_code
 
         duplicate_generation = _looks_like_duplicate_generation(response.python_code, previous_executed_code)
+        prompt_url_violation = _generated_code_ignores_prompt_urls(
+            user_prompt=user_prompt,
+            python_code=response.python_code,
+            active_replan_reasons=active_replan_reasons,
+        )
         invalid_generation = (
             not _is_compilable_python_code(response.python_code)
             or _looks_like_non_executing_task_script(response.python_code)
             or _looks_like_missing_install_progress_generation(response.python_code, user_prompt)
             or duplicate_generation
+            or prompt_url_violation
         )
         if invalid_generation:
             invalid_attempt_path = root / "responses" / f"step-{step_index:03d}.invalid-attempt-00.response.json"
@@ -1577,73 +1874,102 @@ def run_agent_control_loop(
                 response.notes.append("missing_install_progress_generation_detected")
             if duplicate_generation:
                 response.notes.append("duplicate_python_generation_detected")
+            if prompt_url_violation:
+                response.notes.append("prompt_url_violation_detected")
             _write_json(invalid_attempt_path, response.to_dict())
-            retry_request = StepRequest(
-                user_prompt=user_prompt,
-                policy=policy,
-                execution_style=execution_style,
-                replan_requested=bool(active_replan_reasons),
-                replan_reasons=active_replan_reasons,
-                strong_visual_grounding=strong_visual_grounding,
-                reasoning_enabled=reasoning_enabled,
-                screenshot_path=screenshot_path,
-                screenshot_base64=screenshot_base64,
-                screenshot_media_type=screenshot_media_type,
-                observation_text=state.get("observation_text"),
-                web_search_context=request.web_search_context,
-                recent_history=_history_for_invalid_python_retry_with_prompt(
-                    history,
-                    user_prompt=user_prompt,
+            if prompt_url_violation and _should_use_framework_official_download_recovery(request):
+                retry_response = StepResponse(
+                    python_code=_synthesized_official_download_recovery_code(user_prompt=user_prompt),
+                    raw_text=_synthesized_official_download_recovery_code(user_prompt=user_prompt),
+                    model_id="framework:official-download-recovery",
                     step_index=step_index,
-                    previous_code=response.raw_text,
-                    duplicate_generation=duplicate_generation,
-                ),
-                last_execution=last_execution,
-                step_index=step_index,
-            )
-            retry_request_path = root / "payloads" / f"step-{step_index:03d}.invalid-retry-00.request.json"
-            _write_json(retry_request_path, retry_request.to_dict())
-            retry_response = generate_step_response(
-                runtime,
-                retry_request,
-                max_new_tokens=_retry_token_budget(max_new_tokens),
-                generation_context=_make_generation_context(
-                    run_dir=root,
-                    step_id=f"{step_id}.invalid-retry-00",
-                    request_kind=retry_request.request_kind,
-                    step_index=retry_request.step_index,
-                ),
-            )
-            generated_steps += 1
-            invalid_generation_retries_used += 1
-            retry_response.notes.append("retry_due_to_invalid_python_generation")
-            retry_normalized_code = _normalize_python_code(retry_response.python_code)
-            retry_response_path = root / "responses" / f"step-{step_index:03d}.invalid-retry-00.response.json"
-            _write_json(retry_response_path, retry_response.to_dict())
-            retry_duplicate_generation = _looks_like_duplicate_generation(retry_response.python_code, previous_executed_code)
-            retry_invalid_generation = (
-                not _is_compilable_python_code(retry_response.python_code)
-                or _looks_like_non_executing_task_script(retry_response.python_code)
-                or _looks_like_missing_install_progress_generation(retry_response.python_code, user_prompt)
-                or retry_duplicate_generation
-            )
-            if retry_invalid_generation:
-                if not _is_compilable_python_code(retry_response.python_code):
-                    retry_response.notes.append("stopped_due_to_invalid_python_generation")
-                if _looks_like_non_executing_task_script(retry_response.python_code):
-                    retry_response.notes.append("stopped_due_to_non_executing_python_generation")
-                if _looks_like_missing_install_progress_generation(retry_response.python_code, user_prompt):
-                    retry_response.notes.append("stopped_due_to_missing_install_progress_generation")
-                if retry_duplicate_generation:
-                    retry_response.notes.append("stopped_due_to_duplicate_python_generation")
-                final_response = retry_response.to_dict()
+                    done=False,
+                    notes=[
+                        "retry_due_to_prompt_url_violation",
+                        "framework_official_download_recovery_used",
+                    ],
+                )
+                invalid_generation_retries_used += 1
+                retry_response_path = root / "responses" / f"step-{step_index:03d}.framework-recovery-00.response.json"
                 _write_json(retry_response_path, retry_response.to_dict())
-                _write_json(response_path, retry_response.to_dict())
-                stopped_reason = "invalid_python_generation"
-                history.append(f"step-{step_index:03d}_stopped=invalid_python_generation")
-                break
-            response = retry_response
-            normalized_code = retry_normalized_code
+                response = retry_response
+                normalized_code = _normalize_python_code(response.python_code)
+            else:
+                retry_request = StepRequest(
+                    user_prompt=user_prompt,
+                    policy=policy,
+                    execution_style=execution_style,
+                    replan_requested=bool(active_replan_reasons),
+                    replan_reasons=active_replan_reasons,
+                    strong_visual_grounding=strong_visual_grounding,
+                    reasoning_enabled=reasoning_enabled,
+                    screenshot_path=screenshot_path,
+                    screenshot_base64=screenshot_base64,
+                    screenshot_media_type=screenshot_media_type,
+                    observation_text=state.get("observation_text"),
+                    web_search_context=request.web_search_context,
+                    recent_history=_history_for_invalid_python_retry_with_prompt(
+                        history,
+                        user_prompt=user_prompt,
+                        step_index=step_index,
+                        previous_code=response.raw_text,
+                        duplicate_generation=duplicate_generation,
+                        prompt_url_violation=prompt_url_violation,
+                    ),
+                    last_execution=last_execution,
+                    step_index=step_index,
+                )
+                retry_request_path = root / "payloads" / f"step-{step_index:03d}.invalid-retry-00.request.json"
+                _write_json(retry_request_path, retry_request.to_dict())
+                retry_response = generate_step_response(
+                    runtime,
+                    retry_request,
+                    max_new_tokens=_retry_token_budget(max_new_tokens),
+                    generation_context=_make_generation_context(
+                        run_dir=root,
+                        step_id=f"{step_id}.invalid-retry-00",
+                        request_kind=retry_request.request_kind,
+                        step_index=retry_request.step_index,
+                    ),
+                )
+                generated_steps += 1
+                invalid_generation_retries_used += 1
+                retry_response.notes.append("retry_due_to_invalid_python_generation")
+                retry_normalized_code = _normalize_python_code(retry_response.python_code)
+                retry_response_path = root / "responses" / f"step-{step_index:03d}.invalid-retry-00.response.json"
+                _write_json(retry_response_path, retry_response.to_dict())
+                retry_duplicate_generation = _looks_like_duplicate_generation(retry_response.python_code, previous_executed_code)
+                retry_prompt_url_violation = _generated_code_ignores_prompt_urls(
+                    user_prompt=user_prompt,
+                    python_code=retry_response.python_code,
+                    active_replan_reasons=active_replan_reasons,
+                )
+                retry_invalid_generation = (
+                    not _is_compilable_python_code(retry_response.python_code)
+                    or _looks_like_non_executing_task_script(retry_response.python_code)
+                    or _looks_like_missing_install_progress_generation(retry_response.python_code, user_prompt)
+                    or retry_duplicate_generation
+                    or retry_prompt_url_violation
+                )
+                if retry_invalid_generation:
+                    if not _is_compilable_python_code(retry_response.python_code):
+                        retry_response.notes.append("stopped_due_to_invalid_python_generation")
+                    if _looks_like_non_executing_task_script(retry_response.python_code):
+                        retry_response.notes.append("stopped_due_to_non_executing_python_generation")
+                    if _looks_like_missing_install_progress_generation(retry_response.python_code, user_prompt):
+                        retry_response.notes.append("stopped_due_to_missing_install_progress_generation")
+                    if retry_duplicate_generation:
+                        retry_response.notes.append("stopped_due_to_duplicate_python_generation")
+                    if retry_prompt_url_violation:
+                        retry_response.notes.append("stopped_due_to_prompt_url_violation")
+                    final_response = retry_response.to_dict()
+                    _write_json(retry_response_path, retry_response.to_dict())
+                    _write_json(response_path, retry_response.to_dict())
+                    stopped_reason = "invalid_python_generation"
+                    history.append(f"step-{step_index:03d}_stopped=invalid_python_generation")
+                    break
+                response = retry_response
+                normalized_code = retry_normalized_code
 
         response.notes.append(f"code_fingerprint={_code_fingerprint(response.python_code)}")
         final_response = response.to_dict()
@@ -1765,6 +2091,15 @@ def run_agent_control_loop(
                 history.append(
                     "system_hint=use pure Python for download recovery; avoid curl, wget, powershell download commands, local http.server helpers, and literal %USERPROFILE% path strings"
                 )
+                prompt_urls = _extract_prompt_urls(user_prompt)
+                if prompt_urls:
+                    history.append(
+                        "system_hint=the current prompt already contains official URL candidates; fetch these exact URLs first before inventing a different host or latest-path: "
+                        + ", ".join(prompt_urls[:4])
+                    )
+                history.append(
+                    "system_hint=do not request guessed artifact directories such as /files/latest or /download/latest as HTML unless that exact URL came from fetched official vendor HTML"
+                )
             if "download_url_403" in unique_reasons:
                 history.append(
                     "system_hint=previous direct installer URL returned 403/Forbidden; retry with urllib.request.Request plus a browser-like User-Agent header or fetch the official download page HTML with the same header and extract the official installer link there"
@@ -1779,6 +2114,12 @@ def run_agent_control_loop(
                 history.append(
                     "system_hint=when parsing HTML for installers, do not search only href attributes; also scan the full HTML/text for absolute https .exe URLs and verify candidates with a real HTTP request before downloading"
                 )
+                prompt_urls = _extract_prompt_urls(user_prompt)
+                if prompt_urls:
+                    history.append(
+                        "system_hint=the prompt already lists official URL candidates; start from those exact pages and follow only official links discovered there: "
+                        + ", ".join(prompt_urls[:4])
+                    )
             if "installer_timeout" in unique_reasons:
                 history.append(
                     "system_hint=previous installer launch timed out; do not rerun the same silent installer command again on the next step"

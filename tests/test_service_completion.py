@@ -18,6 +18,7 @@ from computer_use_raw_python_agent.service import (
     _normalize_missing_module_install_name,
     _rewrite_user_prompt_for_replan,
     _retry_token_budget,
+    _should_omit_screenshot_for_generation,
 )
 
 
@@ -67,6 +68,15 @@ driver.get("https://example.com/download")
 driver.find_element("xpath", "//a").click()
 """
     assert _looks_like_opened_page_only_step(code) is False
+
+
+def test_download_prompt_with_downloads_destination_is_not_treated_as_existing_installer_launch_task() -> None:
+    prompt = (
+        "Use Python to open the official installation page, extract the latest Windows installer `.exe` link, "
+        "and download the installer to `~/Downloads/targetapp-windows-installer.exe`."
+    )
+    assert _looks_like_existing_installer_launch_task(prompt) is False
+    assert _should_omit_screenshot_for_generation(user_prompt=prompt, last_execution={}) is True
 
 
 def test_reported_failure_detected_from_stdout_or_stderr_even_with_zero_exit_code() -> None:
