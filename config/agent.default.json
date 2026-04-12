@@ -4,6 +4,7 @@
   "run_dir": "../data/runs",
   "max_iterations": 20,
   "max_new_tokens": 512,
+  "execution_style": "gui_first",
   "strong_visual_grounding": true,
   "reasoning_enabled": true,
   "replan_enabled": true,

@@ -37,6 +37,7 @@ class PromptBundle:
     user_prompt: str
     session_prompt: str
     policy: dict[str, Any]
+    execution_style: str = "python_first"
     reasoning_enabled: bool = False
     observation_text: str | None = None
     last_execution: dict[str, Any] = field(default_factory=dict)
@@ -79,6 +80,7 @@ class GeneratedText:
 class StepRequest:
     user_prompt: str
     policy: dict[str, Any] = field(default_factory=dict)
+    execution_style: str = "python_first"
     request_kind: str = "task_step"
     repair_context: dict[str, Any] = field(default_factory=dict)
     replan_requested: bool = False
@@ -99,6 +101,7 @@ class StepRequest:
         return cls(
             user_prompt=str(data["user_prompt"]),
             policy=dict(data.get("policy", {})),
+            execution_style=str(data.get("execution_style", "python_first")),
             request_kind=str(data.get("request_kind", "task_step")),
             repair_context=dict(data.get("repair_context", {})),
             replan_requested=bool(data.get("replan_requested", False)),

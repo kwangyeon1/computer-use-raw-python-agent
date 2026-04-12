@@ -68,6 +68,7 @@ def _collect_explicit_overrides(args: argparse.Namespace) -> dict:
         "policy",
         "max_iterations",
         "max_new_tokens",
+        "execution_style",
         "strong_visual_grounding",
         "reasoning_enabled",
         "replan_enabled",
@@ -320,6 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcp-cwd")
     parser.add_argument("--max-iterations", type=int)
     parser.add_argument("--max-new-tokens", type=int)
+    parser.add_argument("--execution-style", choices=("python_first", "gui_first"))
     parser.add_argument("--strong-visual-grounding", action="store_true", default=None)
     parser.add_argument("--reasoning-enabled", action="store_true", default=None)
     parser.add_argument("--replan-enabled", action="store_true", default=None)

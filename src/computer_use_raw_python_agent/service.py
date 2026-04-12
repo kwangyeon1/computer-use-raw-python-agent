@@ -1121,6 +1121,7 @@ def _maybe_perform_web_search(
     search_request = StepRequest(
         user_prompt=request.user_prompt,
         policy=request.policy,
+        execution_style=request.execution_style,
         request_kind="web_search_decision",
         repair_context={},
         replan_requested=request.replan_requested,
@@ -1264,6 +1265,7 @@ def _attempt_dependency_repair(
                 strategy=strategy,
             ),
             policy=policy,
+            execution_style="python_first",
             request_kind="dependency_repair",
             repair_context={
                 "reason": "missing_python_module",
@@ -1383,6 +1385,7 @@ def run_agent_control_loop(
     run_dir: str | Path,
     max_iterations: int,
     max_new_tokens: int,
+    execution_style: str = "python_first",
     strong_visual_grounding: bool = False,
     reasoning_enabled: bool = False,
     replan_enabled: bool = False,
@@ -1410,6 +1413,7 @@ def run_agent_control_loop(
         {
             "user_prompt": user_prompt,
             "policy": policy,
+            "execution_style": execution_style,
         },
     )
     if web_search_enabled and str(web_search_engine).strip().lower() != "searxng":
@@ -1453,6 +1457,7 @@ def run_agent_control_loop(
         request = StepRequest(
             user_prompt=request_user_prompt,
             policy=policy,
+            execution_style=execution_style,
             replan_requested=bool(active_replan_reasons),
             replan_reasons=active_replan_reasons,
             strong_visual_grounding=strong_visual_grounding,
@@ -1511,6 +1516,7 @@ def run_agent_control_loop(
             retry_request = StepRequest(
                 user_prompt=user_prompt,
                 policy=policy,
+                execution_style=execution_style,
                 replan_requested=bool(active_replan_reasons),
                 replan_reasons=active_replan_reasons,
                 strong_visual_grounding=strong_visual_grounding,
@@ -1575,6 +1581,7 @@ def run_agent_control_loop(
             retry_request = StepRequest(
                 user_prompt=user_prompt,
                 policy=policy,
+                execution_style=execution_style,
                 replan_requested=bool(active_replan_reasons),
                 replan_reasons=active_replan_reasons,
                 strong_visual_grounding=strong_visual_grounding,
@@ -1814,6 +1821,7 @@ def run_agent_control_loop(
         "final_response": final_response,
         "stopped_reason": stopped_reason,
         "strong_visual_grounding": strong_visual_grounding,
+        "execution_style": execution_style,
         "reasoning_enabled": reasoning_enabled,
         "replan_enabled": replan_enabled,
         "replan_max_attempts": replan_max_attempts,
@@ -1855,6 +1863,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--processor-id")
     parser.add_argument("--max-iterations", type=int, default=5)
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--execution-style", choices=("python_first", "gui_first"), default="python_first")
     parser.add_argument("--strong-visual-grounding", action="store_true")
     parser.add_argument("--reasoning-enabled", action="store_true")
     parser.add_argument("--replan-enabled", action="store_true")
@@ -1916,6 +1925,7 @@ def main() -> None:
             run_dir=args.run_dir,
             max_iterations=args.max_iterations,
             max_new_tokens=args.max_new_tokens,
+            execution_style=args.execution_style,
             strong_visual_grounding=args.strong_visual_grounding,
             reasoning_enabled=args.reasoning_enabled,
             replan_enabled=args.replan_enabled,

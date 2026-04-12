@@ -129,6 +129,22 @@ If web_search_context is present:
 - Do not fabricate search results that are not present in web_search_context.
 """
 
+PYTHON_FIRST_EXECUTION_APPEND = """
+Execution style: python_first
+- Keep the current Python-first behavior.
+- For install/download tasks, prefer deterministic Python-side progress before browser wandering: direct official download, file verification, subprocess launches, installer path checks, and process verification.
+- Prefer direct file/process/state inspection over browsing/searching when the next action can already be taken locally.
+"""
+
+GUI_FIRST_EXECUTION_APPEND = """
+Execution style: gui_first
+- Continue returning executable Python only, but prefer browser/UI-driven progression when relevant UI is already visible.
+- When a browser page, search results page, vendor page, installer wizard, UAC prompt, or completion dialog is already on screen, prefer advancing that visible state before bypassing it with a fresh direct download or silent install attempt.
+- For download/install tasks, it is acceptable to navigate search results, click visible official download controls, use browser download UI, and drive installer dialogs like a user when that is the most grounded next action from the screenshot.
+- Use direct Python HTTP download, silent switches, or filesystem-only shortcuts only when there is no useful visible UI state or the visible UI path has clearly stalled.
+- Prefer continuing from the current browser/app/installer state instead of restarting the task from scratch.
+"""
+
 REASONING_ENABLED_APPEND = """
 If reasoning_enabled is true:
 - You may use extra internal reasoning to choose the next action.
@@ -221,9 +237,19 @@ def _compact_last_execution_for_prompt(last_execution: dict | None) -> dict[str,
     return compact
 
 
+def _normalize_execution_style(value: str | None) -> str:
+    normalized = str(value or "python_first").strip().lower().replace("-", "_")
+    if normalized == "gui":
+        normalized = "gui_first"
+    if normalized not in {"python_first", "gui_first"}:
+        normalized = "python_first"
+    return normalized
+
+
 def render_user_prompt(
     session_prompt: str,
     policy: RuntimePolicy,
+    execution_style: str = "python_first",
     observation_text: str | None = None,
     recent_history: Iterable[str] | None = None,
     last_execution: dict | None = None,
@@ -233,6 +259,7 @@ def render_user_prompt(
     strong_visual_grounding: bool = False,
     reasoning_enabled: bool = False,
 ) -> str:
+    execution_style = _normalize_execution_style(execution_style)
     history = list(recent_history or [])
     last_execution_payload = _compact_last_execution_for_prompt(last_execution)
     replan_reason_list = [str(item) for item in (replan_reasons or [])]
@@ -240,6 +267,7 @@ def render_user_prompt(
         "user_prompt": session_prompt,
         "runtime_policy": policy.to_dict(),
         "request_kind": "task_step",
+        "execution_style": execution_style,
         "repair_context": None,
         "replan_requested": replan_requested,
         "replan_reasons": replan_reason_list,
@@ -258,6 +286,7 @@ def render_user_prompt(
 def render_prompt_bundle(
     session_prompt: str,
     policy: RuntimePolicy,
+    execution_style: str = "python_first",
     observation_text: str | None = None,
     recent_history: Iterable[str] | None = None,
     last_execution: dict | None = None,
@@ -267,10 +296,15 @@ def render_prompt_bundle(
     strong_visual_grounding: bool = False,
     reasoning_enabled: bool = False,
 ) -> PromptBundle:
+    execution_style = _normalize_execution_style(execution_style)
     history = list(recent_history or [])
     last_execution_payload = _compact_last_execution_for_prompt(last_execution)
     replan_reason_list = [str(item) for item in (replan_reasons or [])]
     system_prompt = RAW_PYTHON_SYSTEM_PROMPT
+    if execution_style == "gui_first":
+        system_prompt = system_prompt + "\n" + GUI_FIRST_EXECUTION_APPEND.strip() + "\n"
+    else:
+        system_prompt = system_prompt + "\n" + PYTHON_FIRST_EXECUTION_APPEND.strip() + "\n"
     if reasoning_enabled:
         system_prompt = system_prompt + "\n" + REASONING_ENABLED_APPEND.strip() + "\n"
     if strong_visual_grounding:
@@ -280,6 +314,7 @@ def render_prompt_bundle(
         user_prompt=render_user_prompt(
             session_prompt=session_prompt,
             policy=policy,
+            execution_style=execution_style,
             observation_text=observation_text,
             web_search_context=web_search_context,
             recent_history=history,
@@ -291,6 +326,7 @@ def render_prompt_bundle(
         ),
         session_prompt=session_prompt,
         policy=policy.to_dict(),
+        execution_style=execution_style,
         reasoning_enabled=reasoning_enabled,
         observation_text=observation_text,
         last_execution=last_execution_payload,
@@ -308,6 +344,7 @@ def render_prompt_bundle_from_step_request(request: StepRequest) -> PromptBundle
     bundle = render_prompt_bundle(
         session_prompt=request.user_prompt,
         policy=policy,
+        execution_style=request.execution_style,
         observation_text=request.observation_text,
         web_search_context=request.web_search_context,
         recent_history=history,
@@ -319,6 +356,7 @@ def render_prompt_bundle_from_step_request(request: StepRequest) -> PromptBundle
     )
     user_payload = json.loads(bundle.user_prompt)
     user_payload["request_kind"] = request.request_kind
+    user_payload["execution_style"] = _normalize_execution_style(request.execution_style)
     user_payload["repair_context"] = request.repair_context or None
     user_payload["replan_requested"] = request.replan_requested
     user_payload["replan_reasons"] = request.replan_reasons
@@ -348,6 +386,7 @@ def render_web_search_decision_bundle_from_step_request(
     payload = {
         "user_prompt": request.user_prompt,
         "request_kind": "web_search_decision",
+        "execution_style": _normalize_execution_style(request.execution_style),
         "strong_visual_grounding": request.strong_visual_grounding,
         "observation_text": request.observation_text,
         "last_execution": last_execution_payload or None,
@@ -369,6 +408,7 @@ def render_web_search_decision_bundle_from_step_request(
         user_prompt=json.dumps(payload, ensure_ascii=False, indent=2),
         session_prompt=request.user_prompt,
         policy=policy.to_dict(),
+        execution_style=_normalize_execution_style(request.execution_style),
         reasoning_enabled=reasoning_enabled,
         observation_text=request.observation_text,
         last_execution=last_execution_payload,

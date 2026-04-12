@@ -8,6 +8,7 @@
   "device_map": "auto",
   "max_iterations": 3,
   "max_new_tokens": 384,
+  "execution_style": "python_first",
   "strong_visual_grounding": true,
   "reasoning_enabled": true,
   "replan_enabled": true,
