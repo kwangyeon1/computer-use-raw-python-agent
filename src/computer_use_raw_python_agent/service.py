@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 import argparse
+import ast
 import base64
 import hashlib
 import json
@@ -77,6 +78,160 @@ def _code_fingerprint(code: str) -> str:
 
 def _is_empty_python_code(code: str) -> bool:
     return not bool(_normalize_python_code(code))
+
+
+def _is_compilable_python_code(code: str) -> bool:
+    normalized = _normalize_python_code(code)
+    if not normalized:
+        return False
+    try:
+        compile(normalized, "<agent-generated>", "exec")
+        return True
+    except SyntaxError:
+        return False
+
+
+def _has_meaningful_top_level_execution(code: str) -> bool:
+    normalized = _normalize_python_code(code)
+    if not normalized:
+        return False
+    try:
+        tree = ast.parse(normalized, mode="exec")
+    except SyntaxError:
+        return False
+
+    def _is_literal_value(node: ast.AST | None) -> bool:
+        if node is None:
+            return True
+        if isinstance(node, ast.Constant):
+            return True
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return all(_is_literal_value(item) for item in node.elts)
+        if isinstance(node, ast.Dict):
+            return all(_is_literal_value(key) and _is_literal_value(value) for key, value in zip(node.keys, node.values))
+        return False
+
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Pass)):
+            continue
+        if isinstance(node, ast.Expr) and isinstance(getattr(node, "value", None), ast.Constant) and isinstance(node.value.value, str):
+            continue
+        if isinstance(node, ast.Assign) and _is_literal_value(node.value):
+            continue
+        if isinstance(node, ast.AnnAssign) and _is_literal_value(node.value):
+            continue
+        return True
+    return False
+
+
+def _looks_like_non_executing_task_script(code: str) -> bool:
+    normalized = _normalize_python_code(code)
+    if not normalized:
+        return False
+    if _has_task_complete_marker(normalized):
+        return False
+    if not _has_meaningful_top_level_execution(normalized):
+        return True
+    try:
+        tree = ast.parse(normalized, mode="exec")
+    except SyntaxError:
+        return False
+    function_names = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    if function_names:
+        if isinstance(tree.body[-1], (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return True
+
+        def _calls_defined_helper(stmt: ast.stmt) -> bool:
+            for node in ast.walk(stmt):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in function_names:
+                    return True
+            return False
+
+        non_definition_stmts = [
+            stmt
+            for stmt in tree.body
+            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+        if not any(_calls_defined_helper(stmt) for stmt in non_definition_stmts):
+            return True
+    return False
+
+
+def _has_gui_install_progress_action(code: str) -> bool:
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    progress_tokens = (
+        "pyautogui.",
+        "click(",
+        "doubleclick(",
+        "press(",
+        "hotkey(",
+        "typewrite(",
+        "write(",
+        "getwindowswithtitle(",
+        ".activate(",
+        ".restore(",
+        ".maximize(",
+    )
+    return any(token in normalized for token in progress_tokens)
+
+
+def _has_installer_launch_action(code: str) -> bool:
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    launch_tokens = (
+        "subprocess.popen(",
+        "subprocess.run(",
+        "os.startfile(",
+        "startfile(",
+    )
+    installer_tokens = (
+        "installer",
+        "setup",
+        ".exe",
+        "/verysilent",
+        "/silent",
+        "/sp-",
+        "/norestart",
+    )
+    if any(
+        launch_token in normalized and installer_token in normalized
+        for launch_token in launch_tokens
+        for installer_token in installer_tokens
+    ):
+        return True
+    for line in normalized.splitlines():
+        stripped = line.strip()
+        if any(token in stripped for token in launch_tokens) and any(token in stripped for token in installer_tokens):
+            return True
+    return False
+
+
+def _has_install_progress_action(code: str) -> bool:
+    return _has_installer_launch_action(code) or _has_gui_install_progress_action(code)
+
+
+def _looks_like_missing_install_progress_generation(code: str, user_prompt: str) -> bool:
+    if not _looks_like_existing_installer_launch_task(user_prompt):
+        return False
+    normalized = _normalize_python_code(code).lower()
+    if not normalized or _has_task_complete_marker(normalized):
+        return False
+    installer_context_tokens = (
+        "downloads",
+        "installer",
+        ".exe",
+        "setup",
+    )
+    if not any(token in normalized for token in installer_context_tokens):
+        return False
+    return not _has_install_progress_action(normalized)
 
 
 def _has_task_complete_marker(code: str) -> bool:
@@ -188,11 +343,191 @@ def _history_for_empty_retry(history: list[str], *, step_index: int) -> list[str
     return retry_history
 
 
+def _compact_previous_python_for_retry(code: str, *, max_chars: int = 1200) -> str:
+    normalized = _normalize_python_code(code)
+    if len(normalized) <= max_chars:
+        return normalized
+    head_limit = max_chars // 2
+    tail_limit = max_chars - head_limit - 5
+    return normalized[:head_limit].rstrip() + "\n...\n" + normalized[-tail_limit:].lstrip()
+
+
+def _history_for_invalid_python_retry(history: list[str], *, step_index: int, previous_code: str | None = None) -> list[str]:
+    retry_history = _history_for_step(history)
+    retry_history.append(f"step-{step_index:03d}_invalid_python_generation=1")
+    retry_history.append(
+        "system_hint=previous model output was invalid, truncated, or helper-only; return one complete top-level standalone Python script only with no prose, no docstrings, and no function-only skeleton"
+    )
+    retry_history.append(
+        "system_hint=if the previous script was cut off mid-block, continue and finish the same script idea instead of restarting from scratch; close all loops, conditionals, and try blocks"
+    )
+    retry_history.append(
+        "system_hint=the final script must actually execute the task end-to-end, including main invocation, download completion, and explicit failure on errors"
+    )
+    retry_history.append(
+        "system_hint=for download/install tasks, avoid helper-function scaffolding on retry; start real top-level network/file/process actions early in the script"
+    )
+    retry_history.append(
+        "system_hint=on retry for download/install tasks, do not define main() or multiple helper functions; prefer straight-line top-level code only"
+    )
+    retry_history.append(
+        "system_hint=do not emit import-only or setup-only code; import only modules you use and start doing the actual task within the first 25 lines"
+    )
+    compact_previous = _compact_previous_python_for_retry(previous_code or "")
+    if compact_previous:
+        retry_history.append(
+            "system_hint=continue the same script idea from the previous partial Python below; return the full finished script from the beginning, not only the missing tail"
+        )
+        retry_history.append(f"previous_python_prefix=\n{compact_previous}")
+    return retry_history
+
+
+def _history_for_invalid_python_retry_with_prompt(
+    history: list[str],
+    *,
+    user_prompt: str,
+    step_index: int,
+    previous_code: str | None = None,
+    duplicate_generation: bool = False,
+) -> list[str]:
+    retry_history = _history_for_invalid_python_retry(
+        history,
+        step_index=step_index,
+        previous_code=previous_code,
+    )
+    if duplicate_generation:
+        retry_history.append(
+            "system_hint=the previous generation repeated the exact same script as the last executed step; produce a materially different script structure and control flow"
+        )
+    if _looks_like_existing_installer_launch_task(user_prompt):
+        retry_history.append(
+            "system_hint=this is an install-and-launch chunk with an existing installer file; do not emit any download helper, URL fetch, HTML parsing, or release discovery logic"
+        )
+        retry_history.append(
+            "system_hint=return one straight-line top-level script that finds the installer in Downloads, tries silent install switches, locates the installed app exe, launches it, and verifies the process"
+        )
+        retry_history.append(
+            "system_hint=if no installed app exe already exists, the script must either launch the installer or actively drive an already-visible installer window; a search-only script is invalid"
+        )
+        retry_history.append(
+            "system_hint=launching only the final app exe is not install progress; the script must either call subprocess/os.startfile on the installer path itself or use Python GUI automation on a visible installer window"
+        )
+        retry_history.append(
+            "system_hint=keep the installer GUI script compact; use short bounded loops for repeated key presses instead of many duplicated pyautogui.press lines"
+        )
+        retry_history.append(
+            "system_hint=if you need to advance the wizard repeatedly, prefer a loop such as for _ in range(8): pyautogui.press('enter'); time.sleep(1)"
+        )
+        retry_history.append(
+            "system_hint=prefer common Windows silent installer switches such as /VERYSILENT, /SILENT, /SP-, and /NORESTART before any GUI automation"
+        )
+    return retry_history
+
+
+def _looks_like_duplicate_generation(code: str, previous_executed_code: str | None) -> bool:
+    if not previous_executed_code:
+        return False
+    normalized = _normalize_python_code(code)
+    previous_normalized = _normalize_python_code(previous_executed_code)
+    return bool(normalized) and normalized == previous_normalized
+
+
 def _history_for_dependency_repair(history: list[str], *, failed_step_id: str) -> list[str]:
     failed_step_history = [entry for entry in history if entry.startswith(f"{failed_step_id}_")]
     if not failed_step_history:
         return _history_for_step(history)
     return failed_step_history[-2:]
+
+
+_MISSING_MODULE_INSTALL_NAME_OVERRIDES = {
+    "pywin32": "pywin32",
+    "win32api": "pywin32",
+    "win32com": "pywin32",
+    "win32con": "pywin32",
+    "win32event": "pywin32",
+    "win32gui": "pywin32",
+    "win32process": "pywin32",
+    "win32ui": "pywin32",
+    "pythoncom": "pywin32",
+}
+
+
+def _normalize_missing_module_install_name(module_name: str, install_name: str) -> str:
+    normalized_module = str(module_name or "").strip().lower()
+    normalized_install = str(install_name or "").strip()
+    if normalized_module in _MISSING_MODULE_INSTALL_NAME_OVERRIDES:
+        return _MISSING_MODULE_INSTALL_NAME_OVERRIDES[normalized_module]
+    return normalized_install
+
+
+_OPTIONAL_WINDOWS_GUI_MODULES = {
+    "pywin32",
+    "pywinauto",
+    "pythoncom",
+    "win32api",
+    "win32com",
+    "win32con",
+    "win32event",
+    "win32gui",
+    "win32process",
+    "win32ui",
+}
+
+
+def _missing_module_name_from_execution(last_execution: dict[str, Any]) -> str:
+    error_info = dict(last_execution.get("error_info") or {})
+    module_name = str(error_info.get("module_name") or "").strip()
+    if module_name:
+        return module_name
+    combined = "\n".join(
+        str(last_execution.get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    )
+    for line in combined.splitlines():
+        marker = "No module named "
+        if marker in line:
+            tail = line.split(marker, 1)[1].strip().strip("'\"")
+            if tail:
+                return tail
+    return ""
+
+
+def _looks_like_optional_windows_gui_module_failure(last_execution: dict[str, Any]) -> bool:
+    module_name = _missing_module_name_from_execution(last_execution).lower()
+    return module_name in _OPTIONAL_WINDOWS_GUI_MODULES
+
+
+def _dependency_repair_user_prompt(*, module_name: str, install_name: str, strategy: str) -> str:
+    lines = [
+        "Return executable Python only.",
+        "Repair the reported missing Python dependency only.",
+        "Do not continue the main GUI task in this response.",
+        f"Missing module: {module_name}",
+        f"Preferred install target: {install_name}",
+    ]
+    if strategy == "pip_install":
+        lines.extend(
+            [
+                "Use sys.executable -m pip install <package> first.",
+                "After installation, verify the import in the same script and exit non-zero if the import still fails.",
+                "Do not relaunch the installer or repeat the original task script here.",
+            ]
+        )
+        if module_name.strip().lower() == "pywin32":
+            lines.extend(
+                [
+                    "Important: `pywin32` is a distribution name, not a reliable top-level import target.",
+                    "Do not write `import pywin32` after installation. Either verify a concrete Win32 module such as `win32gui` or `pythoncom`, or finish after successful pip install and let the next task step avoid `import pywin32`.",
+                ]
+            )
+    else:
+        lines.extend(
+            [
+                "Use a shell or subprocess fallback to install the dependency, then verify the import.",
+                "Do not relaunch the installer or repeat the original task script here.",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def _history_for_web_search(history: list[str], *, limit: int = 4) -> list[str]:
@@ -202,6 +537,11 @@ def _history_for_web_search(history: list[str], *, limit: int = 4) -> list[str]:
         return base
     combined = base + filtered[-2:]
     return list(dict.fromkeys(combined))[-limit:]
+
+
+def _retry_token_budget(max_new_tokens: int) -> int:
+    base = int(max_new_tokens)
+    return max(base, min(512, base + 128))
 
 
 def _state_visual_hash(state: dict[str, Any]) -> str | None:
@@ -230,6 +570,228 @@ def _looks_like_download_or_install_task(user_prompt: str) -> bool:
         "setup.exe",
     )
     return any(keyword in text for keyword in keywords)
+
+
+def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
+    text = str(user_prompt or "").lower()
+    launch_markers = (
+        "downloads\\",
+        "downloads/",
+        "downloaded installer",
+        "already exists in downloads",
+        "launch the installed app",
+        "run it, finish the installation",
+        "process is running",
+    )
+    return _looks_like_download_or_install_task(text) and any(marker in text for marker in launch_markers)
+
+
+def _looks_like_installer_timeout(last_execution: dict[str, Any], python_code: str, user_prompt: str) -> bool:
+    if not _looks_like_existing_installer_launch_task(user_prompt):
+        return False
+    if not last_execution:
+        return False
+    if not bool(last_execution.get("timed_out")) and str((last_execution.get("error_info") or {}).get("kind") or "").lower() != "timeout":
+        return False
+    normalized = _normalize_python_code(python_code).lower()
+    installer_tokens = (
+        "/verysilent",
+        "/silent",
+        "subprocess.run(",
+        ".exe",
+    )
+    return any(token in normalized for token in installer_tokens)
+
+
+def _looks_like_installer_launched_but_app_not_found(last_execution: dict[str, Any], python_code: str, user_prompt: str) -> bool:
+    if not _looks_like_existing_installer_launch_task(user_prompt):
+        return False
+    if not last_execution:
+        return False
+    combined = "\n".join(
+        str(last_execution.get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    ).lower()
+    if "found installer:" not in combined:
+        return False
+    failure_markers = (
+        "installation failed or app not found",
+        "app exited immediately",
+        "app exited unexpectedly",
+    )
+    if not any(marker in combined for marker in failure_markers):
+        return False
+    normalized = _normalize_python_code(python_code).lower()
+    return "subprocess.popen(" in normalized and ".exe" in normalized
+
+
+def _looks_like_incomplete_install_attempt(last_execution: dict[str, Any], python_code: str, user_prompt: str) -> bool:
+    if not _looks_like_existing_installer_launch_task(user_prompt):
+        return False
+    if int(last_execution.get("return_code", 0) or 0) != 0:
+        return False
+    combined = "\n".join(
+        str(last_execution.get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    ).lower()
+    if "found installer:" not in combined:
+        return False
+    success_markers = (
+        "found installed exe:",
+        "installed exe exists",
+        "process running",
+        "installation complete",
+        "already installed",
+    )
+    if any(marker in combined for marker in success_markers):
+        return False
+    normalized = _normalize_python_code(python_code).lower()
+    if not _has_install_progress_action(normalized):
+        return True
+    install_tokens = (
+        "subprocess.popen(",
+        "subprocess.run(",
+        "os.startfile(",
+        "/verysilent",
+        "/silent",
+        ".exe",
+    )
+    return any(token in normalized for token in install_tokens)
+
+
+def _looks_like_install_path_scan_failure(last_execution: dict[str, Any]) -> bool:
+    combined = "\n".join(
+        str(last_execution.get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    ).lower()
+    markers = (
+        "filenotfounderror",
+        "winerror 3",
+        "cloudstore",
+        "os.scandir",
+        "pathlib.py",
+        "rglob(",
+    )
+    return any(marker in combined for marker in markers)
+
+
+def _looks_like_truncated_gui_repetition_failure(last_execution: dict[str, Any]) -> bool:
+    stderr_tail = str(last_execution.get("stderr_tail") or "").lower()
+    return "nameerror" in stderr_tail and "name 'py' is not defined" in stderr_tail
+
+
+def _rewrite_user_prompt_for_replan(
+    user_prompt: str,
+    *,
+    active_replan_reasons: list[str],
+    last_execution: dict[str, Any],
+) -> str:
+    prompt = str(user_prompt or "").strip()
+    unique_reasons = list(dict.fromkeys(str(reason).strip() for reason in active_replan_reasons if str(reason).strip()))
+    if not prompt or not unique_reasons:
+        return prompt
+
+    if not _looks_like_existing_installer_launch_task(prompt):
+        return prompt
+
+    optional_gui_dependency_failure = _looks_like_optional_windows_gui_module_failure(last_execution)
+    install_path_scan_failure = _looks_like_install_path_scan_failure(last_execution)
+    truncated_gui_repetition_failure = _looks_like_truncated_gui_repetition_failure(last_execution)
+    install_replan = (
+        "installer_timeout" in unique_reasons
+        or "installer_app_not_found" in unique_reasons
+        or "execution_error" in unique_reasons
+        or optional_gui_dependency_failure
+    )
+    override_lines = [
+        "REPLAN OVERRIDE FOR THIS STEP:",
+        "Return executable Python only.",
+    ]
+    if "repeated_code_execution" in unique_reasons:
+        override_lines.append("Produce a materially different script from the previous attempt.")
+    if install_replan:
+        override_lines.append("Do not repeat the same silent installer launch-and-scan script.")
+        override_lines.append("Do not retry `/VERYSILENT` or `/SILENT` first on this step.")
+        override_lines.append(
+            "First inspect the current screenshot and desktop state for an installer wizard, UAC prompt, license dialog, destination dialog, or completion dialog, and use Python GUI automation to advance it."
+        )
+        override_lines.append(
+            "Use Python-accessible GUI control such as pyautogui, pygetwindow, ctypes, or psutil if available. Do not ask a human to click."
+        )
+        override_lines.append(
+            "Import only GUI modules you actually call. Prefer the smallest available toolset first, such as pyautogui plus the standard library."
+        )
+        override_lines.append(
+            "Launching only the final app executable is not enough. This step must either launch the installer path itself or operate a visible installer window with Python GUI automation."
+        )
+        override_lines.append(
+            "Keep the script compact. Use short loops for repeated installer key presses instead of many duplicated pyautogui.press lines."
+        )
+        if optional_gui_dependency_failure:
+            override_lines.append(
+                "Previous attempt failed while importing optional Windows GUI modules. Do not directly import win32gui, win32con, win32api, pythoncom, pywinauto, or similar optional packages unless the script first proves they already import successfully."
+            )
+            override_lines.append(
+                "Prefer pyautogui, pygetwindow, psutil, and the standard library. If an optional helper import fails, catch it and fall back instead of aborting the whole step at startup."
+            )
+        override_lines.append("Keep the script short and avoid deeply nested repeated retry loops.")
+        override_lines.append("Only after handling visible installer UI may you scan install paths, launch the installed app, and verify the process.")
+        override_lines.append("If no installer window is visible, then check running processes and common install paths before relaunching the installer once.")
+        if install_path_scan_failure:
+            override_lines.append(
+                "Previous attempt failed while recursively scanning broad Windows directories. Do not rglob the whole of LOCALAPPDATA or Program Files."
+            )
+            override_lines.append(
+                "Check only likely install directories such as LOCALAPPDATA\\\\DBeaver, LOCALAPPDATA\\\\Programs\\\\DBeaver, Program Files\\\\DBeaver, and Program Files (x86)\\\\DBeaver, or use os.walk with onerror handling."
+            )
+        if truncated_gui_repetition_failure:
+            override_lines.append(
+                "Previous attempt appears to have been cut off mid-script while repeating GUI actions. Rewrite it as a shorter complete script from the beginning."
+            )
+            override_lines.append(
+                "If you need many Enter presses, use a bounded loop like for _ in range(8): pyautogui.press('enter'); time.sleep(1) rather than spelling them out line by line."
+            )
+
+    stdout_tail = str(last_execution.get("stdout_tail") or "").strip()
+    stderr_tail = str(last_execution.get("stderr_tail") or "").strip()
+    if stdout_tail:
+        override_lines.append(f"Previous stdout summary: {stdout_tail[-240:]}")
+    if stderr_tail:
+        override_lines.append(f"Previous stderr summary: {stderr_tail[-240:]}")
+
+    if install_replan:
+        override_lines.extend(
+            [
+                "Use the existing installer already present in Downloads; do not add download, URL discovery, or HTML parsing logic.",
+                "If an installer or completion window is visible, operate that window directly with Python clicks, key presses, or focus changes instead of launching the installer again.",
+                "If no installer window is visible, inspect common install paths and running processes for the target app before relaunching the installer once without silent-mode repetition.",
+                "End this step only when the installed app process is running.",
+            ]
+        )
+        return "\n".join(override_lines)
+
+    return "\n".join(override_lines) + "\n\n" + prompt
+
+
+def _should_omit_screenshot_for_generation(*, user_prompt: str, last_execution: dict[str, Any]) -> bool:
+    if _looks_like_existing_installer_launch_task(user_prompt):
+        return False
+    return _looks_like_download_or_install_task(user_prompt) and not bool(last_execution)
+
+
+def _generation_screenshot_fields(
+    *,
+    state: dict[str, Any],
+    user_prompt: str,
+    last_execution: dict[str, Any],
+) -> tuple[Any, Any, Any]:
+    if _should_omit_screenshot_for_generation(user_prompt=user_prompt, last_execution=last_execution):
+        return None, None, None
+    return (
+        state.get("screenshot_path"),
+        state.get("screenshot_base64"),
+        state.get("screenshot_media_type"),
+    )
 
 
 def _looks_like_opened_page_only_step(python_code: str) -> bool:
@@ -301,6 +863,114 @@ def _looks_like_reported_failure(last_execution: dict[str, Any]) -> bool:
     return any(marker in combined for marker in failure_markers)
 
 
+def _looks_like_direct_download_url_404(last_execution: dict[str, Any], python_code: str) -> bool:
+    if not last_execution:
+        return False
+    combined = "\n".join(
+        str(last_execution.get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    ).lower()
+    if "404" not in combined and "not found" not in combined:
+        return False
+    normalized = _normalize_python_code(python_code).lower()
+    if "http" not in normalized or ".exe" not in normalized:
+        return False
+    direct_download_tokens = (
+        "requests.get(",
+        "urllib",
+        "downloadfile(",
+        "urlretrieve(",
+        "invoke-webrequest",
+        "start-bitstransfer",
+        "webclient",
+    )
+    return any(token in normalized for token in direct_download_tokens)
+
+
+def _looks_like_direct_download_url_403(last_execution: dict[str, Any], python_code: str) -> bool:
+    if not last_execution:
+        return False
+    combined = "\n".join(
+        str(last_execution.get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    ).lower()
+    if "403" not in combined and "forbidden" not in combined:
+        return False
+    normalized = _normalize_python_code(python_code).lower()
+    if "http" not in normalized or ".exe" not in normalized:
+        return False
+    direct_download_tokens = (
+        "requests.get(",
+        "urllib",
+        "downloadfile(",
+        "urlretrieve(",
+        "invoke-webrequest",
+        "start-bitstransfer",
+    )
+    return any(token in normalized for token in direct_download_tokens)
+
+
+def _looks_like_installer_url_discovery_failure(last_execution: dict[str, Any], python_code: str) -> bool:
+    if not last_execution:
+        return False
+    combined = "\n".join(
+        str(last_execution.get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    ).lower()
+    discovery_markers = (
+        "failed to find installer url",
+        "could not find installer url",
+        "no installer url found",
+        "failed to find download url",
+        "could not find download url",
+        "no download url found",
+    )
+    if not any(marker in combined for marker in discovery_markers):
+        return False
+    normalized = _normalize_python_code(python_code).lower()
+    if ".exe" not in normalized:
+        return False
+    discovery_tokens = (
+        "urllib.request.urlopen(",
+        "requests.get(",
+        ".read().decode(",
+        "re.findall(",
+        "findall(",
+        "href=",
+        "html",
+    )
+    return any(token in normalized for token in discovery_tokens)
+
+
+def _looks_like_download_chunk_completed(*, user_prompt: str, last_execution: dict[str, Any]) -> bool:
+    if not _looks_like_download_or_install_task(user_prompt):
+        return False
+    if int(last_execution.get("return_code", 0) or 0) != 0:
+        return False
+    combined = "\n".join(
+        str(last_execution.get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    ).lower()
+    success_markers = (
+        "downloaded:",
+        "downloaded successfully:",
+        "existing installer found:",
+        "using existing installer:",
+    )
+    if not any(marker in combined for marker in success_markers):
+        return False
+    prompt_lower = str(user_prompt or "").lower()
+    return any(
+        marker in prompt_lower
+        for marker in (
+            "success target",
+            "installer `.exe` exists",
+            "installer `.exe`가 있",
+            "downloads\\",
+        )
+    )
+
+
 def build_executor_client(*, endpoint: str | None, mcp_command: list[str] | None, mcp_cwd: str | None):
     if bool(endpoint) == bool(mcp_command):
         raise RuntimeError("provide exactly one of endpoint or mcp_command")
@@ -339,7 +1009,7 @@ def generate_step_response(
         prompt_bundle=bundle,
         image_path=request.screenshot_path,
         image_bytes=image_bytes,
-        use_blank_image=not bool(request.screenshot_path or image_bytes),
+        use_blank_image=not bool(request.screenshot_path or image_bytes) and not _looks_like_download_or_install_task(request.user_prompt),
         max_new_tokens=max_new_tokens,
         generation_context=generation_context,
     )
@@ -573,7 +1243,11 @@ def _attempt_dependency_repair(
     allow_shell_fallback: bool,
 ) -> dict[str, Any]:
     error_info = dict(last_execution.get("error_info") or {})
-    install_name = str(error_info.get("install_name") or error_info.get("module_name") or "").strip()
+    module_name = str(error_info.get("module_name") or "").strip()
+    install_name = _normalize_missing_module_install_name(
+        module_name,
+        str(error_info.get("install_name") or module_name).strip(),
+    )
     if not install_name:
         return {"handled": False}
 
@@ -584,12 +1258,16 @@ def _attempt_dependency_repair(
 
     for strategy_index, strategy in enumerate(strategies):
         repair_request = StepRequest(
-            user_prompt=user_prompt,
+            user_prompt=_dependency_repair_user_prompt(
+                module_name=module_name or install_name,
+                install_name=install_name,
+                strategy=strategy,
+            ),
             policy=policy,
             request_kind="dependency_repair",
             repair_context={
                 "reason": "missing_python_module",
-                "module_name": error_info.get("module_name"),
+                "module_name": module_name,
                 "install_name": install_name,
                 "repair_strategy": strategy,
                 "repair_attempt_index": repair_attempt_index,
@@ -755,22 +1433,33 @@ def run_agent_control_loop(
     web_search_cache: dict[str, dict[str, Any]] = {}
     dependency_repairs_used = 0
     empty_generation_retries_used = 0
+    invalid_generation_retries_used = 0
     normalized_preferred_search_engines = [str(engine).strip().lower() for engine in (searxng_preferred_engines or []) if str(engine).strip()]
     searxng_client = SearXNGClient(base_url=searxng_base_url, timeout_s=web_search_timeout_s) if web_search_enabled else None
 
     for step_index in range(max_iterations):
         active_replan_reasons = list(pending_replan_reasons)
         pending_replan_reasons = []
-        request = StepRequest(
+        request_user_prompt = _rewrite_user_prompt_for_replan(
+            user_prompt,
+            active_replan_reasons=active_replan_reasons,
+            last_execution=last_execution,
+        )
+        screenshot_path, screenshot_base64, screenshot_media_type = _generation_screenshot_fields(
+            state=state,
             user_prompt=user_prompt,
+            last_execution=last_execution,
+        )
+        request = StepRequest(
+            user_prompt=request_user_prompt,
             policy=policy,
             replan_requested=bool(active_replan_reasons),
             replan_reasons=active_replan_reasons,
             strong_visual_grounding=strong_visual_grounding,
             reasoning_enabled=reasoning_enabled,
-            screenshot_path=state.get("screenshot_path"),
-            screenshot_base64=state.get("screenshot_base64"),
-            screenshot_media_type=state.get("screenshot_media_type"),
+            screenshot_path=screenshot_path,
+            screenshot_base64=screenshot_base64,
+            screenshot_media_type=screenshot_media_type,
             observation_text=state.get("observation_text"),
             web_search_context={},
             recent_history=_history_for_step(history),
@@ -826,9 +1515,9 @@ def run_agent_control_loop(
                 replan_reasons=active_replan_reasons,
                 strong_visual_grounding=strong_visual_grounding,
                 reasoning_enabled=reasoning_enabled,
-                screenshot_path=state.get("screenshot_path"),
-                screenshot_base64=state.get("screenshot_base64"),
-                screenshot_media_type=state.get("screenshot_media_type"),
+                screenshot_path=screenshot_path,
+                screenshot_base64=screenshot_base64,
+                screenshot_media_type=screenshot_media_type,
                 observation_text=state.get("observation_text"),
                 web_search_context=request.web_search_context,
                 recent_history=_history_for_empty_retry(history, step_index=step_index),
@@ -861,6 +1550,90 @@ def run_agent_control_loop(
                 _write_json(response_path, retry_response.to_dict())
                 stopped_reason = "empty_generation"
                 history.append(f"step-{step_index:03d}_stopped=empty_generation")
+                break
+            response = retry_response
+            normalized_code = retry_normalized_code
+
+        duplicate_generation = _looks_like_duplicate_generation(response.python_code, previous_executed_code)
+        invalid_generation = (
+            not _is_compilable_python_code(response.python_code)
+            or _looks_like_non_executing_task_script(response.python_code)
+            or _looks_like_missing_install_progress_generation(response.python_code, user_prompt)
+            or duplicate_generation
+        )
+        if invalid_generation:
+            invalid_attempt_path = root / "responses" / f"step-{step_index:03d}.invalid-attempt-00.response.json"
+            if not _is_compilable_python_code(response.python_code):
+                response.notes.append("invalid_python_generation_detected")
+            if _looks_like_non_executing_task_script(response.python_code):
+                response.notes.append("non_executing_python_generation_detected")
+            if _looks_like_missing_install_progress_generation(response.python_code, user_prompt):
+                response.notes.append("missing_install_progress_generation_detected")
+            if duplicate_generation:
+                response.notes.append("duplicate_python_generation_detected")
+            _write_json(invalid_attempt_path, response.to_dict())
+            retry_request = StepRequest(
+                user_prompt=user_prompt,
+                policy=policy,
+                replan_requested=bool(active_replan_reasons),
+                replan_reasons=active_replan_reasons,
+                strong_visual_grounding=strong_visual_grounding,
+                reasoning_enabled=reasoning_enabled,
+                screenshot_path=screenshot_path,
+                screenshot_base64=screenshot_base64,
+                screenshot_media_type=screenshot_media_type,
+                observation_text=state.get("observation_text"),
+                web_search_context=request.web_search_context,
+                recent_history=_history_for_invalid_python_retry_with_prompt(
+                    history,
+                    user_prompt=user_prompt,
+                    step_index=step_index,
+                    previous_code=response.raw_text,
+                    duplicate_generation=duplicate_generation,
+                ),
+                last_execution=last_execution,
+                step_index=step_index,
+            )
+            retry_request_path = root / "payloads" / f"step-{step_index:03d}.invalid-retry-00.request.json"
+            _write_json(retry_request_path, retry_request.to_dict())
+            retry_response = generate_step_response(
+                runtime,
+                retry_request,
+                max_new_tokens=_retry_token_budget(max_new_tokens),
+                generation_context=_make_generation_context(
+                    run_dir=root,
+                    step_id=f"{step_id}.invalid-retry-00",
+                    request_kind=retry_request.request_kind,
+                    step_index=retry_request.step_index,
+                ),
+            )
+            generated_steps += 1
+            invalid_generation_retries_used += 1
+            retry_response.notes.append("retry_due_to_invalid_python_generation")
+            retry_normalized_code = _normalize_python_code(retry_response.python_code)
+            retry_response_path = root / "responses" / f"step-{step_index:03d}.invalid-retry-00.response.json"
+            _write_json(retry_response_path, retry_response.to_dict())
+            retry_duplicate_generation = _looks_like_duplicate_generation(retry_response.python_code, previous_executed_code)
+            retry_invalid_generation = (
+                not _is_compilable_python_code(retry_response.python_code)
+                or _looks_like_non_executing_task_script(retry_response.python_code)
+                or _looks_like_missing_install_progress_generation(retry_response.python_code, user_prompt)
+                or retry_duplicate_generation
+            )
+            if retry_invalid_generation:
+                if not _is_compilable_python_code(retry_response.python_code):
+                    retry_response.notes.append("stopped_due_to_invalid_python_generation")
+                if _looks_like_non_executing_task_script(retry_response.python_code):
+                    retry_response.notes.append("stopped_due_to_non_executing_python_generation")
+                if _looks_like_missing_install_progress_generation(retry_response.python_code, user_prompt):
+                    retry_response.notes.append("stopped_due_to_missing_install_progress_generation")
+                if retry_duplicate_generation:
+                    retry_response.notes.append("stopped_due_to_duplicate_python_generation")
+                final_response = retry_response.to_dict()
+                _write_json(retry_response_path, retry_response.to_dict())
+                _write_json(response_path, retry_response.to_dict())
+                stopped_reason = "invalid_python_generation"
+                history.append(f"step-{step_index:03d}_stopped=invalid_python_generation")
                 break
             response = retry_response
             normalized_code = retry_normalized_code
@@ -919,6 +1692,10 @@ def run_agent_control_loop(
                 last_execution = dict(repair_result.get("last_execution") or last_execution)
                 state = dict(repair_result.get("state") or state)
 
+        if _looks_like_download_chunk_completed(user_prompt=user_prompt, last_execution=last_execution):
+            response.done = True
+            response.notes.append("download_chunk_completed")
+
         if response.done and int(last_execution.get("return_code", 0) or 0) == 0:
             history.append(f"{step_id}_completed=1")
             final_response = response.to_dict()
@@ -932,11 +1709,29 @@ def run_agent_control_loop(
         if _looks_like_download_or_install_task(user_prompt) and _looks_like_opened_page_only_step(response.python_code):
             replan_reasons.append("partial_progress_opened_page_only")
         dependency_error_handled = repairable_missing_module and dependency_repairs_used > repair_attempt_index if repairable_missing_module else False
+        installer_timeout = _looks_like_installer_timeout(last_execution, response.python_code, user_prompt)
+        installer_app_not_found = _looks_like_installer_launched_but_app_not_found(last_execution, response.python_code, user_prompt)
+        incomplete_install_attempt = _looks_like_incomplete_install_attempt(last_execution, response.python_code, user_prompt)
         if (
-            (int(last_execution.get("return_code", 0) or 0) != 0 or _looks_like_reported_failure(last_execution))
+            (
+                int(last_execution.get("return_code", 0) or 0) != 0
+                or _looks_like_reported_failure(last_execution)
+                or incomplete_install_attempt
+            )
             and not dependency_error_handled
         ):
-            replan_reasons.append("execution_error")
+            if installer_timeout:
+                replan_reasons.append("installer_timeout")
+            elif installer_app_not_found or incomplete_install_attempt:
+                replan_reasons.append("installer_app_not_found")
+            else:
+                replan_reasons.append("execution_error")
+        if _looks_like_direct_download_url_404(last_execution, response.python_code):
+            replan_reasons.append("download_url_404")
+        if _looks_like_direct_download_url_403(last_execution, response.python_code):
+            replan_reasons.append("download_url_403")
+        if _looks_like_installer_url_discovery_failure(last_execution, response.python_code):
+            replan_reasons.append("installer_url_not_found")
         if previous_visual_hash and current_visual_hash and previous_visual_hash == current_visual_hash:
             replan_reasons.append("no_visual_change")
         previous_executed_code = normalized_code or previous_executed_code
@@ -956,6 +1751,54 @@ def run_agent_control_loop(
             _write_json(response_path, response.to_dict())
             history.append(f"{step_id}_replan_requested={','.join(unique_reasons)}")
             history.append("system_hint=previous attempt repeated, failed, or did not visibly change the UI; generate a materially different next Python step")
+            if "download_url_404" in unique_reasons:
+                history.append(
+                    "system_hint=previous direct installer URL returned 404; do not guess another filename pattern, fetch the official page HTML or current vendor page and extract a fresh official .exe link before downloading"
+                )
+                history.append(
+                    "system_hint=use pure Python for download recovery; avoid curl, wget, powershell download commands, local http.server helpers, and literal %USERPROFILE% path strings"
+                )
+            if "download_url_403" in unique_reasons:
+                history.append(
+                    "system_hint=previous direct installer URL returned 403/Forbidden; retry with urllib.request.Request plus a browser-like User-Agent header or fetch the official download page HTML with the same header and extract the official installer link there"
+                )
+                history.append(
+                    "system_hint=for vendor download URLs, prefer urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'}) over plain urlopen(url)"
+                )
+            if "installer_url_not_found" in unique_reasons:
+                history.append(
+                    "system_hint=previous script could not discover an installer URL from the current HTML; if a vendor landing page does not expose a raw .exe, inspect at least one alternate official page or official release page in the same script before giving up"
+                )
+                history.append(
+                    "system_hint=when parsing HTML for installers, do not search only href attributes; also scan the full HTML/text for absolute https .exe URLs and verify candidates with a real HTTP request before downloading"
+                )
+            if "installer_timeout" in unique_reasons:
+                history.append(
+                    "system_hint=previous installer launch timed out; do not rerun the same silent installer command again on the next step"
+                )
+                history.append(
+                    "system_hint=first inspect whether the installer window, UAC prompt, or completion dialog is already visible and use Python GUI automation to advance it if needed"
+                )
+                history.append(
+                    "system_hint=before rerunning any installer, check common install paths and running processes for the target app; if the app is already installed, launch it directly and verify the process"
+                )
+            if "installer_app_not_found" in unique_reasons:
+                history.append(
+                    "system_hint=previous step launched the installer but the app was still not found afterward; do not repeat the same silent launch-and-scan script again"
+                )
+                history.append(
+                    "system_hint=use the latest screenshot and current desktop state to detect an installer wizard, UAC prompt, license dialog, or completion window and drive that GUI forward with Python automation"
+                )
+                history.append(
+                    "system_hint=only search install paths after handling any visible installer window; if an installed exe appears afterward, launch it directly and verify the process"
+                )
+            if "execution_error" in unique_reasons and _looks_like_optional_windows_gui_module_failure(last_execution):
+                history.append(
+                    "system_hint=previous attempt failed importing optional Windows GUI modules; do not require win32gui/win32con/pythoncom/pywinauto on the next step unless already proven importable"
+                )
+                history.append(
+                    "system_hint=prefer pyautogui, pygetwindow, psutil, and standard library fallbacks for installer GUI handling"
+                )
 
         if response.done:
             break
@@ -988,6 +1831,7 @@ def run_agent_control_loop(
         "web_search_uses": web_search_uses,
         "web_search_queries": web_search_queries,
         "empty_generation_retries_used": empty_generation_retries_used,
+        "invalid_generation_retries_used": invalid_generation_retries_used,
         "dependency_repair_enabled": dependency_repair_enabled,
         "dependency_repair_max_attempts": dependency_repair_max_attempts,
         "dependency_repair_allow_shell_fallback": dependency_repair_allow_shell_fallback,
