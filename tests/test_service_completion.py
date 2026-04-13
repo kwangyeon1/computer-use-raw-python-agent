@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from computer_use_raw_python_agent.service import (
     _dependency_repair_user_prompt,
+    _has_visible_gui_continuation_cues,
     _infer_response_done,
     _looks_like_duplicate_generation,
     _looks_like_missing_install_progress_generation,
@@ -16,10 +17,13 @@ from computer_use_raw_python_agent.service import (
     _looks_like_opened_page_only_step,
     _looks_like_reported_failure,
     _normalize_missing_module_install_name,
+    _prompt_keyword_candidates,
     _rewrite_user_prompt_for_replan,
     _retry_token_budget,
+    _should_use_framework_official_download_recovery,
     _should_omit_screenshot_for_generation,
 )
+from computer_use_raw_python_agent.models import StepRequest
 
 
 def test_task_complete_marker_requires_confirmation_script() -> None:
@@ -252,12 +256,74 @@ if exe.exists():
     assert _looks_like_missing_install_progress_generation(code, prompt) is True
 
 
+def test_prompt_keyword_candidates_drop_generic_gui_first_words() -> None:
+    text = (
+        "Return executable Python only for this chunk. Prefer continuing from the currently visible "
+        "browser search results app window and download button. Open https://pc.kakao.com/talk/notices/en?agent=win32 "
+        "and download KakaoTalkSetup.exe."
+    )
+    keywords = _prompt_keyword_candidates(text)
+    assert "kakao" in keywords or "kakaotalksetup" in keywords or "kakaotalk" in keywords
+    assert "visible" not in keywords
+    assert "browser" not in keywords
+    assert "results" not in keywords
+    assert "app" not in keywords
+
+
+def test_visible_gui_continuation_cues_detected_for_gui_first_request() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "If the current screenshot shows a visible browser page or download button, "
+            "continue from the visible UI first."
+        ),
+        execution_style="gui_first",
+        observation_text="Visible browser page with a download button is open.",
+        last_execution={"stdout_tail": "", "stderr_tail": ""},
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+    )
+    assert _has_visible_gui_continuation_cues(request) is True
+
+
+def test_framework_official_download_recovery_disabled_for_gui_first_visible_ui() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Use Python to continue from the current screenshot and visible browser page. "
+            "If a download button is already visible, press it first. "
+            "Official URL: https://pc.kakao.com/talk/notices/en?agent=win32"
+        ),
+        execution_style="gui_first",
+        observation_text="Visible browser page with KakaoTalk download button.",
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+        step_index=2,
+    )
+    assert _should_use_framework_official_download_recovery(request) is False
+
+
+def test_framework_official_download_recovery_reuses_only_matching_existing_installer_keywords() -> None:
+    code = _synthesized_official_download_recovery_code_for_test(
+        user_prompt=(
+            "Return executable Python only for this chunk. "
+            "Open https://pc.kakao.com/talk/notices/en?agent=win32 and download KakaoTalkSetup.exe."
+        )
+    )
+    assert 'if not KEYWORDS:' in code
+    assert 'if not any(keyword in lowered for keyword in KEYWORDS):' in code
+
+
 def test_duplicate_generation_detected_for_same_script() -> None:
     code = """import subprocess
 subprocess.run(["cmd", "/c", "echo", "ok"], check=False)
 """
     assert _looks_like_duplicate_generation(code, code) is True
     assert _looks_like_duplicate_generation(code, 'print("other")') is False
+
+
+def _synthesized_official_download_recovery_code_for_test(*, user_prompt: str) -> str:
+    from computer_use_raw_python_agent.service import _synthesized_official_download_recovery_code
+
+    return _synthesized_official_download_recovery_code(user_prompt=user_prompt)
 
 
 def test_replan_prompt_rewrite_for_installer_app_not_found() -> None:

@@ -1093,6 +1093,10 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         "https",
         "http",
         "www",
+        "com",
+        "net",
+        "org",
+        "pc",
         "page",
         "pages",
         "html",
@@ -1102,10 +1106,66 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         "from",
         "into",
         "task",
+        "the",
+        "and",
+        "open",
+        "agent",
+        "talk",
+        "notices",
+        "notice",
+        "win32",
+        "win64",
+        "x64",
+        "x86_64",
+        "for",
+        "this",
+        "that",
+        "with",
+        "without",
+        "then",
+        "same",
+        "step",
+        "prefer",
+        "continuing",
+        "continue",
+        "currently",
+        "visible",
+        "browser",
+        "search",
+        "results",
+        "result",
+        "window",
+        "app",
+        "direct",
+        "fetch",
+        "fetching",
+        "fresh",
+        "scraping",
+        "silent",
+        "shortcuts",
+        "unless",
+        "latest",
+        "shows",
+        "show",
+        "stalled",
+        "state",
+        "screenshot",
+        "installer",
+        "wizard",
+        "control",
+        "controls",
+        "button",
+        "buttons",
     }
     seen: set[str] = set()
     result: list[str] = []
-    for word in words:
+    candidate_words: list[str] = []
+    for url in _extract_prompt_urls(text):
+        lowered_url = str(url).lower()
+        pieces = re.split(r"[^a-z0-9]+", lowered_url)
+        candidate_words.extend(piece for piece in pieces if piece)
+    candidate_words.extend(words)
+    for word in candidate_words:
         cleaned = word.strip("._-")
         if len(cleaned) < 3 or cleaned in stop_words or cleaned in seen:
             continue
@@ -1116,6 +1176,40 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         if len(result) >= limit:
             break
     return result
+
+
+def _has_visible_gui_continuation_cues(request: StepRequest) -> bool:
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    combined = "\n".join(
+        str(value or "")
+        for value in (
+            request.user_prompt,
+            request.observation_text,
+            request.last_execution.get("stdout_tail"),
+            request.last_execution.get("stderr_tail"),
+        )
+    ).lower()
+    markers = (
+        "visible browser",
+        "visible installer",
+        "visible ui",
+        "current screenshot",
+        "currently visible",
+        "browser session",
+        "browser page",
+        "search results",
+        "download control",
+        "download button",
+        "download bar",
+        "installer wizard",
+        "uac prompt",
+        "completion dialog",
+        "continue from the current",
+        "continue from the visible",
+        "grounded visible",
+    )
+    return any(marker in combined for marker in markers)
 
 
 def _synthesized_official_download_recovery_code(*, user_prompt: str) -> str:
@@ -1196,7 +1290,9 @@ def candidate_destination(url: str) -> Path:
 existing_candidates = []
 for path in downloads.glob("*.exe"):
     lowered = path.name.lower()
-    if KEYWORDS and not any(keyword in lowered for keyword in KEYWORDS):
+    if not KEYWORDS:
+        continue
+    if not any(keyword in lowered for keyword in KEYWORDS):
         continue
     if path.stat().st_size > 1_000_000:
         existing_candidates.append(path)
@@ -1266,6 +1362,8 @@ def _should_use_framework_official_download_recovery(request: StepRequest) -> bo
     if not request.replan_requested:
         return False
     if not _looks_like_download_or_install_task(request.user_prompt):
+        return False
+    if _has_visible_gui_continuation_cues(request):
         return False
     if not _extract_prompt_urls(request.user_prompt):
         return False
