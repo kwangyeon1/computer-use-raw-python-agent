@@ -13,6 +13,7 @@ def test_render_prompt_bundle_uses_gui_first_append() -> None:
         execution_style="gui_first",
     )
     assert "Execution style: gui_first" in bundle.system_prompt
+    assert "do not switch to new urllib/requests HTML scraping" in bundle.system_prompt
     assert '"execution_style": "gui_first"' in bundle.user_prompt
 
 

@@ -145,6 +145,7 @@ Execution style: gui_first
 - Continue returning executable Python only, but prefer browser/UI-driven progression when relevant UI is already visible.
 - When a browser page, search results page, vendor page, installer wizard, UAC prompt, or completion dialog is already on screen, prefer advancing that visible state before bypassing it with a fresh direct download or silent install attempt.
 - For download/install tasks, it is acceptable to navigate search results, click visible official download controls, use browser download UI, and drive installer dialogs like a user when that is the most grounded next action from the screenshot.
+- If the current screenshot or prompt indicates a grounded browser/download/installer UI path, do not switch to new urllib/requests HTML scraping, regex-based direct artifact discovery, or fresh silent-install shortcuts in the same step unless the latest execution clearly shows that visible UI path failed or stalled.
 - Use direct Python HTTP download, silent switches, or filesystem-only shortcuts only when there is no useful visible UI state or the visible UI path has clearly stalled.
 - Prefer continuing from the current browser/app/installer state instead of restarting the task from scratch.
 """
