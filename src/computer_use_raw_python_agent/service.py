@@ -391,6 +391,7 @@ def _history_for_invalid_python_retry_with_prompt(
     previous_code: str | None = None,
     duplicate_generation: bool = False,
     prompt_url_violation: bool = False,
+    gui_first_visible_ui_violation: bool = False,
 ) -> list[str]:
     retry_history = _history_for_invalid_python_retry(
         history,
@@ -410,6 +411,13 @@ def _history_for_invalid_python_retry_with_prompt(
             )
         retry_history.append(
             "system_hint=if you emit a direct download URL on this retry, it must be discovered from those exact prompt URLs or from official HTML fetched from them; otherwise the retry is invalid"
+        )
+    if gui_first_visible_ui_violation:
+        retry_history.append(
+            "system_hint=the previous generation ignored grounded visible browser/download/installer UI and switched to fresh network fetching or browser restart logic; on this retry continue from the visible UI with Python GUI automation first"
+        )
+        retry_history.append(
+            "system_hint=when gui_first is active and the screenshot/observation already grounds a browser page, download control, or installer window, do not use urllib/requests/html scraping, regex link extraction, or webbrowser.open in place of that visible UI progression"
         )
     if _looks_like_existing_installer_launch_task(user_prompt):
         retry_history.append(
@@ -1208,8 +1216,68 @@ def _has_visible_gui_continuation_cues(request: StepRequest) -> bool:
         "continue from the current",
         "continue from the visible",
         "grounded visible",
+        "현재 스크린샷",
+        "현재 화면",
+        "보이는 ui",
+        "보이는 브라우저",
+        "브라우저",
+        "검색 결과",
+        "공식 다운로드 페이지",
+        "다운로드 버튼",
+        "다운로드 진행",
+        "다운로드 ui",
+        "설치 ui",
+        "설치 마법사",
+        "uac",
+        "완료 대화",
+        "보이는 다운로드",
+        "보이는 설치",
     )
     return any(marker in combined for marker in markers)
+
+
+def _looks_like_gui_first_visible_ui_bypass(request: StepRequest, code: str) -> bool:
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    if not _has_visible_gui_continuation_cues(request):
+        return False
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    gui_tokens = (
+        "pyautogui.",
+        "pygetwindow",
+        "getwindowswithtitle(",
+        ".activate(",
+        ".restore(",
+        ".maximize(",
+        "pywinauto",
+        "win32gui",
+        "locateonscreen(",
+        "click(",
+        "doubleclick(",
+        "press(",
+        "hotkey(",
+        "typewrite(",
+        "write(",
+    )
+    if any(token in normalized for token in gui_tokens):
+        return False
+    bypass_tokens = (
+        "urllib.request",
+        "urlopen(",
+        "requests.",
+        "httpx.",
+        "webbrowser.open(",
+        "webdriver.",
+        "selenium",
+        "href=",
+        "download_url",
+        "html =",
+        "html_text",
+        "re.findall(",
+    )
+    return any(token in normalized for token in bypass_tokens)
 
 
 def _synthesized_official_download_recovery_code(*, user_prompt: str) -> str:
@@ -1955,12 +2023,14 @@ def run_agent_control_loop(
             python_code=response.python_code,
             active_replan_reasons=active_replan_reasons,
         )
+        gui_first_visible_ui_violation = _looks_like_gui_first_visible_ui_bypass(request, response.python_code)
         invalid_generation = (
             not _is_compilable_python_code(response.python_code)
             or _looks_like_non_executing_task_script(response.python_code)
             or _looks_like_missing_install_progress_generation(response.python_code, user_prompt)
             or duplicate_generation
             or prompt_url_violation
+            or gui_first_visible_ui_violation
         )
         if invalid_generation:
             invalid_attempt_path = root / "responses" / f"step-{step_index:03d}.invalid-attempt-00.response.json"
@@ -1974,6 +2044,8 @@ def run_agent_control_loop(
                 response.notes.append("duplicate_python_generation_detected")
             if prompt_url_violation:
                 response.notes.append("prompt_url_violation_detected")
+            if gui_first_visible_ui_violation:
+                response.notes.append("gui_first_visible_ui_violation_detected")
             _write_json(invalid_attempt_path, response.to_dict())
             if prompt_url_violation and _should_use_framework_official_download_recovery(request):
                 retry_response = StepResponse(
@@ -2013,6 +2085,7 @@ def run_agent_control_loop(
                         previous_code=response.raw_text,
                         duplicate_generation=duplicate_generation,
                         prompt_url_violation=prompt_url_violation,
+                        gui_first_visible_ui_violation=gui_first_visible_ui_violation,
                     ),
                     last_execution=last_execution,
                     step_index=step_index,
@@ -2042,12 +2115,14 @@ def run_agent_control_loop(
                     python_code=retry_response.python_code,
                     active_replan_reasons=active_replan_reasons,
                 )
+                retry_gui_first_visible_ui_violation = _looks_like_gui_first_visible_ui_bypass(request, retry_response.python_code)
                 retry_invalid_generation = (
                     not _is_compilable_python_code(retry_response.python_code)
                     or _looks_like_non_executing_task_script(retry_response.python_code)
                     or _looks_like_missing_install_progress_generation(retry_response.python_code, user_prompt)
                     or retry_duplicate_generation
                     or retry_prompt_url_violation
+                    or retry_gui_first_visible_ui_violation
                 )
                 if retry_invalid_generation:
                     if not _is_compilable_python_code(retry_response.python_code):
@@ -2060,6 +2135,8 @@ def run_agent_control_loop(
                         retry_response.notes.append("stopped_due_to_duplicate_python_generation")
                     if retry_prompt_url_violation:
                         retry_response.notes.append("stopped_due_to_prompt_url_violation")
+                    if retry_gui_first_visible_ui_violation:
+                        retry_response.notes.append("stopped_due_to_gui_first_visible_ui_violation")
                     final_response = retry_response.to_dict()
                     _write_json(retry_response_path, retry_response.to_dict())
                     _write_json(response_path, retry_response.to_dict())

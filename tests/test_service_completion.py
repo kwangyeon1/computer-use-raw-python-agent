@@ -4,6 +4,7 @@ from computer_use_raw_python_agent.service import (
     _dependency_repair_user_prompt,
     _has_visible_gui_continuation_cues,
     _infer_response_done,
+    _looks_like_gui_first_visible_ui_bypass,
     _looks_like_duplicate_generation,
     _looks_like_missing_install_progress_generation,
     _is_compilable_python_code,
@@ -285,6 +286,16 @@ def test_visible_gui_continuation_cues_detected_for_gui_first_request() -> None:
     assert _has_visible_gui_continuation_cues(request) is True
 
 
+def test_visible_gui_continuation_cues_detected_for_korean_gui_first_request() -> None:
+    request = StepRequest(
+        user_prompt="현재 스크린샷에 브라우저와 다운로드 버튼이 보이면 그 보이는 UI를 먼저 이어서 사용하세요.",
+        execution_style="gui_first",
+        observation_text="공식 다운로드 페이지와 다운로드 진행 UI가 보이는 상태.",
+        last_execution={"stdout_tail": "", "stderr_tail": ""},
+    )
+    assert _has_visible_gui_continuation_cues(request) is True
+
+
 def test_framework_official_download_recovery_disabled_for_gui_first_visible_ui() -> None:
     request = StepRequest(
         user_prompt=(
@@ -299,6 +310,37 @@ def test_framework_official_download_recovery_disabled_for_gui_first_visible_ui(
         step_index=2,
     )
     assert _should_use_framework_official_download_recovery(request) is False
+
+
+def test_gui_first_visible_ui_bypass_detected_for_network_scraping_code() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Continue from the visible browser page and click the download button if it is already on screen. "
+            "Official URL: https://www.kakaocorp.com/page/service/service/KakaoTalk"
+        ),
+        execution_style="gui_first",
+        observation_text="Visible browser page with KakaoTalk download control.",
+    )
+    code = """import urllib.request, re
+html = urllib.request.urlopen("https://www.kakaocorp.com/page/service/service/KakaoTalk").read().decode("utf-8")
+matches = re.findall(r'href="[^"]+\\.exe"', html)
+print(matches)
+"""
+    assert _looks_like_gui_first_visible_ui_bypass(request, code) is True
+
+
+def test_gui_first_visible_ui_bypass_not_detected_for_pyautogui_flow() -> None:
+    request = StepRequest(
+        user_prompt="Continue from the visible browser download button.",
+        execution_style="gui_first",
+        observation_text="Visible browser page with a download button.",
+    )
+    code = """import pyautogui, time
+pyautogui.click(1200, 340)
+time.sleep(1)
+pyautogui.press("enter")
+"""
+    assert _looks_like_gui_first_visible_ui_bypass(request, code) is False
 
 
 def test_framework_official_download_recovery_reuses_only_matching_existing_installer_keywords() -> None:
