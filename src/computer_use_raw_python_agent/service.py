@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import re
+import urllib.parse
 
 try:
     from .executor_client import ExecutorHttpClient, ExecutorStdioClient
@@ -90,6 +91,285 @@ def _is_compilable_python_code(code: str) -> bool:
         return True
     except SyntaxError:
         return False
+
+
+_RUNTIME_HELPERS: dict[str, str] = {
+    "open_url_and_wait": """
+def open_url_and_wait(url, *, expected_title_tokens=None, timeout_s=20.0, poll_interval_s=1.0, settle_time_s=2.0):
+    import os
+    import subprocess
+    import time
+    import webbrowser
+    from pathlib import Path
+
+    target_url = str(url or "").strip()
+    if not target_url:
+        raise SystemExit("open_url_and_wait requires a non-empty url")
+    expected = [str(item).strip().lower() for item in (expected_title_tokens or []) if str(item).strip()]
+    deadline = time.time() + max(float(timeout_s), float(poll_interval_s))
+    started_at = time.time()
+
+    launch_errors = []
+
+    def _launch_windows_browser():
+        launched = False
+        try:
+            os.startfile(target_url)
+            launched = True
+        except Exception as exc:
+            launch_errors.append(f"os.startfile: {exc}")
+        if launched:
+            return True
+
+        try:
+            result = subprocess.run(
+                ["cmd", "/c", "start", "", target_url],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                check=False,
+                timeout=10,
+            )
+            if int(result.returncode or 0) == 0:
+                return True
+            launch_errors.append(f'cmd-start rc={result.returncode} stderr={result.stderr.strip()}')
+        except Exception as exc:
+            launch_errors.append(f"cmd-start: {exc}")
+
+        candidate_paths = []
+        env_candidates = [
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+            os.environ.get("LocalAppData"),
+        ]
+        browser_relpaths = [
+            ("Microsoft", "Edge", "Application", "msedge.exe"),
+            ("Google", "Chrome", "Application", "chrome.exe"),
+            ("BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+            ("Mozilla Firefox", "firefox.exe"),
+            ("Opera", "launcher.exe"),
+        ]
+        for base in env_candidates:
+            if not base:
+                continue
+            for relpath in browser_relpaths:
+                candidate = Path(base).joinpath(*relpath)
+                if candidate.exists():
+                    candidate_paths.append(candidate)
+
+        seen = set()
+        unique_candidates = []
+        for candidate in candidate_paths:
+            key = str(candidate).lower()
+            if key not in seen:
+                seen.add(key)
+                unique_candidates.append(candidate)
+
+        for browser_path in unique_candidates:
+            try:
+                subprocess.Popen([str(browser_path), "--new-tab", target_url])
+                return True
+            except Exception as exc:
+                launch_errors.append(f"{browser_path.name}: {exc}")
+        return False
+
+    if os.name == "nt":
+        if not _launch_windows_browser():
+            raise SystemExit(f"failed to open url: {target_url} ({'; '.join(launch_errors)})")
+    else:
+        if not webbrowser.open(target_url):
+            raise SystemExit(f"failed to open url: {target_url}")
+
+    def _browser_running():
+        browser_names = ("chrome.exe", "msedge.exe", "iexplore.exe", "firefox.exe", "opera.exe", "brave.exe")
+        if os.name == "nt":
+            result = subprocess.run(["tasklist"], capture_output=True, text=True, errors="replace", check=False)
+            haystack = result.stdout.lower()
+            return any(name in haystack for name in browser_names)
+        return False
+
+    def _matching_title_visible():
+        if not expected:
+            return False
+        try:
+            import pygetwindow as gw
+        except Exception:
+            return False
+        for title in gw.getAllTitles():
+            lowered = str(title or "").strip().lower()
+            if lowered and any(token in lowered for token in expected):
+                return True
+        return False
+
+    while time.time() < deadline:
+        title_ready = _matching_title_visible()
+        browser_ready = _browser_running()
+        elapsed = time.time() - started_at
+        if title_ready and elapsed >= float(settle_time_s):
+            return True
+        if browser_ready and elapsed >= float(settle_time_s) and not expected:
+            return True
+        if browser_ready and elapsed >= float(settle_time_s) and expected:
+            try:
+                import pygetwindow  # noqa: F401
+            except Exception:
+                return True
+        time.sleep(float(poll_interval_s))
+
+    detail = f" ({'; '.join(launch_errors)})" if launch_errors else ""
+    raise SystemExit(f"browser or page did not become ready for: {target_url}{detail}")
+""".strip(),
+    "wait_for_stable_download": """
+def wait_for_stable_download(path_or_pattern, *, min_bytes=1_000_000, stable_checks=3, poll_interval_s=2.0, timeout_s=120.0, min_quiet_time_s=None, download_dir=None):
+    import glob
+    import os
+    import time
+    from pathlib import Path
+
+    raw = str(path_or_pattern or "").strip()
+    if not raw:
+        raise SystemExit("wait_for_stable_download requires a path or glob pattern")
+    if stable_checks < 1:
+        stable_checks = 1
+    if poll_interval_s <= 0:
+        poll_interval_s = 1.0
+    if min_quiet_time_s is None:
+        min_quiet_time_s = float(stable_checks) * float(poll_interval_s)
+    elif min_quiet_time_s < 0:
+        min_quiet_time_s = 0.0
+    deadline = time.time() + max(float(timeout_s), float(poll_interval_s))
+    downloads = Path(os.path.expanduser(str(download_dir))) if download_dir else (Path.home() / "Downloads")
+
+    def _matches():
+        expanded = os.path.expanduser(raw)
+        if any(ch in raw for ch in "*?[]"):
+            return [Path(item) for item in glob.glob(expanded, recursive=True)]
+        candidate = Path(expanded)
+        if candidate.is_absolute() or raw.startswith("~"):
+            return [candidate]
+        return list(downloads.glob(raw))
+
+    def _partial_files(candidate):
+        candidate_name = candidate.name.lower() if candidate is not None else ""
+        candidate_stem = candidate.stem.lower() if candidate is not None else ""
+        partials = []
+        for pattern in ("*.crdownload", "*.part", "*.partial", "*.tmp"):
+            for path in downloads.glob(pattern):
+                lowered = path.name.lower()
+                if candidate_name and candidate_name in lowered:
+                    partials.append(path)
+                    continue
+                if candidate_stem and candidate_stem in lowered:
+                    partials.append(path)
+                    continue
+                if not candidate_name and not candidate_stem:
+                    partials.append(path)
+        return partials
+
+    last_size = None
+    stable_count = 0
+    last_candidate = None
+
+    while time.time() < deadline:
+        candidates = [path for path in _matches() if path.exists() and path.is_file()]
+        candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        candidate = candidates[0] if candidates else None
+        if candidate is not None:
+            last_candidate = candidate
+            size = candidate.stat().st_size
+            mtime_age = time.time() - candidate.stat().st_mtime
+            if size >= int(min_bytes) and not _partial_files(candidate):
+                if size == last_size:
+                    stable_count += 1
+                else:
+                    last_size = size
+                    stable_count = 1
+                if stable_count >= stable_checks and mtime_age >= float(min_quiet_time_s):
+                    return candidate
+            else:
+                last_size = size
+                stable_count = 0
+        time.sleep(float(poll_interval_s))
+
+    if last_candidate is not None and last_candidate.exists():
+        raise SystemExit(f"download incomplete: {last_candidate} ({last_candidate.stat().st_size} bytes)")
+    raise SystemExit(f"download not found for pattern: {raw}")
+""".strip(),
+}
+
+
+def _referenced_runtime_helpers(code: str) -> list[str]:
+    normalized = _normalize_python_code(code)
+    if not normalized:
+        return []
+    try:
+        tree = ast.parse(normalized, mode="exec")
+    except SyntaxError:
+        return []
+    defined_functions = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    helper_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            helper_name = node.func.id
+            if helper_name in _RUNTIME_HELPERS and helper_name not in defined_functions:
+                helper_names.add(helper_name)
+    return sorted(helper_names)
+
+
+def _expand_runtime_helpers(code: str) -> str:
+    normalized = _normalize_python_code(code)
+    helper_names = _referenced_runtime_helpers(normalized)
+    if not helper_names:
+        return normalized
+    helper_blocks = [_RUNTIME_HELPERS[name] for name in helper_names]
+    return "\n\n".join([*helper_blocks, normalized]).strip()
+
+
+def _should_auto_open_prompt_url(request: StepRequest | None, code: str) -> bool:
+    if request is None:
+        return False
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    if not _looks_like_download_or_install_task(request.user_prompt):
+        return False
+    if _has_visible_gui_continuation_cues(request):
+        return False
+    prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url(request.user_prompt)
+    if not prompt_url:
+        return False
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    if "open_url_and_wait(" in normalized:
+        return False
+    browser_navigation_tokens = (
+        "webbrowser.open(",
+        "os.startfile(",
+        ".get(",
+        ".goto(",
+        "driver.get(",
+        "page.goto(",
+        "open_new_tab(",
+    )
+    return not any(token in normalized for token in browser_navigation_tokens)
+
+
+def _prepare_python_code_for_execution(request: StepRequest | None, code: str) -> str:
+    normalized = _normalize_python_code(code)
+    if not normalized:
+        return normalized
+    if _should_auto_open_prompt_url(request, normalized):
+        prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url(request.user_prompt)
+        if not prompt_url:
+            return _expand_runtime_helpers(normalized)
+        keyword_tokens = _prompt_keyword_candidates(request.user_prompt, limit=3)
+        prelude = f'open_url_and_wait({json.dumps(prompt_url, ensure_ascii=False)}, expected_title_tokens={json.dumps(keyword_tokens, ensure_ascii=False)})'
+        normalized = f"{prelude}\n\n{normalized}"
+    return _expand_runtime_helpers(normalized)
 
 
 def _has_meaningful_top_level_execution(code: str) -> bool:
@@ -392,6 +672,7 @@ def _history_for_invalid_python_retry_with_prompt(
     duplicate_generation: bool = False,
     prompt_url_violation: bool = False,
     gui_first_visible_ui_violation: bool = False,
+    gui_first_silent_install_shortcut: bool = False,
 ) -> list[str]:
     retry_history = _history_for_invalid_python_retry(
         history,
@@ -418,6 +699,13 @@ def _history_for_invalid_python_retry_with_prompt(
         )
         retry_history.append(
             "system_hint=when gui_first is active and the screenshot/observation already grounds a browser page, download control, or installer window, do not use urllib/requests/html scraping, regex link extraction, or webbrowser.open in place of that visible UI progression"
+        )
+    if gui_first_silent_install_shortcut:
+        retry_history.append(
+            "system_hint=the previous generation used a silent installer shortcut for a gui_first install chunk; on this retry do not start with /SILENT, /VERYSILENT, /SP-, or /NORESTART"
+        )
+        retry_history.append(
+            "system_hint=for gui_first install chunks, either advance the visible installer/UAC/completion UI with Python GUI automation or launch the installer normally once and then handle the resulting window state"
         )
     if _looks_like_existing_installer_launch_task(user_prompt):
         retry_history.append(
@@ -705,6 +993,21 @@ def _looks_like_truncated_gui_repetition_failure(last_execution: dict[str, Any])
     return "nameerror" in stderr_tail and "name 'py' is not defined" in stderr_tail
 
 
+def _last_execution_opened_browser_for_gui_flow(last_execution: dict[str, Any]) -> bool:
+    payload_metadata = dict(last_execution.get("payload_metadata") or {})
+    executed_python_code = str(payload_metadata.get("executed_python_code") or "").lower()
+    if not executed_python_code:
+        return False
+    browser_open_tokens = (
+        "open_url_and_wait(",
+        "os.startfile(",
+        '["cmd", "/c", "start"',
+        "--new-tab",
+        "webbrowser.open(",
+    )
+    return any(token in executed_python_code for token in browser_open_tokens)
+
+
 def _rewrite_user_prompt_for_replan(
     user_prompt: str,
     *,
@@ -715,6 +1018,33 @@ def _rewrite_user_prompt_for_replan(
     unique_reasons = list(dict.fromkeys(str(reason).strip() for reason in active_replan_reasons if str(reason).strip()))
     if not prompt or not unique_reasons:
         return prompt
+
+    download_replan = (
+        _looks_like_download_or_install_task(prompt)
+        and not _looks_like_existing_installer_launch_task(prompt)
+        and _last_execution_opened_browser_for_gui_flow(last_execution)
+        and any(
+            reason in {"execution_error", "download_url_404", "installer_url_not_found"}
+            for reason in unique_reasons
+        )
+    )
+    if download_replan:
+        override_lines = [
+            "REPLAN OVERRIDE FOR THIS STEP:",
+            "Return executable Python only.",
+            "The previous attempt already opened the relevant browser page. Treat the current screenshot as the primary source of truth for the next action.",
+            "Continue from the visible browser/download UI with Python GUI automation before trying any new network fetch or HTML parsing logic.",
+            "Do not use urllib, requests, regex-based HTML scraping, or fresh direct-download discovery in this step unless the current screenshot clearly shows that the browser path is impossible.",
+            "Use Python GUI actions to focus the browser, activate the visible official page, click the visible download control, and then wait for the download artifact to stabilize in Downloads.",
+            "If the browser is already on an official Kakao page or search result page, keep following that visible path instead of restarting from scratch.",
+        ]
+        stdout_tail = str(last_execution.get("stdout_tail") or "").strip()
+        stderr_tail = str(last_execution.get("stderr_tail") or "").strip()
+        if stdout_tail:
+            override_lines.append(f"Previous stdout summary: {stdout_tail[-240:]}")
+        if stderr_tail:
+            override_lines.append(f"Previous stderr summary: {stderr_tail[-240:]}")
+        return "\n".join(override_lines)
 
     if not _looks_like_existing_installer_launch_task(prompt):
         return prompt
@@ -798,7 +1128,14 @@ def _rewrite_user_prompt_for_replan(
     return "\n".join(override_lines) + "\n\n" + prompt
 
 
-def _should_omit_screenshot_for_generation(*, user_prompt: str, last_execution: dict[str, Any]) -> bool:
+def _should_omit_screenshot_for_generation(
+    *,
+    user_prompt: str,
+    execution_style: str,
+    last_execution: dict[str, Any],
+) -> bool:
+    if str(execution_style or "python_first").lower() == "gui_first":
+        return False
     if _looks_like_existing_installer_launch_task(user_prompt):
         return False
     return _looks_like_download_discovery_retry_without_useful_visual_state(
@@ -811,9 +1148,14 @@ def _generation_screenshot_fields(
     *,
     state: dict[str, Any],
     user_prompt: str,
+    execution_style: str,
     last_execution: dict[str, Any],
 ) -> tuple[Any, Any, Any]:
-    if _should_omit_screenshot_for_generation(user_prompt=user_prompt, last_execution=last_execution):
+    if _should_omit_screenshot_for_generation(
+        user_prompt=user_prompt,
+        execution_style=execution_style,
+        last_execution=last_execution,
+    ):
         return None, None, None
     return (
         state.get("screenshot_path"),
@@ -983,6 +1325,38 @@ def _extract_prompt_urls(text: str) -> list[str]:
     return urls
 
 
+def _select_prompt_browser_url(text: str) -> str | None:
+    prompt_urls = _extract_prompt_urls(text)
+    if not prompt_urls:
+        return None
+
+    def _score(url: str) -> tuple[int, int]:
+        lowered = url.lower()
+        score = 0
+        if lowered.endswith(".exe"):
+            score -= 200
+        if any(token in lowered for token in ("/download", "/downloads", "/service", "/product", "/products", "/page/")):
+            score += 40
+        if any(token in lowered for token in ("lang=", "locale=", "notice", "notices", "release", "releases")):
+            score += 10
+        if any(token in lowered for token in ("kakaocorp.com", "dbeaver.com", "filezilla-project.org", "filezilla.net")):
+            score += 20
+        if lowered.count("/") <= 2:
+            score -= 20
+        return (score, -len(url))
+
+    return sorted(prompt_urls, key=_score, reverse=True)[0]
+
+
+def _fallback_browser_search_url(text: str) -> str | None:
+    keywords = _prompt_keyword_candidates(text, limit=4)
+    if not keywords:
+        return None
+    query_terms = [*keywords, "windows", "download"]
+    query = urllib.parse.quote(" ".join(query_terms))
+    return f"https://www.bing.com/search?q={query}"
+
+
 def _looks_like_download_discovery_retry_without_useful_visual_state(
     *,
     user_prompt: str,
@@ -1081,7 +1455,7 @@ def _make_generation_context(
 
 
 def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
-    words = re.findall(r"[a-z0-9][a-z0-9._-]{2,}", str(text or "").lower())
+    words = re.findall(r"[a-z0-9가-힣][a-z0-9가-힣._-]{1,}", str(text or "").lower())
     stop_words = {
         "return",
         "executable",
@@ -1164,18 +1538,67 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         "controls",
         "button",
         "buttons",
+        "설치",
+        "설치해줘",
+        "다운로드",
+        "프로그램",
+        "프로그램을",
+        "버전",
+        "pc버전",
+        "윈도우",
+        "공식",
+        "페이지",
+        "실행",
+        "파일",
+        "폴더",
+        "브라우저",
+        "검색결과",
     }
+    korean_particle_suffixes = (
+        "으로는",
+        "에서는",
+        "에게는",
+        "한테는",
+        "으로",
+        "에서",
+        "에게",
+        "한테",
+        "까지",
+        "부터",
+        "보다",
+        "처럼",
+        "라고",
+        "이라",
+        "라도",
+        "이다",
+        "은",
+        "는",
+        "이",
+        "가",
+        "을",
+        "를",
+        "에",
+        "와",
+        "과",
+        "도",
+    )
     seen: set[str] = set()
     result: list[str] = []
     candidate_words: list[str] = []
     for url in _extract_prompt_urls(text):
         lowered_url = str(url).lower()
-        pieces = re.split(r"[^a-z0-9]+", lowered_url)
+        pieces = re.split(r"[^a-z0-9가-힣]+", lowered_url)
         candidate_words.extend(piece for piece in pieces if piece)
     candidate_words.extend(words)
     for word in candidate_words:
         cleaned = word.strip("._-")
-        if len(cleaned) < 3 or cleaned in stop_words or cleaned in seen:
+        if re.search(r"[가-힣]", cleaned):
+            for suffix in korean_particle_suffixes:
+                if cleaned.endswith(suffix) and len(cleaned) > len(suffix) + 1:
+                    cleaned = cleaned[: -len(suffix)]
+                    break
+        min_len = 2 if re.search(r"[가-힣]", cleaned) else 3
+        if len(cleaned) < min_len or cleaned in stop_words or cleaned in seen:
             continue
         if "." in cleaned and "/" not in cleaned:
             continue
@@ -1189,10 +1612,17 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
 def _has_visible_gui_continuation_cues(request: StepRequest) -> bool:
     if str(request.execution_style or "python_first").lower() != "gui_first":
         return False
+    if (
+        bool(request.screenshot_base64 or request.screenshot_path)
+        and _last_execution_opened_browser_for_gui_flow(request.last_execution)
+    ):
+        return True
+    # Only use grounded runtime state here. The chunk prompt itself often
+    # contains phrases like "current screenshot" or "visible browser", which
+    # should not disable the browser-open prelude by themselves.
     combined = "\n".join(
         str(value or "")
         for value in (
-            request.user_prompt,
             request.observation_text,
             request.last_execution.get("stdout_tail"),
             request.last_execution.get("stderr_tail"),
@@ -1278,6 +1708,54 @@ def _looks_like_gui_first_visible_ui_bypass(request: StepRequest, code: str) -> 
         "re.findall(",
     )
     return any(token in normalized for token in bypass_tokens)
+
+
+def _looks_like_gui_first_silent_install_shortcut(request: StepRequest, code: str) -> bool:
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    if not _looks_like_existing_installer_launch_task(request.user_prompt):
+        return False
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    silent_tokens = ("/verysilent", "/silent", "/sp-", "/norestart")
+    if not any(token in normalized for token in silent_tokens):
+        return False
+    gui_tokens = (
+        "pyautogui.",
+        "pygetwindow",
+        "getwindowswithtitle(",
+        ".activate(",
+        ".restore(",
+        ".maximize(",
+        "locateonscreen(",
+        "click(",
+        "doubleclick(",
+        "press(",
+        "hotkey(",
+        "typewrite(",
+        "write(",
+        "sendkeys",
+    )
+    window_state_tokens = (
+        "installer wizard",
+        "uac",
+        "completion dialog",
+        "license",
+        "destination",
+        "window title",
+        "foreground window",
+        "tasklist",
+        "process_exists",
+        "kakaotalk.exe",
+    )
+    if any(token in normalized for token in gui_tokens):
+        return False
+    if "subprocess.popen(" not in normalized and "subprocess.run(" not in normalized and "os.startfile(" not in normalized:
+        return False
+    # Launching with silent flags is fine for python_first, but for gui_first install chunks
+    # it is too shallow when there is no installer-window handling or post-install verification.
+    return not any(token in normalized for token in window_state_tokens)
 
 
 def _synthesized_official_download_recovery_code(*, user_prompt: str) -> str:
@@ -1429,6 +1907,8 @@ raise SystemExit("All official installer candidates failed.")
 def _should_use_framework_official_download_recovery(request: StepRequest) -> bool:
     if not request.replan_requested:
         return False
+    if str(request.execution_style or "python_first").lower() == "gui_first":
+        return False
     if not _looks_like_download_or_install_task(request.user_prompt):
         return False
     if _has_visible_gui_continuation_cues(request):
@@ -1544,13 +2024,17 @@ def _execute_code_step(
     step_id: str,
     python_code: str,
     metadata: dict[str, Any],
+    request: StepRequest | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     step_dir = root / "steps" / step_id
+    expanded_python_code = _prepare_python_code_for_execution(request, python_code)
+    executor_metadata = dict(metadata)
+    executor_metadata.setdefault("executed_python_code", expanded_python_code)
     exec_result = executor_client.execute(
-        python_code=python_code,
+        python_code=expanded_python_code,
         run_dir=str(step_dir),
         step_id=step_id,
-        metadata=metadata,
+        metadata=executor_metadata,
     )
     _write_json(root / "responses" / f"{step_id}.executor.json", exec_result)
     return exec_result, _extract_last_execution(exec_result), _extract_state(exec_result)
@@ -1766,6 +2250,7 @@ def _attempt_dependency_repair(
             root=root,
             step_id=repair_request_name,
             python_code=repair_response.python_code,
+            request=repair_request,
             metadata={
                 "agent_response": repair_response.to_dict(),
                 "repair_context": repair_request.repair_context,
@@ -1789,6 +2274,7 @@ def _attempt_dependency_repair(
             root=root,
             step_id=retry_step_id,
             python_code=original_response.python_code,
+            request=None,
             metadata={
                 "agent_response": original_response.to_dict(),
                 "dependency_repair_retry": True,
@@ -1909,6 +2395,7 @@ def run_agent_control_loop(
         screenshot_path, screenshot_base64, screenshot_media_type = _generation_screenshot_fields(
             state=state,
             user_prompt=user_prompt,
+            execution_style=execution_style,
             last_execution=last_execution,
         )
         request = StepRequest(
@@ -2024,6 +2511,7 @@ def run_agent_control_loop(
             active_replan_reasons=active_replan_reasons,
         )
         gui_first_visible_ui_violation = _looks_like_gui_first_visible_ui_bypass(request, response.python_code)
+        gui_first_silent_install_shortcut = _looks_like_gui_first_silent_install_shortcut(request, response.python_code)
         invalid_generation = (
             not _is_compilable_python_code(response.python_code)
             or _looks_like_non_executing_task_script(response.python_code)
@@ -2031,6 +2519,7 @@ def run_agent_control_loop(
             or duplicate_generation
             or prompt_url_violation
             or gui_first_visible_ui_violation
+            or gui_first_silent_install_shortcut
         )
         if invalid_generation:
             invalid_attempt_path = root / "responses" / f"step-{step_index:03d}.invalid-attempt-00.response.json"
@@ -2046,6 +2535,8 @@ def run_agent_control_loop(
                 response.notes.append("prompt_url_violation_detected")
             if gui_first_visible_ui_violation:
                 response.notes.append("gui_first_visible_ui_violation_detected")
+            if gui_first_silent_install_shortcut:
+                response.notes.append("gui_first_silent_install_shortcut_detected")
             _write_json(invalid_attempt_path, response.to_dict())
             if prompt_url_violation and _should_use_framework_official_download_recovery(request):
                 retry_response = StepResponse(
@@ -2086,6 +2577,7 @@ def run_agent_control_loop(
                         duplicate_generation=duplicate_generation,
                         prompt_url_violation=prompt_url_violation,
                         gui_first_visible_ui_violation=gui_first_visible_ui_violation,
+                        gui_first_silent_install_shortcut=gui_first_silent_install_shortcut,
                     ),
                     last_execution=last_execution,
                     step_index=step_index,
@@ -2116,6 +2608,7 @@ def run_agent_control_loop(
                     active_replan_reasons=active_replan_reasons,
                 )
                 retry_gui_first_visible_ui_violation = _looks_like_gui_first_visible_ui_bypass(request, retry_response.python_code)
+                retry_gui_first_silent_install_shortcut = _looks_like_gui_first_silent_install_shortcut(request, retry_response.python_code)
                 retry_invalid_generation = (
                     not _is_compilable_python_code(retry_response.python_code)
                     or _looks_like_non_executing_task_script(retry_response.python_code)
@@ -2123,6 +2616,7 @@ def run_agent_control_loop(
                     or retry_duplicate_generation
                     or retry_prompt_url_violation
                     or retry_gui_first_visible_ui_violation
+                    or retry_gui_first_silent_install_shortcut
                 )
                 if retry_invalid_generation:
                     if not _is_compilable_python_code(retry_response.python_code):
@@ -2137,6 +2631,8 @@ def run_agent_control_loop(
                         retry_response.notes.append("stopped_due_to_prompt_url_violation")
                     if retry_gui_first_visible_ui_violation:
                         retry_response.notes.append("stopped_due_to_gui_first_visible_ui_violation")
+                    if retry_gui_first_silent_install_shortcut:
+                        retry_response.notes.append("stopped_due_to_gui_first_silent_install_shortcut")
                     final_response = retry_response.to_dict()
                     _write_json(retry_response_path, retry_response.to_dict())
                     _write_json(response_path, retry_response.to_dict())
@@ -2155,6 +2651,7 @@ def run_agent_control_loop(
             root=root,
             step_id=step_id,
             python_code=response.python_code,
+            request=request,
             metadata={
                 "agent_response": response.to_dict(),
                 "step_index": step_index,

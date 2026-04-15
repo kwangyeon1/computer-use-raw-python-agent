@@ -32,6 +32,7 @@ If you define a helper function, call it in the same script.
 Avoid docstrings and explanatory comments unless absolutely necessary.
 Do not stop after imports, variable setup, or print statements; perform the task in the same script.
 Prefer helper functions when possible:
+- open_url_and_wait
 - focus_window
 - press_key
 - press_hotkey
@@ -40,6 +41,7 @@ Prefer helper functions when possible:
 - sleep
 - wait_for_window
 - capture_note
+- wait_for_stable_download
 
 If helper functions are not sufficient, direct library usage is allowed.
 Always generate code that can run as a standalone script.
@@ -146,6 +148,8 @@ Execution style: gui_first
 - When a browser page, search results page, vendor page, installer wizard, UAC prompt, or completion dialog is already on screen, prefer advancing that visible state before bypassing it with a fresh direct download or silent install attempt.
 - For download/install tasks, it is acceptable to navigate search results, click visible official download controls, use browser download UI, and drive installer dialogs like a user when that is the most grounded next action from the screenshot.
 - If the current screenshot or prompt indicates a grounded browser/download/installer UI path, do not switch to new urllib/requests HTML scraping, regex-based direct artifact discovery, or fresh silent-install shortcuts in the same step unless the latest execution clearly shows that visible UI path failed or stalled.
+- For install-launch chunks where the installer `.exe` is already present, do not start by retrying `/VERYSILENT`, `/SILENT`, `/SP-`, or `/NORESTART` unless the latest execution already proved a normal visible installer flow is impossible.
+- For gui_first install chunks, prefer this order: inspect visible installer/UAC/completion UI, advance that UI with Python GUI automation, then verify install paths or launch the installed app.
 - Use direct Python HTTP download, silent switches, or filesystem-only shortcuts only when there is no useful visible UI state or the visible UI path has clearly stalled.
 - Prefer continuing from the current browser/app/installer state instead of restarting the task from scratch.
 """

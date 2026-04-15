@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from computer_use_raw_python_agent.service import (
     _dependency_repair_user_prompt,
+    _expand_runtime_helpers,
     _has_visible_gui_continuation_cues,
     _infer_response_done,
+    _looks_like_gui_first_silent_install_shortcut,
     _looks_like_gui_first_visible_ui_bypass,
     _looks_like_duplicate_generation,
     _looks_like_missing_install_progress_generation,
@@ -75,13 +77,63 @@ driver.find_element("xpath", "//a").click()
     assert _looks_like_opened_page_only_step(code) is False
 
 
+def test_visible_gui_continuation_cues_ignore_prompt_text_only() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Prefer continuing from the currently visible browser, search results, download UI, "
+            "app window, or installer dialog when that UI is already on screen."
+        ),
+        execution_style="gui_first",
+        observation_text="",
+    )
+    assert _has_visible_gui_continuation_cues(request) is False
+
+
+def test_visible_gui_continuation_cues_use_runtime_state() -> None:
+    request = StepRequest(
+        user_prompt="카카오톡 pc버전 프로그램을 설치해줘",
+        execution_style="gui_first",
+        observation_text="현재 화면에 브라우저와 다운로드 버튼이 보입니다.",
+    )
+    assert _has_visible_gui_continuation_cues(request) is True
+
+
+def test_visible_gui_continuation_cues_detected_after_browser_open_when_screenshot_present() -> None:
+    request = StepRequest(
+        user_prompt="카카오톡 pc버전 프로그램을 설치해줘",
+        execution_style="gui_first",
+        screenshot_base64="ZmFrZQ==",
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://pc.kakao.com/talk", expected_title_tokens=["kakao"])',
+            }
+        },
+    )
+    assert _has_visible_gui_continuation_cues(request) is True
+
+
 def test_download_prompt_with_downloads_destination_is_not_treated_as_existing_installer_launch_task() -> None:
     prompt = (
         "Use Python to open the official installation page, extract the latest Windows installer `.exe` link, "
         "and download the installer to `~/Downloads/targetapp-windows-installer.exe`."
     )
     assert _looks_like_existing_installer_launch_task(prompt) is False
-    assert _should_omit_screenshot_for_generation(user_prompt=prompt, last_execution={}) is True
+    assert _should_omit_screenshot_for_generation(
+        user_prompt=prompt,
+        execution_style="python_first",
+        last_execution={},
+    ) is True
+
+
+def test_gui_first_download_retry_keeps_screenshot_for_generation() -> None:
+    prompt = (
+        "Use Python to continue from the visible browser and download the installer to Downloads."
+    )
+    assert _should_omit_screenshot_for_generation(
+        user_prompt=prompt,
+        execution_style="gui_first",
+        last_execution={"stdout_tail": "download retry", "stderr_tail": ""},
+    ) is False
 
 
 def test_reported_failure_detected_from_stdout_or_stderr_even_with_zero_exit_code() -> None:
@@ -312,6 +364,21 @@ def test_framework_official_download_recovery_disabled_for_gui_first_visible_ui(
     assert _should_use_framework_official_download_recovery(request) is False
 
 
+def test_framework_official_download_recovery_disabled_for_gui_first_even_without_visible_ui_cues() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Use Python to continue downloading the Windows installer from the official page. "
+            "Official URL: https://pc.kakao.com/talk/notices/en?agent=win32"
+        ),
+        execution_style="gui_first",
+        observation_text=None,
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+        step_index=2,
+    )
+    assert _should_use_framework_official_download_recovery(request) is False
+
+
 def test_gui_first_visible_ui_bypass_detected_for_network_scraping_code() -> None:
     request = StepRequest(
         user_prompt=(
@@ -341,6 +408,69 @@ time.sleep(1)
 pyautogui.press("enter")
 """
     assert _looks_like_gui_first_visible_ui_bypass(request, code) is False
+
+
+def test_gui_first_silent_install_shortcut_detected_for_existing_installer_task() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Locate the downloaded installer `.exe` in Downloads and complete the installer wizard. "
+            "If installer UI is visible, continue from that visible UI first."
+        ),
+        execution_style="gui_first",
+        observation_text="Installer wizard may appear on screen.",
+    )
+    code = """from pathlib import Path
+import subprocess, time
+installer = max((Path.home() / "Downloads").glob("*.exe"))
+subprocess.Popen([str(installer), "/SILENT", "/NORESTART", "/SP-"])
+time.sleep(5)
+"""
+    assert _looks_like_gui_first_silent_install_shortcut(request, code) is True
+
+
+def test_gui_first_silent_install_shortcut_not_detected_when_gui_progress_exists() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Locate the downloaded installer `.exe` in Downloads and complete the installer wizard. "
+            "If installer UI is visible, continue from that visible UI first."
+        ),
+        execution_style="gui_first",
+        observation_text="Installer wizard visible.",
+    )
+    code = """import pyautogui, time
+    for _ in range(4):
+    pyautogui.press("enter")
+    time.sleep(1)
+"""
+    assert _looks_like_gui_first_silent_install_shortcut(request, code) is False
+
+
+def test_expand_runtime_helpers_injects_wait_for_stable_download_definition() -> None:
+    code = """from pathlib import Path
+downloads = Path.home() / "Downloads"
+installer = wait_for_stable_download("KakaoTalk*.exe", min_bytes=1_000_000)
+print(installer)
+"""
+    expanded = _expand_runtime_helpers(code)
+    assert "def wait_for_stable_download(" in expanded
+    assert 'installer = wait_for_stable_download("KakaoTalk*.exe", min_bytes=1_000_000)' in expanded
+    assert "candidate.stat().st_mtime" in expanded
+    assert "min_quiet_time_s" in expanded
+
+
+def test_expand_runtime_helpers_injects_open_url_and_wait_definition() -> None:
+    code = """opened = open_url_and_wait(
+    "https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=en",
+    expected_title_tokens=["kakao", "kakaotalk"],
+)
+print(opened)
+"""
+    expanded = _expand_runtime_helpers(code)
+    assert "def open_url_and_wait(" in expanded
+    assert 'os.startfile(target_url)' in expanded
+    assert '["cmd", "/c", "start", "", target_url]' in expanded
+    assert '"--new-tab", target_url' in expanded
+    assert 'expected_title_tokens=["kakao", "kakaotalk"]' in expanded
 
 
 def test_framework_official_download_recovery_reuses_only_matching_existing_installer_keywords() -> None:
@@ -391,6 +521,28 @@ def test_replan_prompt_rewrite_for_installer_app_not_found() -> None:
     assert "Keep the script compact." in rewritten
     assert "End this step only when the installed app process is running." in rewritten
     assert prompt not in rewritten
+
+
+def test_replan_prompt_rewrite_for_gui_first_download_after_browser_open() -> None:
+    prompt = (
+        "Use Python on Windows to open Kakao's official PC page at https://pc.kakao.com/talk "
+        "and download the Windows KakaoTalk installer only as a `.exe`."
+    )
+    rewritten = _rewrite_user_prompt_for_replan(
+        prompt,
+        active_replan_reasons=["execution_error", "download_url_404"],
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=en", expected_title_tokens=["kakao"])',
+            },
+            "stdout_tail": "Downloading from https://pc.kakao.com/talk...\nFailed to fetch page: HTTP Error 404",
+        },
+    )
+    assert rewritten.startswith("REPLAN OVERRIDE FOR THIS STEP:")
+    assert "Treat the current screenshot as the primary source of truth" in rewritten
+    assert "Continue from the visible browser/download UI with Python GUI automation" in rewritten
+    assert "Do not use urllib, requests, regex-based HTML scraping" in rewritten
+    assert "click the visible download control" in rewritten
 
 
 def test_replan_prompt_rewrite_for_truncated_gui_repetition_failure_adds_loop_hint() -> None:
