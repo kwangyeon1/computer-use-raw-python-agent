@@ -16,6 +16,7 @@ def test_render_prompt_bundle_uses_gui_first_append() -> None:
     assert "do not switch to new urllib/requests HTML scraping" in bundle.system_prompt
     assert "do not start by retrying `/VERYSILENT`, `/SILENT`, `/SP-`, or `/NORESTART`" in bundle.system_prompt
     assert "click_download_like_target()" in bundle.system_prompt
+    assert "open_responsive_header_menu()" in bundle.system_prompt
     assert '"execution_style": "gui_first"' in bundle.user_prompt
 
 

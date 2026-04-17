@@ -3,6 +3,9 @@ from __future__ import annotations
 from computer_use_raw_python_agent.service import (
     _dependency_repair_user_prompt,
     _expand_runtime_helpers,
+    _extract_prompt_download_glob,
+    _extract_prompt_install_marker_path,
+    _extract_prompt_launch_marker_path,
     _fallback_browser_search_url,
     _generated_code_ignores_prompt_urls,
     _has_visible_gui_continuation_cues,
@@ -14,10 +17,12 @@ from computer_use_raw_python_agent.service import (
     _is_compilable_python_code,
     _looks_like_direct_download_url_404,
     _looks_like_existing_installer_launch_task,
+    _looks_like_launch_app_chunk_task,
     _looks_like_incomplete_install_attempt,
     _looks_like_installer_launched_but_app_not_found,
     _looks_like_installer_timeout,
     _looks_like_installer_url_discovery_failure,
+    _looks_like_visible_installer_observation,
     _looks_like_non_executing_task_script,
     _looks_like_opened_page_only_step,
     _looks_like_reported_failure,
@@ -27,8 +32,13 @@ from computer_use_raw_python_agent.service import (
     _prompt_keyword_candidates,
     _rewrite_user_prompt_for_replan,
     _retry_token_budget,
+    _select_prompt_browser_url,
     _synthesized_visible_download_completion_code,
+    _synthesized_visible_installer_recovery_code,
+    _synthesized_visible_launch_recovery_code,
     _synthesized_visible_ui_click_recovery_code,
+    _should_use_framework_visible_launch_recovery,
+    _should_use_framework_visible_installer_recovery,
     _should_use_framework_official_download_recovery,
     _should_omit_screenshot_for_generation,
     _visible_flow_extra_targets,
@@ -232,6 +242,130 @@ def test_prepare_python_code_for_execution_auto_clicks_search_result_for_visible
     assert "search_first=True" in prepared
 
 
+def test_extract_prompt_install_marker_path() -> None:
+    prompt = "Write `~/Downloads/computer-use-agent/targetapp/install-success.json` when finished."
+    assert _extract_prompt_install_marker_path(prompt) == "~/Downloads/computer-use-agent/targetapp/install-success.json"
+
+
+def test_extract_prompt_launch_marker_path() -> None:
+    prompt = "Write `~/Downloads/computer-use-agent/targetapp/launch-success.json` only after launch succeeds."
+    assert _extract_prompt_launch_marker_path(prompt) == "~/Downloads/computer-use-agent/targetapp/launch-success.json"
+
+
+def test_visible_installer_observation_detected_from_language_dialog_text() -> None:
+    request = StepRequest(
+        user_prompt="어떤 프로그램을 설치해줘",
+        execution_style="gui_first",
+        observation_text="OCR visible text: Installer Language | Please select language | 확인",
+    )
+    assert _looks_like_visible_installer_observation(request) is True
+
+
+def test_synthesized_visible_installer_recovery_code_prefers_existing_visible_installer() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Use executable Python only. Find the existing installer `.exe` in "
+            "`%USERPROFILE%\\\\Downloads\\\\computer-use-agent\\\\targetapp-1234\\\\`, launch it once, "
+            "and end only when you have written `~/Downloads/computer-use-agent/targetapp-1234/install-success.json`."
+        ),
+        execution_style="gui_first",
+        observation_text="OCR visible text: Installer Language | Please select language | 확인",
+    )
+    code = _synthesized_visible_installer_recovery_code(request)
+    assert "advance_visible_installer_flow(" in code
+    assert "install-success.json" in code
+    assert 'VISIBLE_INSTALLER = True' in code
+    assert 'os.startfile(str(installer))' in code
+    assert "TARGET_KEYWORDS" in code
+    assert "SYSTEM_APP_NAMES" in code
+    assert '"store.exe"' in code
+    assert "installer = find_existing_installer()" in code
+    assert "_iter_registry_candidate_paths()" in code
+    assert "_is_valid_installed_executable(" in code
+    assert "FILENAME_TARGET_KEYWORDS" in code
+    assert "_matches_filename_target(" in code
+    assert '"/appdata/local/temp/"' in code
+    assert '"setup"' in code
+    assert 'print(f"already installed: {existing}")' not in code
+
+
+def test_framework_visible_installer_recovery_selected_for_gui_first_existing_installer_task() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Use executable Python only. "
+            "Find the existing installer `.exe` in `%USERPROFILE%\\\\Downloads\\\\computer-use-agent\\\\targetapp-1234\\\\`, "
+            "launch it once, and then continue from the resulting installer UI."
+        ),
+        execution_style="gui_first",
+    )
+    assert _should_use_framework_visible_installer_recovery(request) is True
+
+
+def test_existing_installer_recovery_not_selected_for_launch_chunk() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Prefer reading `~/Downloads/computer-use-agent/targetapp/install-success.json` first, "
+            "launch the installed app once, and write "
+            "`~/Downloads/computer-use-agent/targetapp/launch-success.json` after the app is running."
+        ),
+        execution_style="gui_first",
+    )
+    assert _should_use_framework_visible_installer_recovery(request) is False
+
+
+def test_launch_chunk_task_detected() -> None:
+    prompt = (
+        "Prefer reading `~/Downloads/computer-use-agent/targetapp/install-success.json` first, "
+        "launch the installed app once, bring the app window to the foreground if needed, and "
+        "write `~/Downloads/computer-use-agent/targetapp/launch-success.json` only after launch succeeded."
+    )
+    assert _looks_like_launch_app_chunk_task(prompt) is True
+
+
+def test_framework_visible_launch_recovery_selected_for_gui_first_launch_chunk() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Prefer reading `~/Downloads/computer-use-agent/targetapp/install-success.json` first, "
+            "launch the installed app once, and write "
+            "`~/Downloads/computer-use-agent/targetapp/launch-success.json` only after launch succeeded."
+        ),
+        execution_style="gui_first",
+    )
+    assert _should_use_framework_visible_launch_recovery(request) is True
+
+
+def test_visible_flow_extra_targets_ignore_helper_names_and_keep_app_keyword() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "대상 앱과 일치하는 installer만 사용하세요. 파일명은 가능하면 `카카오톡`, `install` 같은 대상 앱 키워드를 포함해야 하며, "
+            "보이는 download/install control 이 있으면 OCR-grounded helper 예를 들어 "
+            "`click_download_like_target()` 또는 `click_text_targets([...])` 같은 helper를 우선 고려하세요. "
+            "Do not import pywin32, pywinauto, win32gui, win32con, win32api, pythoncom. "
+            "Avoid recursively scanning %LOCALAPPDATA% or %ProgramFiles%."
+        ),
+        execution_style="gui_first",
+    )
+    assert _visible_flow_extra_targets(request, limit=3) == ["카카오톡"]
+
+
+def test_synthesized_visible_launch_recovery_ignores_invalid_install_marker_and_writes_launch_marker() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Prefer reading `~/Downloads/computer-use-agent/targetapp/install-success.json` first, "
+            "launch the installed app once, bring the app window to the foreground if needed, and "
+            "write `~/Downloads/computer-use-agent/targetapp/launch-success.json` only after launch succeeded."
+        ),
+        execution_style="gui_first",
+    )
+    code = _synthesized_visible_launch_recovery_code(request)
+    assert 'INSTALL_MARKER_PATH = Path(os.path.expanduser("~/Downloads/computer-use-agent/targetapp/install-success.json"))' in code
+    assert 'LAUNCH_MARKER_PATH = Path(os.path.expanduser("~/Downloads/computer-use-agent/targetapp/launch-success.json"))' in code
+    assert "ignoring invalid install marker candidate" in code
+    assert "_iter_registry_candidate_paths()" in code
+    assert "_process_running(exe_path)" in code
+    assert "write_launch_marker(exe_path)" in code
+
+
 def test_fallback_browser_search_url_uses_korean_download_terms_for_hangul_tasks() -> None:
     url = _fallback_browser_search_url("카카오톡 pc버전 프로그램을 설치해줘")
     assert url is not None
@@ -244,6 +378,28 @@ def test_fallback_browser_search_url_adds_vendor_domain_filters_from_prompt_urls
     assert url is not None
     assert "site%3Aexample.com" in url
     assert "site%3Aexamplecorp.com" in url
+
+
+def test_select_prompt_browser_url_prefers_korean_locale_for_hangul_task() -> None:
+    prompt = (
+        "카카오톡 pc버전 프로그램을 설치해줘. "
+        "Use these URLs first: "
+        "https://www.example.com/page/service/app?lang=en "
+        "https://www.example.com/page/service/app?lang=ko"
+    )
+    assert _select_prompt_browser_url(prompt) == "https://www.example.com/page/service/app?lang=ko"
+
+
+def test_prompt_keyword_candidates_drop_install_control_stopwords() -> None:
+    prompt = (
+        "Return executable Python only. "
+        "Do not repeat the same silent-install actions and switch logic. "
+        "source task: 카카오톡 pc버전 프로그램을 설치해줘"
+    )
+    keywords = _prompt_keyword_candidates(prompt, limit=5)
+    assert "actions" not in keywords
+    assert "switch" not in keywords
+    assert "silent-install" not in keywords
 
 
 def test_synthesized_visible_download_completion_code_adds_search_recovery_for_bad_prompt_url() -> None:
@@ -278,6 +434,76 @@ def test_synthesized_visible_download_completion_code_retries_visible_flow_befor
     assert "download_official_installer_from_page(" in code
 
 
+def test_extract_prompt_download_glob_uses_official_exe_url_basename() -> None:
+    prompt = (
+        "Use Python-first automation on Windows to download the official Windows installer `.exe` "
+        "from `https://downloads.vendor.example/releases/TargetApp_Setup.exe` and wait for it to finish."
+    )
+    assert _extract_prompt_download_glob(prompt) == "TargetApp_Setup.exe"
+
+
+def test_extract_prompt_download_glob_uses_explicit_downloads_path_filename() -> None:
+    prompt = (
+        "Save it to the user's Downloads folder as `~/Downloads/targetapp-windows-installer.exe` "
+        "and do not finish until the file is fully present."
+    )
+    assert _extract_prompt_download_glob(prompt) == "targetapp-windows-installer.exe"
+
+
+def test_extract_prompt_download_glob_ignores_generic_dot_exe_token() -> None:
+    prompt = "Download the official Windows installer `.exe` and then run it from Downloads."
+    assert _extract_prompt_download_glob(prompt) is None
+
+
+def test_synthesized_visible_download_completion_code_waits_for_prompt_named_installer() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Use Python-first automation on Windows to download the official Windows installer `.exe` "
+            "from `https://downloads.vendor.example/releases/TargetApp_Setup.exe`. "
+            "Save it to the user's Downloads folder as `TargetApp_Setup.exe`."
+        ),
+        execution_style="gui_first",
+    )
+    code = _synthesized_visible_download_completion_code(
+        request,
+        prompt_url="https://downloads.vendor.example/releases/TargetApp_Setup.exe",
+    )
+    assert 'wait_for_stable_download("TargetApp_Setup.exe"' in code
+    assert 'print(f"download ready: {installer}")' in code
+
+
+def test_existing_installer_launch_task_detected_for_generic_downloaded_installer_prompt() -> None:
+    prompt = (
+        "Locate the downloaded installer `.exe` in Downloads, verify it is the Windows installer, "
+        "run it with Python automation, and proceed through the installer wizard."
+    )
+    assert _looks_like_existing_installer_launch_task(prompt) is True
+
+
+def test_visible_installer_recovery_selected_for_generic_installer_prompt() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Locate the downloaded installer `.exe` in Downloads, verify it is the Windows installer, "
+            "run it with Python automation, and proceed through the installer wizard."
+        ),
+        execution_style="gui_first",
+    )
+    assert _should_use_framework_visible_installer_recovery(request) is True
+
+
+def test_synthesized_visible_installer_recovery_prefers_prompt_named_installer() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Locate `~/Downloads/TargetApp_Setup.exe`, verify it is the downloaded Windows installer, "
+            "and run it with Python automation."
+        ),
+        execution_style="gui_first",
+    )
+    code = _synthesized_visible_installer_recovery_code(request)
+    assert 'EXPECTED_INSTALLER_GLOB = "TargetApp_Setup.exe"' in code
+    assert "for path in TARGET_DIR.glob(pattern):" in code
+
+
 def test_expand_runtime_helpers_includes_browser_region_heuristic_click() -> None:
     expanded = _expand_runtime_helpers("click_search_result_like_target(extra_targets=['targetapp'])")
     assert "def _heuristic_browser_click(" in expanded
@@ -291,6 +517,8 @@ def test_expand_runtime_helpers_includes_responsive_header_menu_flow() -> None:
     assert "def open_responsive_header_menu(" in expanded
     assert 'heuristic_mode="menu"' in expanded
     assert "browser_header_menu_region" in expanded
+    assert "responsive_header_menu_prefetch" in expanded
+    assert "diversion_cues_present" in expanded
     assert "allow_heuristic_fallback=False" in expanded
     assert "download_control_heuristic" in expanded
     assert 'after_menu": False' in expanded
@@ -834,6 +1062,8 @@ print(result)
     assert "def click_text_targets(" in expanded
     assert "def ocr_screen_text_regions(" in expanded
     assert '"download",' in expanded
+    assert '"guide",' in expanded
+    assert '"support",' in expanded
     assert 'click_horizontal_bias="matched_token_right"' in expanded
     assert "browser_download_cta_region" in expanded
 
