@@ -188,54 +188,72 @@ def open_url_and_wait(url, *, expected_title_tokens=None, timeout_s=20.0, poll_i
             return any(name in haystack for name in browser_names)
         return False
 
-    def _matching_title_visible():
-        if not expected:
-            return False
-        try:
-            import pygetwindow as gw
-        except Exception:
-            return False
-        for title in gw.getAllTitles():
-            lowered = str(title or "").strip().lower()
-            if lowered and any(token in lowered for token in expected):
-                return True
-        return False
+    def _screen_metrics():
+        if os.name != "nt":
+            return (0, 0)
+        import ctypes
 
-    def _browser_window_visible():
+        user32 = ctypes.windll.user32
+        return max(1, int(user32.GetSystemMetrics(0))), max(1, int(user32.GetSystemMetrics(1)))
+
+    def _browser_window_candidates():
         try:
             import pygetwindow as gw
         except Exception:
-            return False
+            return []
         browser_title_tokens = ("chrome", "edge", "firefox", "brave", "opera", "internet explorer")
-        for title in gw.getAllTitles():
-            lowered = str(title or "").strip().lower()
-            if lowered and any(token in lowered for token in browser_title_tokens):
-                return True
-        return False
-
-    def _activate_browser_window():
-        try:
-            import pygetwindow as gw
-        except Exception:
-            return False
+        terminal_tokens = ("terminal", "powershell", "command prompt", "cmd", "bash", "python", "codex", "explorer", "visual studio code", "vscode")
+        screen_width, screen_height = _screen_metrics()
         candidates = []
-        browser_title_tokens = ("chrome", "edge", "firefox", "brave", "opera", "internet explorer")
         for window in gw.getAllWindows():
             title = str(getattr(window, "title", "") or "").strip()
-            if not title:
-                continue
             lowered = title.lower()
+            width = int(getattr(window, "width", 0) or 0)
+            height = int(getattr(window, "height", 0) or 0)
+            left = int(getattr(window, "left", 0) or 0)
+            top = int(getattr(window, "top", 0) or 0)
+            if width < 320 or height < 320:
+                continue
+            if left + width < 0 or top + height < 0:
+                continue
             score = 0
-            if expected and any(token in lowered for token in expected):
+            if title and expected and any(token in lowered for token in expected):
                 score += 80
-            if any(token in lowered for token in browser_title_tokens):
+            if title and any(token in lowered for token in browser_title_tokens):
                 score += 30
-            if any(token in lowered for token in ("download", "다운로드", "windows", "pc")):
+            if title and any(token in lowered for token in ("download", "다운로드", "windows", "pc")):
                 score += 15
+            if title and any(token in lowered for token in terminal_tokens):
+                score -= 160
+            if width >= int(screen_width * 0.45):
+                score += 35
+            if left >= int(screen_width * 0.18):
+                score += 20
+            if height >= int(screen_height * 0.50):
+                score += 10
+            if width < int(screen_width * 0.35) and left <= int(screen_width * 0.12):
+                score -= 45
+            score += min((width * height) // 50000, 30)
             if score <= 0:
                 continue
             candidates.append((score, window))
         candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates
+
+    def _matching_title_visible():
+        if not expected:
+            return False
+        for _, window in _browser_window_candidates():
+            title = str(getattr(window, "title", "") or "").strip().lower()
+            if title and any(token in title for token in expected):
+                return True
+        return False
+
+    def _browser_window_visible():
+        return bool(_browser_window_candidates())
+
+    def _activate_browser_window():
+        candidates = _browser_window_candidates()
         for _, window in candidates:
             try:
                 if hasattr(window, "isMinimized") and window.isMinimized:
@@ -256,12 +274,14 @@ def open_url_and_wait(url, *, expected_title_tokens=None, timeout_s=20.0, poll_i
         if title_ready and elapsed >= float(settle_time_s):
             _activate_browser_window()
             return True
+        if browser_window_ready and elapsed >= max(float(settle_time_s), 4.0):
+            _activate_browser_window()
+            return True
         if not expected:
-            if browser_window_ready and elapsed >= float(settle_time_s):
-                _activate_browser_window()
-                return True
             if browser_ready and elapsed >= float(settle_time_s) and _activate_browser_window():
                 return True
+        elif browser_ready and elapsed >= max(float(settle_time_s), 4.0) and _activate_browser_window():
+            return True
         time.sleep(float(poll_interval_s))
 
     detail = f" ({'; '.join(launch_errors)})" if launch_errors else ""
@@ -342,6 +362,229 @@ def wait_for_stable_download(path_or_pattern, *, min_bytes=1_000_000, stable_che
     if last_candidate is not None and last_candidate.exists():
         raise SystemExit(f"download incomplete: {last_candidate} ({last_candidate.stat().st_size} bytes)")
     raise SystemExit(f"download not found for pattern: {raw}")
+""".strip(),
+    "browser_page_has_error_state": """
+def browser_page_has_error_state(*, image_path=None, expected_title_tokens=None):
+    import os
+    import re
+
+    expected = [str(item).strip().lower() for item in (expected_title_tokens or []) if str(item).strip()]
+    error_markers = (
+        "404",
+        "not found",
+        "page not found",
+        "forbidden",
+        "access denied",
+        "bad gateway",
+        "service unavailable",
+        "찾을 수 없습니다",
+        "페이지를 찾을 수 없습니다",
+        "접근할 수 없습니다",
+        "지원하지 않습니다",
+        "지원되지 않습니다",
+    )
+
+    def _looks_like_error_text(text):
+        lowered = str(text or "").strip().lower()
+        if not lowered:
+            return False
+        if any(marker in lowered for marker in error_markers):
+            return True
+        if re.search(r"\\b4\\s*0\\s*4\\b", lowered):
+            return True
+        return False
+
+    if os.name == "nt":
+        try:
+            import pygetwindow as gw
+        except Exception:
+            gw = None
+        if gw is not None:
+            browser_title_tokens = ("chrome", "edge", "firefox", "brave", "opera", "internet explorer")
+            terminal_tokens = ("terminal", "powershell", "command prompt", "cmd", "bash", "python", "codex", "explorer", "visual studio code", "vscode")
+            for window in gw.getAllWindows():
+                title = str(getattr(window, "title", "") or "").strip()
+                lowered = title.lower()
+                if not lowered:
+                    continue
+                if any(token in lowered for token in terminal_tokens):
+                    continue
+                if expected and not any(token in lowered for token in expected) and not any(token in lowered for token in browser_title_tokens):
+                    continue
+                if _looks_like_error_text(lowered):
+                    return True
+
+    try:
+        ocr_lines = ocr_screen_text_regions(image_path=image_path, max_lines=40)
+    except Exception:
+        ocr_lines = []
+    for item in ocr_lines:
+        text = item.get("text", "") if isinstance(item, dict) else str(item or "")
+        if _looks_like_error_text(text):
+            return True
+    return False
+""".strip(),
+    "browser_page_has_search_results": """
+def browser_page_has_search_results(*, image_path=None, expected_title_tokens=None):
+    expected = [str(item).strip().lower() for item in (expected_title_tokens or []) if str(item).strip()]
+
+    try:
+        import pygetwindow as gw
+
+        for window in gw.getAllWindows():
+            title = str(getattr(window, "title", "") or "").strip().lower()
+            if not title:
+                continue
+            if any(token in title for token in ("bing", "google", "duckduckgo", "search", "검색")):
+                return True
+            if expected and any(token in title for token in expected) and any(marker in title for marker in ("search", "검색", "bing", "google", "duckduckgo")):
+                return True
+    except Exception:
+        pass
+
+    try:
+        lines = ocr_screen_text_regions(image_path=image_path, max_lines=80)
+    except Exception:
+        return False
+    combined = " | ".join(str(item.get("text") or "").strip().lower() for item in lines if isinstance(item, dict) and str(item.get("text") or "").strip())
+    if not combined:
+        return False
+    if any(marker in combined for marker in ("bing", "google", "duckduckgo", "search results", "검색 결과")):
+        return True
+    if expected and any(token in combined for token in expected) and any(marker in combined for marker in ("official", "공식", "download", "다운로드", "windows", "pc")):
+        return True
+    return False
+""".strip(),
+    "page_down_browser_view": """
+def page_down_browser_view(*, steps=1, settle_s=0.8):
+    import ctypes
+    import time
+
+    try:
+        import pygetwindow as gw
+    except Exception:
+        gw = None
+    if gw is not None:
+        browser_tokens = ("chrome", "edge", "firefox", "brave", "opera", "internet explorer")
+        for window in gw.getAllWindows():
+            title = str(getattr(window, "title", "") or "").strip().lower()
+            if not title or not any(token in title for token in browser_tokens):
+                continue
+            try:
+                if hasattr(window, "isMinimized") and window.isMinimized:
+                    window.restore()
+                    time.sleep(0.2)
+                window.activate()
+                time.sleep(0.3)
+                break
+            except Exception:
+                continue
+
+    user32 = ctypes.windll.user32
+    vk_next = 0x22
+    total_steps = max(1, int(steps))
+    for _ in range(total_steps):
+        user32.keybd_event(vk_next, 0, 0, 0)
+        time.sleep(0.05)
+        user32.keybd_event(vk_next, 0, 0x0002, 0)
+        time.sleep(max(0.2, float(settle_s)))
+""".strip(),
+    "download_official_installer_from_page": """
+def download_official_installer_from_page(page_url, *, extra_targets=None, download_glob=None, min_bytes=1_000_000):
+    import re
+    import urllib.request
+    from pathlib import Path
+    from urllib.parse import urljoin, urlparse, unquote
+
+    target_url = str(page_url or "").strip()
+    if not target_url:
+        raise SystemExit("download_official_installer_from_page requires a page_url")
+
+    user_agent = "Mozilla/5.0"
+    keywords = [str(item).strip().lower() for item in (extra_targets or []) if str(item).strip()]
+    avoid_markers = ("android", "iphone", "ios", "mac", "macos", "linux", "portable", ".zip", ".7z", ".tar", ".gz", ".msi", ".pkg")
+    preferred_markers = ("windows", "win32", "win64", "x64", "x86_64", "setup", "install", "installer", ".exe")
+
+    downloads = Path.home() / "Downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+    destination_dir = downloads
+    glob_text = str(download_glob or "").strip()
+    if glob_text.startswith("computer-use-agent/") and glob_text.endswith("/*.exe"):
+        relative_dir = glob_text[: -len("/*.exe")]
+        destination_dir = downloads / relative_dir
+        destination_dir.mkdir(parents=True, exist_ok=True)
+
+    request = urllib.request.Request(target_url, headers={"User-Agent": user_agent})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        final_page_url = response.geturl()
+        html_text = response.read().decode("utf-8", errors="ignore")
+
+    normalized_text = (
+        html_text
+        .replace("\\\\u002F", "/")
+        .replace("\\\\u003A", ":")
+        .replace("\\\\/", "/")
+        .replace("&amp;", "&")
+    )
+
+    candidates = []
+    seen = set()
+    patterns = (
+        r'https?://[^\\s"\\'<>]+\\.exe',
+        r'(?:href|src)\\s*=\\s*["\\']([^"\\']+\\.exe[^"\\']*)["\\']',
+    )
+    for pattern in patterns:
+        for raw in re.findall(pattern, normalized_text, flags=re.IGNORECASE):
+            resolved = urljoin(final_page_url, str(raw).split("#", 1)[0])
+            lowered = resolved.lower()
+            if lowered in seen or not lowered.startswith("http"):
+                continue
+            seen.add(lowered)
+            candidates.append(resolved)
+
+    def _score(url):
+        lowered = unquote(urlparse(url).path).lower()
+        score = 0
+        if lowered.endswith(".exe"):
+            score += 120
+        for keyword in keywords:
+            if keyword and keyword in lowered:
+                score += 18
+        for marker in preferred_markers:
+            if marker in lowered:
+                score += 8
+        for marker in avoid_markers:
+            if marker in lowered:
+                score -= 200
+        return score
+
+    candidates = [url for url in candidates if _score(url) > 0]
+    candidates.sort(key=_score, reverse=True)
+    if not candidates:
+        raise SystemExit("no official Windows installer .exe candidate found on the current page")
+
+    last_error = None
+    for candidate in candidates:
+        try:
+            filename = Path(unquote(urlparse(candidate).path)).name or "installer.exe"
+            if not filename.lower().endswith(".exe"):
+                filename = "installer.exe"
+            destination = destination_dir / filename
+            req = urllib.request.Request(candidate, headers={"User-Agent": user_agent})
+            with urllib.request.urlopen(req, timeout=90) as response, open(destination, "wb") as handle:
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+            if destination.exists() and destination.stat().st_size >= int(min_bytes):
+                return destination
+            if destination.exists():
+                destination.unlink(missing_ok=True)
+        except Exception as exc:
+            last_error = exc
+            continue
+    raise SystemExit(f"all official installer candidates failed: {last_error}")
 """.strip(),
     "ocr_screen_text_regions": """
 def ocr_screen_text_regions(image_path=None, *, max_lines=40, crop_region=None):
@@ -547,6 +790,8 @@ def click_text_targets(
     poll_interval_s=1.0,
     prefer_bottom=True,
     double_click=False,
+    allow_heuristic_fallback=True,
+    heuristic_mode="auto",
 ):
     import ctypes
     import re
@@ -826,26 +1071,39 @@ def click_text_targets(
         bottom = int(region["bottom"])
         width = max(1, right - left)
         height = max(1, bottom - top)
-        browser_chrome = min(max(int(height * 0.10), 110), 190)
-        content_top = min(bottom - 80, top + browser_chrome)
+        browser_toolbar = min(max(int(height * 0.045), 52), 92)
+        page_header_top = top + browser_toolbar + 12
+        content_top = min(bottom - 80, page_header_top + 36)
         content_height = max(120, bottom - content_top - 30)
-        if not prefer_bottom:
+        mode = str(heuristic_mode or "auto").strip().lower()
+        if mode not in {"auto", "search", "download", "menu"}:
+            mode = "auto"
+        if mode == "auto":
+            mode = "download" if prefer_bottom else "search"
+        if mode == "search":
             x_fracs = (0.18, 0.22, 0.27)
             y_fracs = (0.10, 0.20, 0.32)
             label = "browser_search_result_region"
+        elif mode == "menu":
+            x_fracs = (0.965, 0.935, 0.905, 0.875)
+            header_offsets = (18, 22, 28, 36)
+            label = "browser_header_menu_region"
         else:
-            x_fracs = (0.97, 0.94, 0.91, 0.88, 0.85, 0.82)
+            x_fracs = (0.66, 0.72, 0.78, 0.84, 0.60, 0.90)
+            header_offsets = (56, 72, 90, 112, 136, 162)
             label = "browser_download_cta_region"
-        cycle_len = len(y_fracs) if not prefer_bottom else len(x_fracs)
+        cycle_len = len(y_fracs) if mode == "search" else len(x_fracs)
         idx = max(0, int(attempt_index)) % max(1, cycle_len)
         x = left + int(width * x_fracs[min(idx, len(x_fracs) - 1)])
-        if not prefer_bottom:
+        if mode == "search":
             y = content_top + int(content_height * y_fracs[idx])
         else:
-            header_offsets = (20, 34, 48, 62, 82, 108)
-            y = top + browser_chrome + header_offsets[min(idx, len(header_offsets) - 1)]
+            y = page_header_top + header_offsets[min(idx, len(header_offsets) - 1)]
         x = max(left + 40, min(right - 40, x))
-        y = max(content_top + 20, min(bottom - 40, y))
+        if mode == "search":
+            y = max(content_top + 20, min(bottom - 40, y))
+        else:
+            y = max(top + browser_toolbar + 10, min(bottom - 40, y))
         return {
             "text": f"[heuristic:{label}]",
             "x": int(x),
@@ -962,7 +1220,7 @@ def click_text_targets(
                 "y": center_y,
                 "score": best_candidate["score"],
             }
-        if restrict_to_browser_window and browser_region is not None:
+        if allow_heuristic_fallback and restrict_to_browser_window and browser_region is not None:
             heuristic_candidate = _heuristic_browser_click(browser_region, attempt_index=sweep_index)
             if heuristic_candidate is not None:
                 _click_point(int(heuristic_candidate["x"]), int(heuristic_candidate["y"]))
@@ -1029,6 +1287,8 @@ def click_download_like_target(*, extra_targets=None, avoid_targets=None, image_
         poll_interval_s=1.0,
         prefer_bottom=True,
         double_click=False,
+        allow_heuristic_fallback=True,
+        heuristic_mode="download",
     )
 """.strip(),
     "click_search_result_like_target": """
@@ -1082,10 +1342,42 @@ def click_search_result_like_target(*, extra_targets=None, avoid_targets=None, i
         poll_interval_s=1.0,
         prefer_bottom=False,
         double_click=True,
+        allow_heuristic_fallback=True,
+        heuristic_mode="search",
+    )
+""".strip(),
+    "open_responsive_header_menu": """
+def open_responsive_header_menu(*, extra_targets=None, image_path=None, timeout_s=6.0):
+    targets = [
+        "menu",
+        "메뉴",
+        "more",
+        "더보기",
+        "navigation",
+        "nav",
+        "전체메뉴",
+        "all menu",
+    ]
+    if extra_targets:
+        targets.extend(str(item).strip().lower() for item in extra_targets if str(item).strip())
+    return click_text_targets(
+        targets,
+        primary_targets=["menu", "메뉴", "more", "더보기", "전체메뉴"],
+        min_primary_hits=0,
+        window_title_tokens=[*targets, "chrome", "edge", "firefox", "brave", "opera"],
+        restrict_to_browser_window=True,
+        click_horizontal_bias="matched_token_right",
+        image_path=image_path,
+        timeout_s=timeout_s,
+        poll_interval_s=1.0,
+        prefer_bottom=False,
+        double_click=False,
+        allow_heuristic_fallback=True,
+        heuristic_mode="menu",
     )
 """.strip(),
     "advance_visible_download_flow": """
-def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeout_s=18.0, search_first=False):
+def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeout_s=18.0, search_first=False, search_url=None):
     import ctypes
     import time
 
@@ -1109,6 +1401,17 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
     search_timeout = min(12.0, max(6.0, total_timeout * 0.55))
     download_timeout = min(12.0, max(6.0, total_timeout * 0.55))
     if search_first:
+        if search_url and not browser_page_has_search_results(image_path=image_path, expected_title_tokens=extra_targets):
+            try:
+                open_url_and_wait(
+                    search_url,
+                    expected_title_tokens=extra_targets,
+                    timeout_s=max(10.0, search_timeout),
+                )
+                attempts.append({"stage": "search_page_open", "opened": search_url})
+                time.sleep(3.5)
+            except SystemExit as exc:
+                attempts.append({"stage": "search_page_open", "error": str(exc), "opened": search_url})
         try:
             clicked = click_search_result_like_target(
                 extra_targets=extra_targets,
@@ -1142,16 +1445,89 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
             attempts.append({"stage": "search_result_keyboard_fallback", "action": "tab_enter"})
             time.sleep(4.0)
     try:
-        clicked = click_download_like_target(
-            extra_targets=extra_targets,
+        clicked = click_text_targets(
+            [
+                *(list(extra_targets or [])),
+                "official",
+                "공식",
+                "download",
+                "다운로드",
+                "설치",
+                "install",
+                "installer",
+                "setup",
+                "받기",
+                "pc",
+                "windows",
+                "exe",
+            ],
+            avoid_targets=[
+                "android",
+                "iphone",
+                "ios",
+                "mac",
+                "macos",
+                "linux",
+                "portable",
+                "zip",
+                "archive",
+                "source",
+                "sdk",
+                "server",
+                "blog",
+                "블로그",
+                "forum",
+                "커뮤니티",
+            ],
+            primary_targets=["download", "다운로드", "install", "installer", "setup", "설치", "받기", "exe"],
+            min_primary_hits=1,
+            window_title_tokens=[*(list(extra_targets or [])), "chrome", "edge", "firefox", "brave", "opera", "official", "공식", "download", "다운로드"],
+            restrict_to_browser_window=True,
+            click_horizontal_bias="matched_token_right",
             image_path=image_path,
-            timeout_s=download_timeout,
+            timeout_s=max(4.0, min(download_timeout, 8.0)),
+            poll_interval_s=1.0,
+            prefer_bottom=True,
+            double_click=False,
+            allow_heuristic_fallback=False,
+            heuristic_mode="download",
         )
-        attempts.append({"stage": "download_control", "clicked": clicked})
+        attempts.append({"stage": "download_control_text", "clicked": clicked})
     except SystemExit as exc:
-        attempts.append({"stage": "download_control", "error": str(exc)})
-        _tab_enter(6, final_enter=True)
-        attempts.append({"stage": "download_keyboard_fallback", "action": "tab_enter"})
+        attempts.append({"stage": "download_control_text", "error": str(exc)})
+        try:
+            clicked = click_download_like_target(
+                extra_targets=extra_targets,
+                image_path=image_path,
+                timeout_s=min(8.0, download_timeout),
+            )
+            attempts.append({"stage": "download_control_heuristic", "clicked": clicked, "after_menu": False})
+            return {"attempts": attempts}
+        except SystemExit as heuristic_exc:
+            attempts.append({"stage": "download_control_heuristic", "error": str(heuristic_exc), "after_menu": False})
+        menu_opened = False
+        try:
+            menu_click = open_responsive_header_menu(
+                extra_targets=extra_targets,
+                image_path=image_path,
+                timeout_s=min(6.0, download_timeout),
+            )
+            attempts.append({"stage": "responsive_header_menu", "clicked": menu_click})
+            menu_opened = True
+            time.sleep(2.0)
+        except SystemExit as menu_exc:
+            attempts.append({"stage": "responsive_header_menu", "error": str(menu_exc)})
+        try:
+            clicked = click_download_like_target(
+                extra_targets=extra_targets,
+                image_path=image_path,
+                timeout_s=download_timeout,
+            )
+            attempts.append({"stage": "download_control", "clicked": clicked, "after_menu": menu_opened})
+        except SystemExit as final_exc:
+            attempts.append({"stage": "download_control", "error": str(final_exc), "after_menu": menu_opened})
+            _tab_enter(6, final_enter=True)
+            attempts.append({"stage": "download_keyboard_fallback", "action": "tab_enter"})
     return {"attempts": attempts}
 """.strip(),
 }
@@ -1331,31 +1707,83 @@ def _synthesized_visible_download_completion_code(
     continue_on_failure: bool = False,
 ) -> str:
     extra_targets = _visible_flow_extra_targets(request, limit=2)
-    search_first = _looks_like_search_results_observation(request) or _url_looks_like_search_results(prompt_url)
+    initial_search_first = _looks_like_search_results_observation(request) or _url_looks_like_search_results(prompt_url)
+    fallback_search_url = None
+    if prompt_url and not initial_search_first:
+        fallback_search_url = _fallback_browser_search_url(request.user_prompt)
     lines: list[str] = []
+    lines.append(f"search_first = {repr(bool(initial_search_first))}")
+    if prompt_url:
+        lines.append(f"prompt_url = {json.dumps(prompt_url, ensure_ascii=False)}")
+    else:
+        lines.append("prompt_url = None")
+    if fallback_search_url:
+        lines.append(f"fallback_search_url = {json.dumps(fallback_search_url, ensure_ascii=False)}")
+    else:
+        lines.append("fallback_search_url = None")
     if prompt_url:
         lines.append(
-            f'open_url_and_wait({json.dumps(prompt_url, ensure_ascii=False)}, '
+            'open_url_and_wait(prompt_url, '
             f'expected_title_tokens={json.dumps(extra_targets, ensure_ascii=False)})'
+        )
+        lines.extend(
+            [
+                "if fallback_search_url and browser_page_has_error_state(expected_title_tokens="
+                f"{json.dumps(extra_targets, ensure_ascii=False)}):",
+                "    open_url_and_wait(",
+                "        fallback_search_url,",
+                f"        expected_title_tokens={json.dumps(extra_targets, ensure_ascii=False)},",
+                "    )",
+                "    search_first = True",
+            ]
         )
     lines.extend(
         [
             "try:",
             "    flow = advance_visible_download_flow("
             f"extra_targets={json.dumps(extra_targets, ensure_ascii=False)}, "
-            f"search_first={repr(bool(search_first))}, "
+            "search_first=search_first, "
+            "search_url=fallback_search_url, "
             f"timeout_s={float(timeout_s):.1f})",
             '    print(f"advanced visible download flow: {flow}")',
         ]
     )
     download_glob = _extract_prompt_download_glob(request.user_prompt)
     if download_glob:
+        short_wait_timeout = max(10.0, min(float(wait_timeout_s) * 0.35, 18.0))
         lines.extend(
             [
-                "    installer = wait_for_stable_download("
+                "    installer = None",
+                "    last_download_error = None",
+                "    for download_attempt in range(2):",
+                "        try:",
+                "            installer = wait_for_stable_download("
                 f"{json.dumps(download_glob, ensure_ascii=False)}, "
-                f"min_bytes=1_000_000, timeout_s={float(wait_timeout_s):.1f})",
-                '    print(f"download ready: {installer}")',
+                f"min_bytes=1_000_000, timeout_s={float(short_wait_timeout):.1f})",
+                '            print(f"download ready: {installer}")',
+                "            break",
+                "        except SystemExit as download_exc:",
+                "            last_download_error = download_exc",
+                "            if download_attempt >= 1:",
+                "                break",
+                "            page_down_browser_view(steps=1)",
+                "            flow = advance_visible_download_flow("
+                f"extra_targets={json.dumps(extra_targets, ensure_ascii=False)}, "
+                "search_first=False, "
+                "search_url=None, "
+                "timeout_s=12.0)",
+                '            print(f"advanced visible download flow retry: {flow}")',
+                "    if installer is None:",
+                "        if prompt_url:",
+                "            installer = download_official_installer_from_page(",
+                "                prompt_url,",
+                f"                extra_targets={json.dumps(extra_targets, ensure_ascii=False)},",
+                f"                download_glob={json.dumps(download_glob, ensure_ascii=False)},",
+                "                min_bytes=1_000_000,",
+                "            )",
+                '            print(f"download recovered from official page: {installer}")',
+                "        else:",
+                "            raise SystemExit(f\"download not found after visible-flow retry: {last_download_error}\")",
             ]
         )
     if exit_on_success:
@@ -1413,12 +1841,30 @@ def _prepare_python_code_for_execution(request: StepRequest | None, code: str) -
 
 
 def _synthesized_visible_ui_click_recovery_code(request: StepRequest | None, *, timeout_s: float = 12.0) -> str:
-    click_call = _click_helper_call_for_request(request, timeout_s=timeout_s)
-    return "\n".join(
-        [
-            f"clicked = {click_call}",
-            'print(f"clicked visible control: {clicked}")',
-        ]
+    if request is None:
+        return "\n".join(
+            [
+                'clicked = click_download_like_target(timeout_s=12.0)',
+                'print(f"clicked visible control: {clicked}")',
+            ]
+        )
+    prompt_url = None
+    last_execution_payload = dict(request.last_execution.get("payload_metadata") or {})
+    last_execution_code = str(last_execution_payload.get("executed_python_code") or "")
+    if _looks_like_search_results_observation(request):
+        for candidate in _extract_prompt_urls(last_execution_code):
+            if _url_looks_like_search_results(candidate):
+                prompt_url = candidate
+                break
+    if not prompt_url:
+        prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url(request.user_prompt)
+    return _synthesized_visible_download_completion_code(
+        request,
+        prompt_url=prompt_url,
+        timeout_s=max(12.0, float(timeout_s)),
+        wait_timeout_s=30.0,
+        exit_on_success=False,
+        continue_on_failure=False,
     )
 
 
@@ -2475,11 +2921,43 @@ def _fallback_browser_search_url(text: str) -> str | None:
     keywords = _prompt_keyword_candidates(text, limit=4)
     if not keywords:
         return None
+    search_domains: list[str] = []
+    for url in _extract_prompt_urls(text):
+        parsed = urllib.parse.urlparse(str(url or "").strip())
+        host = str(parsed.netloc or "").strip().lower().split(":", 1)[0]
+        if not host:
+            continue
+        parts = [part for part in host.split(".") if part]
+        if len(parts) < 2:
+            continue
+        registrable = ".".join(parts[-2:])
+        if registrable not in search_domains:
+            search_domains.append(registrable)
+        lead = parts[-2]
+        tld = parts[-1]
+        if (
+            lead
+            and len(lead) >= 4
+            and lead.isascii()
+            and lead.isalnum()
+            and not lead.endswith(("corp", "inc", "co", "group", "app"))
+            and tld in {"com", "net", "org"}
+        ):
+            sibling = f"{lead}corp.{tld}"
+            if sibling not in search_domains:
+                search_domains.append(sibling)
+        if len(search_domains) >= 2:
+            break
     joined = " ".join(keywords)
     if re.search(r"[\uac00-\ud7a3]", joined):
         query_terms = [*keywords, "공식", "다운로드", "pc", "windows"]
     else:
         query_terms = [*keywords, "official", "windows", "download"]
+    if search_domains:
+        if len(search_domains) == 1:
+            query_terms.append(f"site:{search_domains[0]}")
+        else:
+            query_terms.append("(" + " OR ".join(f"site:{domain}" for domain in search_domains[:2]) + ")")
     query = urllib.parse.quote(" ".join(query_terms))
     return f"https://www.bing.com/search?q={query}"
 
@@ -2572,6 +3050,8 @@ def _looks_like_download_chunk_completed(*, user_prompt: str, last_execution: di
     success_markers = (
         "downloaded:",
         "downloaded successfully:",
+        "download ready:",
+        "download recovered from official page:",
         "existing installer found:",
         "using existing installer:",
     )

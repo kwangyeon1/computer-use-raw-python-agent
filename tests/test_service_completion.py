@@ -21,11 +21,13 @@ from computer_use_raw_python_agent.service import (
     _looks_like_non_executing_task_script,
     _looks_like_opened_page_only_step,
     _looks_like_reported_failure,
+    _looks_like_download_chunk_completed,
     _normalize_missing_module_install_name,
     _prepare_python_code_for_execution,
     _prompt_keyword_candidates,
     _rewrite_user_prompt_for_replan,
     _retry_token_budget,
+    _synthesized_visible_download_completion_code,
     _synthesized_visible_ui_click_recovery_code,
     _should_use_framework_official_download_recovery,
     _should_omit_screenshot_for_generation,
@@ -173,7 +175,6 @@ def test_prepare_python_code_for_execution_auto_clicks_download_control_for_gui_
     )
     prepared = _prepare_python_code_for_execution(request, 'print("continue")')
     assert "advance_visible_download_flow(" in prepared
-    assert "wait_for_stable_download(" in prepared
     assert "visible download automation incomplete:" in prepared
 
 
@@ -191,7 +192,7 @@ print(html[:100])
     )
     assert "open_url_and_wait(" in prepared
     assert "advance_visible_download_flow(" in prepared
-    assert "wait_for_stable_download(" in prepared
+    assert "browser_page_has_error_state(" in prepared
     assert "urllib.request.urlopen" not in prepared
 
 
@@ -238,12 +239,99 @@ def test_fallback_browser_search_url_uses_korean_download_terms_for_hangul_tasks
     assert "%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C" in url
 
 
+def test_fallback_browser_search_url_adds_vendor_domain_filters_from_prompt_urls() -> None:
+    url = _fallback_browser_search_url("Use the official page https://pc.example.com/download and continue.")
+    assert url is not None
+    assert "site%3Aexample.com" in url
+    assert "site%3Aexamplecorp.com" in url
+
+
+def test_synthesized_visible_download_completion_code_adds_search_recovery_for_bad_prompt_url() -> None:
+    request = StepRequest(
+        user_prompt="카카오톡 pc버전 프로그램을 설치해줘",
+        execution_style="gui_first",
+    )
+    code = _synthesized_visible_download_completion_code(
+        request,
+        prompt_url="https://pc.example.com/talk",
+    )
+    assert "fallback_search_url =" in code
+    assert 'prompt_url = "https://pc.example.com/talk"' in code
+    assert "browser_page_has_error_state(" in code
+    assert "search_first = True" in code
+    assert "https://www.bing.com/search?q=" in code
+    assert "search_url=fallback_search_url" in code
+
+
+def test_synthesized_visible_download_completion_code_retries_visible_flow_before_failing_download_wait() -> None:
+    request = StepRequest(
+        user_prompt="Download into ~/Downloads/computer-use-agent/targetapp-1234/ and wait for the installer .exe to appear.",
+        execution_style="gui_first",
+    )
+    code = _synthesized_visible_download_completion_code(
+        request,
+        prompt_url="https://download.example.com/app",
+    )
+    assert "for download_attempt in range(2)" in code
+    assert "advanced visible download flow retry" in code
+    assert "page_down_browser_view(steps=1)" in code
+    assert "download_official_installer_from_page(" in code
+
+
 def test_expand_runtime_helpers_includes_browser_region_heuristic_click() -> None:
     expanded = _expand_runtime_helpers("click_search_result_like_target(extra_targets=['targetapp'])")
     assert "def _heuristic_browser_click(" in expanded
     assert "browser_search_result_region" in expanded
     assert "screen-browser-region-fallback" in expanded
     assert "crop_region=browser_region" in expanded
+
+
+def test_expand_runtime_helpers_includes_responsive_header_menu_flow() -> None:
+    expanded = _expand_runtime_helpers("advance_visible_download_flow(extra_targets=['targetapp'])")
+    assert "def open_responsive_header_menu(" in expanded
+    assert 'heuristic_mode="menu"' in expanded
+    assert "browser_header_menu_region" in expanded
+    assert "allow_heuristic_fallback=False" in expanded
+    assert "download_control_heuristic" in expanded
+    assert 'after_menu": False' in expanded
+
+
+def test_expand_runtime_helpers_relaxes_browser_open_readiness_to_visible_window() -> None:
+    expanded = _expand_runtime_helpers('open_url_and_wait("https://example.com", expected_title_tokens=["example"])')
+    assert "def _browser_window_candidates()" in expanded
+    assert 'elapsed >= max(float(settle_time_s), 4.0)' in expanded
+
+
+def test_expand_runtime_helpers_includes_browser_error_state_detection() -> None:
+    expanded = _expand_runtime_helpers('browser_page_has_error_state(expected_title_tokens=["targetapp"])')
+    assert "def browser_page_has_error_state(" in expanded
+    assert "404" in expanded
+    assert "not found" in expanded
+    assert "ocr_screen_text_regions(" in expanded
+
+
+def test_expand_runtime_helpers_includes_browser_search_state_detection() -> None:
+    expanded = _expand_runtime_helpers('browser_page_has_search_results(expected_title_tokens=["targetapp"])')
+    assert "def browser_page_has_search_results(" in expanded
+    assert "bing" in expanded
+    assert "duckduckgo" in expanded
+    assert "ocr_screen_text_regions(" in expanded
+
+
+def test_expand_runtime_helpers_includes_page_down_browser_view() -> None:
+    expanded = _expand_runtime_helpers("page_down_browser_view(steps=1)")
+    assert "def page_down_browser_view(" in expanded
+    assert "vk_next = 0x22" in expanded
+
+
+def test_expand_runtime_helpers_includes_official_page_download_recovery() -> None:
+    expanded = _expand_runtime_helpers(
+        'download_official_installer_from_page("https://example.com/app", extra_targets=["targetapp"], download_glob="computer-use-agent/demo/*.exe")'
+    )
+    assert "def download_official_installer_from_page(" in expanded
+    assert "destination_dir = downloads" in expanded
+    assert '.replace("\\\\u002F", "/")' in expanded
+    assert "all official installer candidates failed" in expanded
 
 
 def test_prompt_url_violation_allows_gui_first_search_discovery_flow() -> None:
@@ -296,7 +384,9 @@ def test_visible_ui_click_recovery_uses_search_result_helper_for_search_results(
         },
     )
     recovery_code = _synthesized_visible_ui_click_recovery_code(request)
-    assert "click_search_result_like_target(" in recovery_code
+    assert "open_url_and_wait(" in recovery_code
+    assert "advance_visible_download_flow(" in recovery_code
+    assert "search_url=fallback_search_url" in recovery_code
 
 
 def test_reported_failure_detected_from_stdout_or_stderr_even_with_zero_exit_code() -> None:
@@ -307,6 +397,17 @@ def test_reported_failure_detected_from_stdout_or_stderr_even_with_zero_exit_cod
         "error_info": None,
     }
     assert _looks_like_reported_failure(execution) is True
+
+
+def test_download_chunk_completed_accepts_official_page_recovery_marker() -> None:
+    assert _looks_like_download_chunk_completed(
+        user_prompt="success target: installer `.exe` exists in Downloads",
+        last_execution={
+            "return_code": 0,
+            "stdout_tail": "download recovered from official page: C:\\\\Users\\\\qkqxl\\\\Downloads\\\\computer-use-agent\\\\targetapp\\\\KakaoTalk_Setup.exe",
+            "stderr_tail": "",
+        },
+    ) is True
 
 
 def test_compilable_python_code_detects_truncated_script() -> None:
