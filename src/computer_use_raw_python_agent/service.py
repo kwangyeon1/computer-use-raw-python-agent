@@ -363,6 +363,57 @@ def wait_for_stable_download(path_or_pattern, *, min_bytes=1_000_000, stable_che
         raise SystemExit(f"download incomplete: {last_candidate} ({last_candidate.stat().st_size} bytes)")
     raise SystemExit(f"download not found for pattern: {raw}")
 """.strip(),
+    "read_action_context": """
+def read_action_context(context_path):
+    import json
+    import os
+    from pathlib import Path
+
+    path = Path(os.path.expanduser(str(context_path or ""))).resolve()
+    if not path.name:
+        raise SystemExit("read_action_context requires a file path")
+    if not path.exists() or not path.is_file():
+        return {"_context_path": str(path), "_exists": False}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"_context_path": str(path), "_exists": True, "_error": f"invalid_json: {exc}"}
+    if not isinstance(payload, dict):
+        payload = {}
+    payload["_context_path"] = str(path)
+    payload["_exists"] = True
+    return payload
+""".strip(),
+    "write_action_context": """
+def write_action_context(context_path, **updates):
+    import json
+    import os
+    import time
+    from pathlib import Path
+
+    path = Path(os.path.expanduser(str(context_path or ""))).resolve()
+    if not path.name:
+        raise SystemExit("write_action_context requires a file path")
+    existing = {}
+    if path.exists() and path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except Exception:
+            existing = {}
+    for key, value in updates.items():
+        if value is None:
+            continue
+        existing[key] = value
+    existing["version"] = 1
+    existing["updated_at"] = time.time()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    existing["_context_path"] = str(path)
+    existing["_exists"] = True
+    return existing
+""".strip(),
     "browser_page_has_error_state": """
 def browser_page_has_error_state(*, image_path=None, expected_title_tokens=None):
     import os
@@ -784,6 +835,7 @@ def click_text_targets(
     min_primary_hits=0,
     window_title_tokens=None,
     restrict_to_browser_window=False,
+    crop_region=None,
     click_horizontal_bias="center",
     image_path=None,
     timeout_s=10.0,
@@ -1076,7 +1128,7 @@ def click_text_targets(
         content_top = min(bottom - 80, page_header_top + 36)
         content_height = max(120, bottom - content_top - 30)
         mode = str(heuristic_mode or "auto").strip().lower()
-        if mode not in {"auto", "search", "download", "menu"}:
+        if mode not in {"auto", "search", "download", "menu", "installer"}:
             mode = "auto"
         if mode == "auto":
             mode = "download" if prefer_bottom else "search"
@@ -1084,6 +1136,16 @@ def click_text_targets(
             x_fracs = (0.18, 0.22, 0.27)
             y_fracs = (0.10, 0.20, 0.32)
             label = "browser_search_result_region"
+        elif mode == "installer":
+            click_points = (
+                (0.92, 0.90),
+                (0.88, 0.90),
+                (0.84, 0.90),
+                (0.92, 0.82),
+                (0.80, 0.82),
+                (0.76, 0.90),
+            )
+            label = "installer_primary_action_region"
         elif mode == "menu":
             x_fracs = (0.965, 0.935, 0.905, 0.875)
             header_offsets = (18, 22, 28, 36)
@@ -1092,17 +1154,27 @@ def click_text_targets(
             x_fracs = (0.66, 0.72, 0.78, 0.84, 0.60, 0.90)
             header_offsets = (56, 72, 90, 112, 136, 162)
             label = "browser_download_cta_region"
-        cycle_len = len(y_fracs) if mode == "search" else len(x_fracs)
+        if mode == "installer":
+            cycle_len = len(click_points)
+        else:
+            cycle_len = len(y_fracs) if mode == "search" else len(x_fracs)
         idx = max(0, int(attempt_index)) % max(1, cycle_len)
-        x = left + int(width * x_fracs[min(idx, len(x_fracs) - 1)])
+        if mode == "installer":
+            frac_x, frac_y = click_points[idx]
+            x = left + int(width * frac_x)
+            y = top + int(height * frac_y)
+        else:
+            x = left + int(width * x_fracs[min(idx, len(x_fracs) - 1)])
         if mode == "search":
             y = content_top + int(content_height * y_fracs[idx])
+        elif mode == "installer":
+            y = max(top + 28, min(bottom - 28, y))
         else:
             y = page_header_top + header_offsets[min(idx, len(header_offsets) - 1)]
         x = max(left + 40, min(right - 40, x))
         if mode == "search":
             y = max(content_top + 20, min(bottom - 40, y))
-        else:
+        elif mode != "installer":
             y = max(top + browser_toolbar + 10, min(bottom - 40, y))
         return {
             "text": f"[heuristic:{label}]",
@@ -1117,11 +1189,13 @@ def click_text_targets(
     while time.time() < deadline:
         if restrict_to_browser_window:
             _activate_browser_window()
-        browser_region = _browser_window_region()
+        active_region = crop_region
+        if active_region is None and restrict_to_browser_window:
+            active_region = _browser_window_region()
         lines = ocr_screen_text_regions(
             image_path=image_path,
             max_lines=200,
-            crop_region=browser_region if restrict_to_browser_window and browser_region is not None else None,
+            crop_region=active_region if active_region is not None else None,
         )
 
         def _collect_candidates(region):
@@ -1198,8 +1272,8 @@ def click_text_targets(
                 )
             return collected
 
-        candidates = _collect_candidates(browser_region)
-        if not candidates and browser_region is not None:
+        candidates = _collect_candidates(active_region)
+        if not candidates and active_region is not None:
             candidates = _collect_candidates(None)
         if candidates:
             candidates.sort(
@@ -1220,8 +1294,8 @@ def click_text_targets(
                 "y": center_y,
                 "score": best_candidate["score"],
             }
-        if allow_heuristic_fallback and restrict_to_browser_window and browser_region is not None:
-            heuristic_candidate = _heuristic_browser_click(browser_region, attempt_index=sweep_index)
+        if allow_heuristic_fallback and active_region is not None:
+            heuristic_candidate = _heuristic_browser_click(active_region, attempt_index=sweep_index)
             if heuristic_candidate is not None:
                 _click_point(int(heuristic_candidate["x"]), int(heuristic_candidate["y"]))
                 best_candidate = heuristic_candidate
@@ -1229,7 +1303,7 @@ def click_text_targets(
                 time.sleep(max(0.8, float(poll_interval_s)))
                 continue
         sweep_index += 1
-        if restrict_to_browser_window and sweep_index % 2 == 0:
+        if restrict_to_browser_window and crop_region is None and sweep_index % 2 == 0:
             _page_down()
         time.sleep(float(poll_interval_s))
     if best_candidate is not None:
@@ -1729,6 +1803,7 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
     "advance_visible_installer_flow": """
 def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeout_s=20.0):
     import ctypes
+    import re
     import time
 
     attempts = []
@@ -1738,6 +1813,142 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
         user32.keybd_event(vk, 0, 0, 0)
         time.sleep(0.05)
         user32.keybd_event(vk, 0, 0x0002, 0)
+
+    def _press_alt(vk):
+        user32 = ctypes.windll.user32
+        vk_menu = 0x12
+        user32.keybd_event(vk_menu, 0, 0, 0)
+        time.sleep(0.05)
+        user32.keybd_event(vk, 0, 0, 0)
+        time.sleep(0.05)
+        user32.keybd_event(vk, 0, 0x0002, 0)
+        time.sleep(0.05)
+        user32.keybd_event(vk_menu, 0, 0x0002, 0)
+
+    def _normalize_tokens(values):
+        tokens = []
+        seen = set()
+        generic_tokens = {
+            "setup",
+            "install",
+            "installer",
+            "language",
+            "select",
+            "wizard",
+            "program",
+            "windows",
+            "desktop",
+            "app",
+            "application",
+            "programs",
+            "exe",
+        }
+        for raw in values or []:
+            for token in re.split(r"[^0-9a-zA-Z가-힣]+", str(raw or "").lower()):
+                cleaned = token.strip()
+                if not cleaned or cleaned in seen or cleaned in generic_tokens:
+                    continue
+                min_len = 2 if any("\\uac00" <= ch <= "\\ud7a3" for ch in cleaned) else 3
+                if len(cleaned) < min_len:
+                    continue
+                seen.add(cleaned)
+                tokens.append(cleaned)
+        return tokens
+
+    def _activate_target_installer_window():
+        try:
+            import pygetwindow as gw
+        except Exception as exc:
+            attempts.append({"stage": "installer_window_target", "error": f"pygetwindow unavailable: {exc}"})
+            return None
+
+        target_window_keywords = _normalize_tokens(extra_targets)
+        generic_window_terms = (
+            "setup",
+            "installer",
+            "install",
+            "wizard",
+            "language",
+            "select language",
+            "설치",
+            "설치 마법사",
+            "확인",
+            "동의",
+            "다음",
+            "완료",
+        )
+        excluded_terms = (
+            "chrome",
+            "edge",
+            "firefox",
+            "brave",
+            "opera",
+            "terminal",
+            "powershell",
+            "command prompt",
+            "cmd",
+            "bash",
+            "python",
+            "codex",
+            "visual studio code",
+            "vscode",
+            "explorer",
+        )
+        candidates = []
+        active_window = None
+        try:
+            active_window = gw.getActiveWindow()
+        except Exception:
+            active_window = None
+        for window in gw.getAllWindows():
+            title = str(getattr(window, "title", "") or "").strip()
+            lowered = title.lower()
+            width = int(getattr(window, "width", 0) or 0)
+            height = int(getattr(window, "height", 0) or 0)
+            left = int(getattr(window, "left", 0) or 0)
+            top = int(getattr(window, "top", 0) or 0)
+            if width < 220 or height < 120:
+                continue
+            if left + width < 0 or top + height < 0:
+                continue
+            if any(token in lowered for token in excluded_terms):
+                continue
+            score = 0
+            if any(token in lowered for token in generic_window_terms):
+                score += 24
+            title_keyword_hits = 0
+            for token in target_window_keywords:
+                if token in lowered:
+                    title_keyword_hits += 1
+                    score += 90
+            if active_window is not None and window is active_window:
+                score += 18
+            if width >= 420:
+                score += 8
+            if height >= 220:
+                score += 8
+            if score <= 0:
+                continue
+            candidates.append((score, title_keyword_hits, window))
+        candidates.sort(key=lambda item: (item[1], item[0]), reverse=True)
+        for _, _, window in candidates:
+            try:
+                if hasattr(window, "isMinimized") and window.isMinimized:
+                    window.restore()
+                    time.sleep(0.2)
+                window.activate()
+                time.sleep(0.45)
+                return {
+                    "left": int(getattr(window, "left", 0) or 0),
+                    "top": int(getattr(window, "top", 0) or 0),
+                    "right": int(getattr(window, "left", 0) or 0) + int(getattr(window, "width", 0) or 0),
+                    "bottom": int(getattr(window, "top", 0) or 0) + int(getattr(window, "height", 0) or 0),
+                    "title": str(getattr(window, "title", "") or ""),
+                }
+            except Exception as exc:
+                attempts.append({"stage": "installer_window_activate", "error": str(exc), "title": title})
+                continue
+        return None
 
     target_terms = [
         "ok",
@@ -1765,6 +1976,11 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
         "언어",
         "select language",
         "installer language",
+        "install now",
+        "지금 설치",
+        "다음",
+        "동의",
+        "계속",
     ]
     avoid_terms = [
         "cancel",
@@ -1782,8 +1998,127 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
     if extra_targets:
         target_terms.extend(str(item).strip().lower() for item in extra_targets if str(item).strip())
 
+    def _read_ocr_text(region):
+        try:
+            lines = ocr_screen_text_regions(image_path=image_path, max_lines=80, crop_region=region)
+        except Exception:
+            return ""
+        return " | ".join(str(item.get("text") or "").strip().lower() for item in lines if isinstance(item, dict))
+
+    def _cancel_confirmation_visible(region):
+        combined = _read_ocr_text(region)
+        if not combined:
+            combined = _read_ocr_text(None)
+        cancel_markers = (
+            "cancel setup",
+            "cancel installation",
+            "cancel install",
+            "abort setup",
+            "abort installation",
+            "quit setup",
+            "quit installation",
+            "exit setup",
+            "exit installation",
+            "취소하시겠습니까",
+            "설치를 취소",
+            "설치를 종료",
+            "설치 종료",
+            "설치 취소",
+            "종료하시겠습니까",
+        )
+        decision_markers = ("yes", "예", "no", "아니오")
+        return any(marker in combined for marker in cancel_markers) and any(marker in combined for marker in decision_markers)
+
+    def _next_like_installer_prompt_visible(region):
+        combined = _read_ocr_text(region)
+        if not combined:
+            combined = _read_ocr_text(None)
+        if not combined:
+            return False
+        positive_markers = (
+            "next",
+            "continue",
+            "install now",
+            "ready to install",
+            "setup will install",
+            "click next",
+            "press next",
+            "다음",
+            "계속",
+            "설치합니다",
+            "설치를 시작",
+            "버튼을 눌러주세요",
+            "버튼을 눌러 주",
+        )
+        negative_markers = (
+            "cancel setup",
+            "cancel installation",
+            "취소하시겠습니까",
+            "설치 취소",
+            "종료하시겠습니까",
+        )
+        return any(marker in combined for marker in positive_markers) and not any(marker in combined for marker in negative_markers)
+
     stage_timeout = max(5.0, min(float(timeout_s), 8.0))
-    for attempt_index in range(3):
+    progress_made = False
+    for attempt_index in range(5):
+        installer_region = _activate_target_installer_window()
+        if installer_region is not None:
+            attempts.append({"stage": "installer_window_target", "window": installer_region, "attempt": attempt_index})
+        if installer_region is not None and _cancel_confirmation_visible(installer_region):
+            try:
+                clicked = click_text_targets(
+                    ["no", "아니오", "continue", "계속", "resume", "돌아가기"],
+                    avoid_targets=["yes", "예", "cancel", "취소", "exit", "종료", "close", "닫기"],
+                    primary_targets=["no", "아니오"],
+                    min_primary_hits=1,
+                    click_horizontal_bias="matched_token_right",
+                    image_path=None,
+                    crop_region=None,
+                    timeout_s=min(stage_timeout, 4.0),
+                    poll_interval_s=0.8,
+                    prefer_bottom=True,
+                    double_click=False,
+                    allow_heuristic_fallback=False,
+                    heuristic_mode="installer",
+                )
+                attempts.append({"stage": "installer_cancel_decline_click", "clicked": clicked, "attempt": attempt_index})
+                progress_made = True
+                time.sleep(1.0)
+                continue
+            except SystemExit as exc:
+                attempts.append({"stage": "installer_cancel_decline_click", "error": str(exc), "attempt": attempt_index})
+        for key_sequence in (
+            ("enter",),
+            ("alt+n",),
+            ("space",),
+            ("tab", "enter"),
+        ):
+            try:
+                for key_name in key_sequence:
+                    if key_name == "tab":
+                        _press(0x09)
+                    elif key_name == "enter":
+                        _press(0x0D)
+                    elif key_name == "space":
+                        _press(0x20)
+                    elif key_name == "alt+n":
+                        _press_alt(0x4E)
+                    time.sleep(0.25)
+                stage_name = "installer_keyboard_primary"
+                if _next_like_installer_prompt_visible(installer_region):
+                    stage_name = "installer_keyboard_primary_guided"
+                attempts.append({"stage": stage_name, "keys": list(key_sequence), "attempt": attempt_index})
+                progress_made = True
+                time.sleep(1.2)
+                break
+            except Exception as exc:
+                attempts.append({"stage": "installer_keyboard_primary", "keys": list(key_sequence), "error": str(exc), "attempt": attempt_index})
+                continue
+        else:
+            pass
+        if progress_made:
+            continue
         try:
             clicked = click_text_targets(
                 target_terms,
@@ -1813,19 +2148,75 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
                 ],
                 min_primary_hits=1,
                 click_horizontal_bias="matched_token_right",
-                image_path=image_path,
+                image_path=None,
+                crop_region=None,
+                timeout_s=min(stage_timeout, 4.5),
+                poll_interval_s=0.8,
+                prefer_bottom=True,
+                double_click=False,
+                allow_heuristic_fallback=False,
+                heuristic_mode="installer",
+            )
+            attempts.append({"stage": "installer_text_click_global", "clicked": clicked, "attempt": attempt_index})
+            progress_made = True
+            time.sleep(1.2)
+            continue
+        except SystemExit as exc:
+            attempts.append({"stage": "installer_text_click_global", "error": str(exc), "attempt": attempt_index})
+        try:
+            clicked = click_text_targets(
+                target_terms,
+                avoid_targets=avoid_terms,
+                primary_targets=[
+                    "ok",
+                    "확인",
+                    "next",
+                    "다음",
+                    "install",
+                    "설치",
+                    "agree",
+                    "동의",
+                    "accept",
+                    "yes",
+                    "예",
+                    "continue",
+                    "계속",
+                    "finish",
+                    "완료",
+                    "launch",
+                    "실행",
+                    "start",
+                    "시작",
+                    "language",
+                    "언어",
+                ],
+                min_primary_hits=1,
+                click_horizontal_bias="matched_token_right",
+                image_path=None,
+                crop_region=installer_region,
                 timeout_s=stage_timeout,
                 poll_interval_s=1.0,
                 prefer_bottom=False,
                 double_click=False,
-                allow_heuristic_fallback=False,
+                allow_heuristic_fallback=True,
+                heuristic_mode="installer",
             )
             attempts.append({"stage": "installer_text_click", "clicked": clicked, "attempt": attempt_index})
-            time.sleep(2.5)
-            return {"attempts": attempts}
+            progress_made = True
+            time.sleep(1.5)
+            continue
         except SystemExit as exc:
             attempts.append({"stage": "installer_text_click", "error": str(exc), "attempt": attempt_index})
-        for key_sequence in (("tab", "enter"), ("enter",), ("space",), ("tab", "tab", "enter")):
+        for key_sequence in (
+            ("enter",),
+            ("space",),
+            ("alt+n",),
+            ("alt+i",),
+            ("alt+a",),
+            ("alt+y",),
+            ("tab", "enter"),
+            ("tab", "tab", "enter"),
+        ):
             try:
                 for key_name in key_sequence:
                     if key_name == "tab":
@@ -1834,13 +2225,24 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
                         _press(0x0D)
                     elif key_name == "space":
                         _press(0x20)
+                    elif key_name == "alt+n":
+                        _press_alt(0x4E)
+                    elif key_name == "alt+i":
+                        _press_alt(0x49)
+                    elif key_name == "alt+a":
+                        _press_alt(0x41)
+                    elif key_name == "alt+y":
+                        _press_alt(0x59)
                     time.sleep(0.25)
                 attempts.append({"stage": "installer_keyboard_fallback", "keys": list(key_sequence), "attempt": attempt_index})
-                time.sleep(1.8)
-                return {"attempts": attempts}
+                progress_made = True
+                time.sleep(1.2)
+                break
             except Exception as exc:
                 attempts.append({"stage": "installer_keyboard_fallback", "keys": list(key_sequence), "error": str(exc), "attempt": attempt_index})
                 continue
+    if progress_made:
+        return {"attempts": attempts}
     raise SystemExit(f"could not advance visible installer flow: {attempts}")
 """.strip(),
 }
@@ -2070,6 +2472,29 @@ def _extract_prompt_launch_marker_path(user_prompt: str) -> str | None:
     return None
 
 
+def _context_path_expr_for_flow(
+    *,
+    download_glob: str | None = None,
+    install_marker_path: str | None = None,
+    launch_marker_path: str | None = None,
+) -> str:
+    for marker_path in (install_marker_path, launch_marker_path):
+        candidate = str(marker_path or "").strip()
+        if not candidate:
+            continue
+        normalized = candidate.replace("\\", "/")
+        if "/" in normalized:
+            context_dir = normalized.rsplit("/", 1)[0]
+        else:
+            context_dir = "~/Downloads"
+        return f'Path(os.path.expanduser({json.dumps(context_dir + "/computer-use-agent-context.json", ensure_ascii=False)}))'
+    normalized_glob = str(download_glob or "").strip().replace("\\", "/")
+    if "/" in normalized_glob:
+        context_dir = normalized_glob.rsplit("/", 1)[0]
+        return f'Path(os.path.expanduser({json.dumps(context_dir + "/computer-use-agent-context.json", ensure_ascii=False)}))'
+    return 'Path.home() / "Downloads" / "computer-use-agent-context.json"'
+
+
 def _looks_like_visible_installer_observation(request: StepRequest | None) -> bool:
     if request is None:
         return False
@@ -2119,10 +2544,17 @@ def _synthesized_visible_download_completion_code(
     extra_targets = _visible_flow_extra_targets(request, limit=2)
     initial_search_first = _looks_like_search_results_observation(request) or _url_looks_like_search_results(prompt_url)
     fallback_search_url = None
+    download_glob = _extract_prompt_download_glob(request.user_prompt)
+    context_path_expr = _context_path_expr_for_flow(
+        download_glob=download_glob,
+        install_marker_path=_extract_prompt_install_marker_path(request.user_prompt),
+        launch_marker_path=_extract_prompt_launch_marker_path(request.user_prompt),
+    )
     if prompt_url and not initial_search_first:
         fallback_search_url = _fallback_browser_search_url(request.user_prompt)
     lines: list[str] = []
     lines.append(f"search_first = {repr(bool(initial_search_first))}")
+    lines.append(f"CONTEXT_PATH = {context_path_expr}")
     if prompt_url:
         lines.append(f"prompt_url = {json.dumps(prompt_url, ensure_ascii=False)}")
     else:
@@ -2158,14 +2590,28 @@ def _synthesized_visible_download_completion_code(
             '    print(f"advanced visible download flow: {flow}")',
         ]
     )
-    download_glob = _extract_prompt_download_glob(request.user_prompt)
     if download_glob:
         short_wait_timeout = max(10.0, min(float(wait_timeout_s) * 0.35, 18.0))
         lines.extend(
             [
                 "    installer = None",
+                "    context_payload = read_action_context(CONTEXT_PATH)",
+                '    context_installer = str(context_payload.get("installer_path") or "").strip().strip(\'"\')',
+                "    if context_installer:",
+                "        try:",
+                "            installer = wait_for_stable_download(",
+                "                context_installer,",
+                "                min_bytes=1_000_000,",
+                "                timeout_s=8.0,",
+                "            )",
+                '            print(f"using context installer: {installer}")',
+                "        except SystemExit as context_exc:",
+                '            print(f"ignoring stale context installer: {context_exc}")',
+                "            installer = None",
                 "    last_download_error = None",
                 "    for download_attempt in range(2):",
+                "        if installer is not None:",
+                "            break",
                 "        try:",
                 "            installer = wait_for_stable_download("
                 f"{json.dumps(download_glob, ensure_ascii=False)}, "
@@ -2194,6 +2640,15 @@ def _synthesized_visible_download_completion_code(
                 '            print(f"download recovered from official page: {installer}")',
                 "        else:",
                 "            raise SystemExit(f\"download not found after visible-flow retry: {last_download_error}\")",
+                "    if installer is not None:",
+                "        write_action_context(",
+                "            CONTEXT_PATH,",
+                '            phase="downloaded",',
+                "            installer_path=str(installer),",
+                f"            expected_installer_glob={json.dumps(download_glob, ensure_ascii=False)},",
+                f"            target_keywords={json.dumps(extra_targets, ensure_ascii=False)},",
+                "            source_url=(prompt_url or fallback_search_url),",
+                "        )",
             ]
         )
     if exit_on_success:
@@ -2300,6 +2755,10 @@ def _synthesized_visible_installer_recovery_code(
         if marker_path
         else f"{target_dir_expr} / \"install-success.json\""
     )
+    context_expr = _context_path_expr_for_flow(
+        download_glob=download_glob,
+        install_marker_path=marker_path,
+    )
     return f"""from pathlib import Path
 import json
 import os
@@ -2309,6 +2768,7 @@ import time
 
 TARGET_DIR = {target_dir_expr}
 MARKER_PATH = {marker_expr}
+CONTEXT_PATH = {context_expr}
 EXPECTED_INSTALLER_GLOB = {json.dumps(download_glob, ensure_ascii=False)}
 EXTRA_TARGETS = {json.dumps(extra_targets, ensure_ascii=False)}
 VISIBLE_INSTALLER = {repr(bool(visible_installer))}
@@ -2354,15 +2814,19 @@ SYSTEM_APP_NAMES = {{
 
 TARGET_DIR.mkdir(parents=True, exist_ok=True)
 MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+CONTEXT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-def _normalize_tokens(values) -> list[str]:
+def _normalize_tokens(values, *, skip_extension_tokens: bool = False) -> list[str]:
     import re
 
+    extension_tokens = {"exe", "msi", "bat", "cmd", "lnk", "com", "scr"}
     normalized = []
     seen = set()
     for raw in values:
         for token in re.split(r"[^0-9a-zA-Z가-힣]+", str(raw or "").lower()):
             cleaned = token.strip()
+            if skip_extension_tokens and cleaned in extension_tokens:
+                continue
             if not cleaned or cleaned in GENERIC_TARGET_TOKENS or cleaned in seen:
                 continue
             min_len = 2 if any("\\uac00" <= ch <= "\\ud7a3" for ch in cleaned) else 3
@@ -2396,9 +2860,24 @@ def _iter_expected_installers() -> list[Path]:
             break
     return matches
 
+def _context_candidate(raw_value: str) -> Path | None:
+    candidate_text = str(raw_value or "").strip().strip('"')
+    if not candidate_text:
+        return None
+    candidate = Path(os.path.expandvars(os.path.expanduser(candidate_text)))
+    if not candidate.exists() or not candidate.is_file() or candidate.suffix.lower() != ".exe":
+        return None
+    return candidate
+
 INSTALLERS = _iter_expected_installers()
-TARGET_KEYWORDS = _normalize_tokens([*EXTRA_TARGETS, *[path.stem for path in INSTALLERS], *[path.name for path in INSTALLERS], MARKER_PATH.parent.name])
-FILENAME_TARGET_KEYWORDS = _normalize_tokens([*[path.stem for path in INSTALLERS], *[path.name for path in INSTALLERS]])
+TARGET_KEYWORDS = _normalize_tokens(
+    [*EXTRA_TARGETS, *[path.stem for path in INSTALLERS], *[path.name for path in INSTALLERS], MARKER_PATH.parent.name],
+    skip_extension_tokens=True,
+)
+FILENAME_TARGET_KEYWORDS = _normalize_tokens(
+    [path.stem for path in INSTALLERS],
+    skip_extension_tokens=True,
+)
 
 def _is_temp_like_path(path: Path) -> bool:
     lowered = str(path).lower().replace("\\\\", "/")
@@ -2468,6 +2947,12 @@ def _score_path(path: Path) -> tuple[int, int, float]:
     return score, matched_keywords, mtime
 
 def find_existing_installer() -> Path:
+    context_payload = read_action_context(CONTEXT_PATH)
+    context_installer = _context_candidate(context_payload.get("installer_path"))
+    if context_installer is not None:
+        lowered = str(context_installer).lower()
+        if (not FILENAME_TARGET_KEYWORDS or any(keyword in lowered for keyword in FILENAME_TARGET_KEYWORDS)) and context_installer.stat().st_size > 1_000_000:
+            return context_installer
     if not INSTALLERS:
         raise SystemExit("No installer found in target directory")
     ranked = sorted(
@@ -2637,8 +3122,36 @@ def write_marker(exe_path: Path) -> None:
     with open(MARKER_PATH, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
 
+def _context_installed_executable() -> Path | None:
+    context_payload = read_action_context(CONTEXT_PATH)
+    candidate = _context_candidate(context_payload.get("installed_exe"))
+    if candidate is None:
+        return None
+    if not _is_valid_installed_executable(candidate) or not _matches_filename_target(candidate):
+        return None
+    return candidate
+
 installer = find_existing_installer()
 print(f"Found installer: {{installer}}")
+write_action_context(
+    CONTEXT_PATH,
+    phase="installer_ready",
+    installer_path=str(installer),
+    expected_installer_glob=str(EXPECTED_INSTALLER_GLOB or ""),
+    target_keywords=EXTRA_TARGETS,
+)
+
+context_existing = _context_installed_executable()
+if context_existing is not None:
+    write_marker(context_existing)
+    write_action_context(
+        CONTEXT_PATH,
+        phase="installed",
+        installer_path=str(installer),
+        installed_exe=str(context_existing),
+    )
+    print(f"already installed from context: {{context_existing}}")
+    sys.exit(0)
 
 if not VISIBLE_INSTALLER:
     try:
@@ -2646,6 +3159,13 @@ if not VISIBLE_INSTALLER:
     except AttributeError:
         subprocess.Popen([str(installer)])
     print("installer launched in normal GUI mode")
+    write_action_context(
+        CONTEXT_PATH,
+        phase="installer_started",
+        installer_path=str(installer),
+        expected_installer_glob=str(EXPECTED_INSTALLER_GLOB or ""),
+        target_keywords=EXTRA_TARGETS,
+    )
     time.sleep(6.0)
 
 deadline = time.time() + max({float(timeout_s):.1f}, 16.0)
@@ -2671,6 +3191,12 @@ while time.time() < deadline:
             print(f"installed executable launch skipped: {{launch_exc}}")
         if _target_process_running():
             write_marker(existing)
+            write_action_context(
+                CONTEXT_PATH,
+                phase="installed",
+                installer_path=str(installer),
+                installed_exe=str(existing),
+            )
             print(f"installation complete: {{existing}}")
             sys.exit(0)
         print(f"candidate executable found but target process not running yet: {{existing}}")
@@ -2695,17 +3221,138 @@ def _synthesized_visible_launch_recovery_code(
     timeout_s: float = 22.0,
 ) -> str:
     extra_targets = _visible_flow_extra_targets(request, limit=3)
+    last_execution_payload = dict(request.last_execution.get("payload_metadata") or {})
+    last_execution_code = str(last_execution_payload.get("executed_python_code") or "")
+    fallback_stop_words = {
+        "use",
+        "python",
+        "confirm",
+        "installed",
+        "desktop",
+        "app",
+        "launchable",
+        "running",
+        "start",
+        "shortcut",
+        "source",
+        "task",
+        "launch",
+        "installedapp",
+        "already",
+        "open",
+        "window",
+        "process",
+        "visible",
+        "current",
+        "screen",
+        "chunk",
+        "only",
+        "not",
+        "once",
+        "from",
+        "into",
+        "through",
+        "the",
+        "and",
+        "for",
+        "with",
+        "that",
+        "this",
+        "then",
+        "if",
+        "it",
+        "its",
+        "is",
+        "are",
+        "was",
+        "be",
+        "to",
+        "of",
+        "or",
+        "confirming",
+        "repeat",
+        "script",
+        "launch-and-scan",
+        "verysilent",
+        "silent",
+        "first",
+        "return",
+        "retry",
+        "step",
+        "same",
+        "expected",
+        "glob",
+        "marker",
+        "path",
+        "expected_installer_glob",
+        "marker_path",
+    }
+    prompt_target_keywords = [
+        keyword
+        for keyword in _prompt_keyword_candidates(request.user_prompt, limit=8)
+        if keyword not in fallback_stop_words
+    ][:4]
+    if not prompt_target_keywords and last_execution_code:
+        prompt_target_keywords = [
+            keyword
+            for keyword in _prompt_keyword_candidates(last_execution_code, limit=8)
+            if keyword not in fallback_stop_words
+        ][:4]
+    if not prompt_target_keywords:
+        seen_keywords: set[str] = set()
+        for source_text in (str(request.user_prompt or ""), last_execution_code):
+            if prompt_target_keywords:
+                break
+            for token in re.findall(r"[a-z0-9가-힣][a-z0-9가-힣._-]{1,}", source_text.lower()):
+                cleaned = token.strip("._-")
+                if (
+                    not cleaned
+                    or cleaned in fallback_stop_words
+                    or cleaned in seen_keywords
+                    or cleaned.endswith((".json", ".exe", ".msi"))
+                    or cleaned.startswith(("http", "www"))
+                ):
+                    continue
+                min_len = 2 if re.search(r"[가-힣]", cleaned) else 3
+                if len(cleaned) < min_len:
+                    continue
+                seen_keywords.add(cleaned)
+                prompt_target_keywords.append(cleaned)
+                if len(prompt_target_keywords) >= 4:
+                    break
+    prompt_download_glob = _extract_prompt_download_glob(request.user_prompt)
+    if not prompt_download_glob and last_execution_code:
+        prompt_download_glob = _extract_prompt_download_glob(last_execution_code)
+    if prompt_download_glob:
+        download_glob_keywords = [
+            keyword
+            for keyword in _prompt_keyword_candidates(Path(prompt_download_glob).stem, limit=4)
+            if keyword not in fallback_stop_words
+        ]
+        if not download_glob_keywords:
+            download_glob_keywords = [
+                token.strip("._-")
+                for token in re.findall(r"[a-z0-9가-힣][a-z0-9가-힣._-]{1,}", Path(prompt_download_glob).stem.lower())
+                if token.strip("._-") and token.strip("._-") not in fallback_stop_words
+            ][:4]
+        if download_glob_keywords:
+            prompt_target_keywords = list(dict.fromkeys(download_glob_keywords))
     install_marker_path = _extract_prompt_install_marker_path(request.user_prompt)
     launch_marker_path = _extract_prompt_launch_marker_path(request.user_prompt)
     install_marker_expr = (
         f'Path(os.path.expanduser({json.dumps(install_marker_path, ensure_ascii=False)}))'
         if install_marker_path
-        else 'Path.home() / "Downloads" / "computer-use-agent" / "install-success.json"'
+        else 'Path.home() / "Downloads" / "install-success.json"'
     )
     launch_marker_expr = (
         f'Path(os.path.expanduser({json.dumps(launch_marker_path, ensure_ascii=False)}))'
         if launch_marker_path
-        else 'Path.home() / "Downloads" / "computer-use-agent" / "launch-success.json"'
+        else 'Path.home() / "Downloads" / "launch-success.json"'
+    )
+    context_expr = _context_path_expr_for_flow(
+        install_marker_path=install_marker_path,
+        launch_marker_path=launch_marker_path,
+        download_glob=prompt_download_glob,
     )
     return f"""from pathlib import Path
 import json
@@ -2716,6 +3363,8 @@ import time
 
 INSTALL_MARKER_PATH = {install_marker_expr}
 LAUNCH_MARKER_PATH = {launch_marker_expr}
+CONTEXT_PATH = {context_expr}
+PROMPT_TARGETS = {json.dumps(prompt_target_keywords, ensure_ascii=False)}
 EXTRA_TARGETS = {json.dumps(extra_targets, ensure_ascii=False)}
 GENERIC_TARGET_TOKENS = {{
     "setup",
@@ -2758,15 +3407,19 @@ SYSTEM_APP_NAMES = {{
 }}
 
 LAUNCH_MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+CONTEXT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-def _normalize_tokens(values) -> list[str]:
+def _normalize_tokens(values, *, skip_extension_tokens: bool = False) -> list[str]:
     import re
 
+    extension_tokens = ("exe", "msi", "bat", "cmd", "lnk", "com", "scr")
     normalized = []
     seen = set()
     for raw in values:
         for token in re.split(r"[^0-9a-zA-Z가-힣]+", str(raw or "").lower()):
             cleaned = token.strip()
+            if skip_extension_tokens and cleaned in extension_tokens:
+                continue
             if not cleaned or cleaned in GENERIC_TARGET_TOKENS or cleaned in seen:
                 continue
             min_len = 2 if any("\\uac00" <= ch <= "\\ud7a3" for ch in cleaned) else 3
@@ -2776,7 +3429,8 @@ def _normalize_tokens(values) -> list[str]:
             normalized.append(cleaned)
     return normalized
 
-TARGET_KEYWORDS = _normalize_tokens([*EXTRA_TARGETS, INSTALL_MARKER_PATH.parent.name])
+TARGET_KEYWORDS = _normalize_tokens([*PROMPT_TARGETS, *EXTRA_TARGETS], skip_extension_tokens=True)
+FILENAME_TARGET_KEYWORDS = _normalize_tokens(PROMPT_TARGETS, skip_extension_tokens=True)
 
 def _is_temp_like_path(path: Path) -> bool:
     lowered = str(path).lower().replace("\\\\", "/")
@@ -2915,9 +3569,24 @@ def _read_install_marker_candidate() -> Path | None:
     if not raw:
         return None
     candidate = Path(os.path.expandvars(raw))
-    if _is_valid_installed_executable(candidate):
+    if _is_valid_installed_executable(candidate) and (
+        not FILENAME_TARGET_KEYWORDS or any(keyword in str(candidate).lower() for keyword in FILENAME_TARGET_KEYWORDS)
+    ):
         return candidate
     print(f"ignoring invalid install marker candidate: {{candidate}}")
+    return None
+
+def _read_context_candidate() -> Path | None:
+    context_payload = read_action_context(CONTEXT_PATH)
+    raw = str(context_payload.get("installed_exe") or context_payload.get("launch_exe") or "").strip().strip('"')
+    if not raw:
+        return None
+    candidate = Path(os.path.expandvars(os.path.expanduser(raw)))
+    if _is_valid_installed_executable(candidate) and (
+        not FILENAME_TARGET_KEYWORDS or any(keyword in str(candidate).lower() for keyword in FILENAME_TARGET_KEYWORDS)
+    ):
+        return candidate
+    print(f"ignoring invalid context candidate: {{candidate}}")
     return None
 
 def find_installed_executable() -> Path | None:
@@ -2930,6 +3599,8 @@ def find_installed_executable() -> Path | None:
             return
         seen.add(key)
         score, matched_keywords, mtime = _score_path(candidate)
+        if FILENAME_TARGET_KEYWORDS and not any(keyword in key for keyword in FILENAME_TARGET_KEYWORDS):
+            return
         if score <= 0 or matched_keywords <= 0 or not _is_valid_installed_executable(candidate):
             return
         candidates.append((score + bonus, matched_keywords, mtime, candidate))
@@ -2937,6 +3608,9 @@ def find_installed_executable() -> Path | None:
     marker_candidate = _read_install_marker_candidate()
     if marker_candidate is not None:
         _append_candidate(marker_candidate, bonus=60)
+    context_candidate = _read_context_candidate()
+    if context_candidate is not None:
+        _append_candidate(context_candidate, bonus=70)
     for candidate in _iter_registry_candidate_paths():
         _append_candidate(candidate, bonus=40)
 
@@ -3019,6 +3693,12 @@ while time.time() < deadline:
     if _process_running(exe_path):
         _focus_window()
         write_launch_marker(exe_path)
+        write_action_context(
+            CONTEXT_PATH,
+            phase="launched",
+            installed_exe=str(exe_path),
+            launch_exe=str(exe_path),
+        )
         print(f"launch complete: {{exe_path}}")
         sys.exit(0)
     _focus_window()
@@ -4276,6 +4956,7 @@ def _looks_like_download_chunk_completed(*, user_prompt: str, last_execution: di
         "download recovered from official page:",
         "existing installer found:",
         "using existing installer:",
+        "using context installer:",
     )
     if not any(marker in combined for marker in success_markers):
         return False
@@ -5138,6 +5819,18 @@ def _should_use_framework_visible_installer_recovery(request: StepRequest) -> bo
 
 def _should_use_framework_visible_launch_recovery(request: StepRequest) -> bool:
     if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    last_execution_payload = dict(request.last_execution.get("payload_metadata") or {})
+    last_execution_code = str(last_execution_payload.get("executed_python_code") or "").lower()
+    if any(
+        token in last_execution_code
+        for token in (
+            "expected_installer_glob",
+            "find_existing_installer(",
+            "advance_visible_installer_flow(",
+            "installer ui flow did not produce",
+        )
+    ):
         return False
     return _looks_like_launch_app_chunk_task(request.user_prompt)
 

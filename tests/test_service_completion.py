@@ -334,6 +334,22 @@ def test_framework_visible_launch_recovery_selected_for_gui_first_launch_chunk()
     assert _should_use_framework_visible_launch_recovery(request) is True
 
 
+def test_framework_visible_launch_recovery_not_selected_during_installer_replan() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Prefer reading `~/Downloads/install-success.json` first, "
+            "launch the installed app once, and write `~/Downloads/launch-success.json` after launch succeeded."
+        ),
+        execution_style="gui_first",
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": "EXPECTED_INSTALLER_GLOB = \"TargetApp_Setup.exe\"\nflow = advance_visible_installer_flow(timeout_s=8.0)",
+            }
+        },
+    )
+    assert _should_use_framework_visible_launch_recovery(request) is False
+
+
 def test_visible_flow_extra_targets_ignore_helper_names_and_keep_app_keyword() -> None:
     request = StepRequest(
         user_prompt=(
@@ -360,10 +376,31 @@ def test_synthesized_visible_launch_recovery_ignores_invalid_install_marker_and_
     code = _synthesized_visible_launch_recovery_code(request)
     assert 'INSTALL_MARKER_PATH = Path(os.path.expanduser("~/Downloads/computer-use-agent/targetapp/install-success.json"))' in code
     assert 'LAUNCH_MARKER_PATH = Path(os.path.expanduser("~/Downloads/computer-use-agent/targetapp/launch-success.json"))' in code
+    assert 'CONTEXT_PATH = Path(os.path.expanduser("~/Downloads/computer-use-agent/targetapp/computer-use-agent-context.json"))' in code
     assert "ignoring invalid install marker candidate" in code
+    assert "_read_context_candidate()" in code
     assert "_iter_registry_candidate_paths()" in code
     assert "_process_running(exe_path)" in code
     assert "write_launch_marker(exe_path)" in code
+    assert "write_action_context(" in code
+
+
+def test_synthesized_visible_launch_recovery_defaults_to_downloads_marker_and_prompt_targets() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Use Python to confirm the installed TargetApp desktop app is launchable and running. "
+            "If it is not already open, start TargetApp from the installed app or shortcut. "
+            "source task: targetapp를 설치해줘"
+        ),
+        execution_style="gui_first",
+    )
+    code = _synthesized_visible_launch_recovery_code(request)
+    assert 'INSTALL_MARKER_PATH = Path.home() / "Downloads" / "install-success.json"' in code
+    assert 'LAUNCH_MARKER_PATH = Path.home() / "Downloads" / "launch-success.json"' in code
+    assert 'CONTEXT_PATH = Path.home() / "Downloads" / "computer-use-agent-context.json"' in code
+    assert 'PROMPT_TARGETS = ["targetapp"]' in code
+    assert "FILENAME_TARGET_KEYWORDS = _normalize_tokens(PROMPT_TARGETS, skip_extension_tokens=True)" in code
+    assert "if FILENAME_TARGET_KEYWORDS and not any(keyword in key for keyword in FILENAME_TARGET_KEYWORDS):" in code
 
 
 def test_fallback_browser_search_url_uses_korean_download_terms_for_hangul_tasks() -> None:
@@ -432,6 +469,26 @@ def test_synthesized_visible_download_completion_code_retries_visible_flow_befor
     assert "advanced visible download flow retry" in code
     assert "page_down_browser_view(steps=1)" in code
     assert "download_official_installer_from_page(" in code
+    assert "CONTEXT_PATH = Path(os.path.expanduser(\"~/Downloads/computer-use-agent/targetapp-1234/computer-use-agent-context.json\"))" in code
+    assert "read_action_context(CONTEXT_PATH)" in code
+    assert "write_action_context(" in code
+
+
+def test_synthesized_visible_installer_recovery_uses_context_path_and_context_installer() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Use executable Python only. Find the existing installer `.exe` in "
+            "`%USERPROFILE%\\\\Downloads\\\\computer-use-agent\\\\targetapp-1234\\\\`, launch it once, "
+            "and end only when you have written `~/Downloads/computer-use-agent/targetapp-1234/install-success.json`."
+        ),
+        execution_style="gui_first",
+    )
+    code = _synthesized_visible_installer_recovery_code(request)
+    assert 'CONTEXT_PATH = Path(os.path.expanduser("~/Downloads/computer-use-agent/targetapp-1234/computer-use-agent-context.json"))' in code
+    assert "context_installer = _context_candidate(context_payload.get(\"installer_path\"))" in code
+    assert "write_action_context(" in code
+    assert "phase=\"installer_started\"" in code
+    assert "phase=\"installed\"" in code
 
 
 def test_extract_prompt_download_glob_uses_official_exe_url_basename() -> None:
@@ -502,6 +559,22 @@ def test_synthesized_visible_installer_recovery_prefers_prompt_named_installer()
     code = _synthesized_visible_installer_recovery_code(request)
     assert 'EXPECTED_INSTALLER_GLOB = "TargetApp_Setup.exe"' in code
     assert "for path in TARGET_DIR.glob(pattern):" in code
+
+
+def test_synthesized_visible_installer_recovery_does_not_use_extension_token_as_filename_target() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Locate `~/Downloads/TargetApp_Setup.exe`, verify it is the downloaded Windows installer, "
+            "and run it with Python automation."
+        ),
+        execution_style="gui_first",
+    )
+    code = _synthesized_visible_installer_recovery_code(request)
+    assert "def _normalize_tokens(values, *, skip_extension_tokens: bool = False)" in code
+    assert "extension_tokens = {\"exe\", \"msi\", \"bat\", \"cmd\", \"lnk\", \"com\", \"scr\"}" in code
+    assert "FILENAME_TARGET_KEYWORDS = _normalize_tokens(" in code
+    assert "[path.stem for path in INSTALLERS]" in code
+    assert "*[path.name for path in INSTALLERS]" not in code.split("FILENAME_TARGET_KEYWORDS =", 1)[1].split("def _is_temp_like_path", 1)[0]
 
 
 def test_expand_runtime_helpers_includes_browser_region_heuristic_click() -> None:
