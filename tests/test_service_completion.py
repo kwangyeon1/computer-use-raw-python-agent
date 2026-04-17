@@ -3,6 +3,8 @@ from __future__ import annotations
 from computer_use_raw_python_agent.service import (
     _dependency_repair_user_prompt,
     _expand_runtime_helpers,
+    _fallback_browser_search_url,
+    _generated_code_ignores_prompt_urls,
     _has_visible_gui_continuation_cues,
     _infer_response_done,
     _looks_like_gui_first_silent_install_shortcut,
@@ -20,11 +22,14 @@ from computer_use_raw_python_agent.service import (
     _looks_like_opened_page_only_step,
     _looks_like_reported_failure,
     _normalize_missing_module_install_name,
+    _prepare_python_code_for_execution,
     _prompt_keyword_candidates,
     _rewrite_user_prompt_for_replan,
     _retry_token_budget,
+    _synthesized_visible_ui_click_recovery_code,
     _should_use_framework_official_download_recovery,
     _should_omit_screenshot_for_generation,
+    _visible_flow_extra_targets,
 )
 from computer_use_raw_python_agent.models import StepRequest
 
@@ -112,6 +117,24 @@ def test_visible_gui_continuation_cues_detected_after_browser_open_when_screensh
     assert _has_visible_gui_continuation_cues(request) is True
 
 
+def test_visible_gui_continuation_cues_detected_from_ocr_observation_text() -> None:
+    request = StepRequest(
+        user_prompt="어떤 프로그램을 설치해줘",
+        execution_style="gui_first",
+        observation_text="OCR visible text: 공식 다운로드 페이지 | 다운로드 버튼 | Windows",
+    )
+    assert _has_visible_gui_continuation_cues(request) is True
+
+
+def test_visible_gui_continuation_cues_ignore_generic_ocr_text_without_browser_markers() -> None:
+    request = StepRequest(
+        user_prompt="어떤 프로그램을 설치해줘",
+        execution_style="gui_first",
+        observation_text="OCR visible text: ./venv/bin/training-generator | --execution-style gui_first | response.json",
+    )
+    assert _has_visible_gui_continuation_cues(request) is False
+
+
 def test_download_prompt_with_downloads_destination_is_not_treated_as_existing_installer_launch_task() -> None:
     prompt = (
         "Use Python to open the official installation page, extract the latest Windows installer `.exe` link, "
@@ -134,6 +157,146 @@ def test_gui_first_download_retry_keeps_screenshot_for_generation() -> None:
         execution_style="gui_first",
         last_execution={"stdout_tail": "download retry", "stderr_tail": ""},
     ) is False
+
+
+def test_prepare_python_code_for_execution_auto_clicks_download_control_for_gui_first_visible_ui() -> None:
+    request = StepRequest(
+        user_prompt="Use Python to open the official vendor page and download the Windows installer `.exe`.",
+        execution_style="gui_first",
+        screenshot_base64="ZmFrZQ==",
+        observation_text="OCR visible text with download/install cues: Download | Windows | Setup",
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://vendor.example/download", expected_title_tokens=["download"])',
+            }
+        },
+    )
+    prepared = _prepare_python_code_for_execution(request, 'print("continue")')
+    assert "advance_visible_download_flow(" in prepared
+    assert "wait_for_stable_download(" in prepared
+    assert "visible download automation incomplete:" in prepared
+
+
+def test_prepare_python_code_for_execution_replaces_gui_first_http_bypass_with_browser_click_flow() -> None:
+    request = StepRequest(
+        user_prompt="카카오톡 pc버전 프로그램을 설치해줘",
+        execution_style="gui_first",
+    )
+    prepared = _prepare_python_code_for_execution(
+        request,
+        """import urllib.request
+html = urllib.request.urlopen("https://example.com").read().decode("utf-8")
+print(html[:100])
+""",
+    )
+    assert "open_url_and_wait(" in prepared
+    assert "advance_visible_download_flow(" in prepared
+    assert "wait_for_stable_download(" in prepared
+    assert "urllib.request.urlopen" not in prepared
+
+
+def test_prepare_python_code_for_execution_does_not_treat_file_write_as_gui_progress() -> None:
+    request = StepRequest(
+        user_prompt="targetapp 설치 파일을 받아줘",
+        execution_style="gui_first",
+    )
+    prepared = _prepare_python_code_for_execution(
+        request,
+        """from pathlib import Path
+import urllib.request
+dest = Path.home() / "Downloads" / "targetapp.exe"
+with urllib.request.urlopen("https://example.com/download", timeout=30) as response, open(dest, "wb") as fh:
+    fh.write(response.read())
+print(dest)
+""",
+    )
+    assert "advance_visible_download_flow(" in prepared
+    assert "urllib.request.urlopen" not in prepared
+
+
+def test_prepare_python_code_for_execution_auto_clicks_search_result_for_visible_search_results() -> None:
+    request = StepRequest(
+        user_prompt="Use Python to open the official vendor page and download the Windows installer `.exe`.",
+        execution_style="gui_first",
+        screenshot_base64="ZmFrZQ==",
+        observation_text="search results | official download | windows",
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.bing.com/search?q=targetapp+official+windows+download", expected_title_tokens=["targetapp"])',
+            }
+        },
+    )
+    prepared = _prepare_python_code_for_execution(request, 'print("continue")')
+    assert "advance_visible_download_flow(" in prepared
+    assert "search_first=True" in prepared
+
+
+def test_fallback_browser_search_url_uses_korean_download_terms_for_hangul_tasks() -> None:
+    url = _fallback_browser_search_url("카카오톡 pc버전 프로그램을 설치해줘")
+    assert url is not None
+    assert "%EA%B3%B5%EC%8B%9D" in url
+    assert "%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C" in url
+
+
+def test_expand_runtime_helpers_includes_browser_region_heuristic_click() -> None:
+    expanded = _expand_runtime_helpers("click_search_result_like_target(extra_targets=['targetapp'])")
+    assert "def _heuristic_browser_click(" in expanded
+    assert "browser_search_result_region" in expanded
+    assert "screen-browser-region-fallback" in expanded
+    assert "crop_region=browser_region" in expanded
+
+
+def test_prompt_url_violation_allows_gui_first_search_discovery_flow() -> None:
+    user_prompt = (
+        "Use Python to continue from the visible browser first and download the Windows installer. "
+        "Official URL: https://pc.example.com/download"
+    )
+    search_url = "https://www.bing.com/search?q=targetapp%20official%20windows%20download"
+    code = f"""open_url_and_wait({search_url!r}, expected_title_tokens=["targetapp"])
+flow = advance_visible_download_flow(extra_targets=["targetapp"], search_first=True, timeout_s=18.0)
+print(flow)
+"""
+    assert (
+        _generated_code_ignores_prompt_urls(
+            user_prompt=user_prompt,
+            python_code=code,
+            active_replan_reasons=[],
+        )
+        is False
+    )
+
+
+def test_prompt_url_violation_still_detects_unrelated_url() -> None:
+    user_prompt = (
+        "Use Python to continue from the visible browser first and download the Windows installer. "
+        "Official URL: https://pc.example.com/download"
+    )
+    code = """open_url_and_wait("https://malicious.example/download", expected_title_tokens=["bad"])
+print("continue")
+"""
+    assert (
+        _generated_code_ignores_prompt_urls(
+            user_prompt=user_prompt,
+            python_code=code,
+            active_replan_reasons=[],
+        )
+        is True
+    )
+
+
+def test_visible_ui_click_recovery_uses_search_result_helper_for_search_results() -> None:
+    request = StepRequest(
+        user_prompt="targetapp를 설치해줘",
+        execution_style="gui_first",
+        observation_text="search results | official download | windows",
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.bing.com/search?q=targetapp+official+windows+download", expected_title_tokens=["targetapp"])',
+            }
+        },
+    )
+    recovery_code = _synthesized_visible_ui_click_recovery_code(request)
+    assert "click_search_result_like_target(" in recovery_code
 
 
 def test_reported_failure_detected_from_stdout_or_stderr_even_with_zero_exit_code() -> None:
@@ -323,6 +486,94 @@ def test_prompt_keyword_candidates_drop_generic_gui_first_words() -> None:
     assert "app" not in keywords
 
 
+def test_prompt_keyword_candidates_include_url_host_tokens_for_korean_task() -> None:
+    text = (
+        'source_task": "카카오톡 pc버전 프로그램을 설치해줘"\n'
+        "Official URL: https://pc.kakao.com/download"
+    )
+    keywords = _prompt_keyword_candidates(text)
+    assert "카카오톡" in keywords
+    assert "kakao" in keywords
+
+
+def test_prompt_keyword_candidates_drop_replan_words() -> None:
+    text = (
+        "REPLAN OVERRIDE FOR THIS STEP: Previous attempt failed. "
+        "Use the current screenshot as the primary source of truth for the next action."
+    )
+    keywords = _prompt_keyword_candidates(text)
+    assert "replan" not in keywords
+    assert "override" not in keywords
+    assert "previous" not in keywords
+    assert "attempt" not in keywords
+
+
+def test_visible_flow_extra_targets_use_observation_text_keywords_when_replan_prompt_is_generic() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Return executable Python only.\n"
+            "The previous attempt already opened the relevant browser page."
+        ),
+        execution_style="gui_first",
+        observation_text="OCR visible text with download/install cues: 카카오톡 official windows download | 다운로드",
+    )
+    keywords = _visible_flow_extra_targets(request, limit=4)
+    assert "카카오톡" in keywords
+    assert "replan" not in keywords
+
+
+def test_visible_flow_extra_targets_prefer_task_and_prompt_url_over_noisy_ocr() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Return executable Python only.\n"
+            "Use executable Python on the Windows machine to obtain the official Windows installer `.exe` "
+            "for the target app from this task: 카카오톡 pc버전 프로그램을 설치해줘.\n"
+            "Use these exact official page URLs first before any search engine result or inferred domain:\n"
+            "- https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko\n"
+        ),
+        execution_style="gui_first",
+        observation_text="OCR visible text with download/install cues: -executi on-style | 다운로드 0",
+    )
+    keywords = _visible_flow_extra_targets(request, limit=4)
+    assert "카카오톡" in keywords
+    assert "kakaocorp" in keywords
+    assert "executi" not in keywords
+    assert "on-style" not in keywords
+
+
+def test_visible_flow_extra_targets_use_last_execution_prompt_url_on_retry() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Return executable Python only.\n"
+            "The current screenshot clearly shows the browser path is impossible.\n"
+        ),
+        execution_style="gui_first",
+        observation_text="OCR visible text with download/install cues: 다. 해당 테스트만 다시 확인합니다. | 다운로드 0",
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko", expected_title_tokens=["카카오톡", "kakaocorp"])',
+            }
+        },
+    )
+    keywords = _visible_flow_extra_targets(request, limit=4)
+    assert "카카오톡" in keywords
+    assert "kakaocorp" in keywords
+    assert "해당" not in keywords
+    assert "테스트만" not in keywords
+
+
+def test_prompt_keyword_candidates_ignore_percent_encoded_fragments() -> None:
+    text = (
+        "Open https://pc.example.com/talk/notices/en%3Fagent%3Dwin32 and continue the official flow."
+    )
+    keywords = _prompt_keyword_candidates(text)
+    assert "3fagent" not in keywords
+    assert "3dwin32" not in keywords
+
+
 def test_visible_gui_continuation_cues_detected_for_gui_first_request() -> None:
     request = StepRequest(
         user_prompt=(
@@ -473,6 +724,30 @@ print(opened)
     assert 'expected_title_tokens=["kakao", "kakaotalk"]' in expanded
 
 
+def test_expand_runtime_helpers_injects_recursive_download_click_helpers() -> None:
+    code = """result = click_download_like_target(timeout_s=8.0)
+print(result)
+"""
+    expanded = _expand_runtime_helpers(code)
+    assert "def click_download_like_target(" in expanded
+    assert "def click_text_targets(" in expanded
+    assert "def ocr_screen_text_regions(" in expanded
+    assert '"download",' in expanded
+    assert 'click_horizontal_bias="matched_token_right"' in expanded
+    assert "browser_download_cta_region" in expanded
+
+
+def test_expand_runtime_helpers_injects_advance_visible_download_flow_definition() -> None:
+    code = """result = advance_visible_download_flow(extra_targets=["targetapp"], search_first=True, timeout_s=18.0)
+print(result)
+"""
+    expanded = _expand_runtime_helpers(code)
+    assert "def advance_visible_download_flow(" in expanded
+    assert "def click_search_result_like_target(" in expanded
+    assert "def click_download_like_target(" in expanded
+    assert 'search_first=True' in expanded
+
+
 def test_framework_official_download_recovery_reuses_only_matching_existing_installer_keywords() -> None:
     code = _synthesized_official_download_recovery_code_for_test(
         user_prompt=(
@@ -542,6 +817,7 @@ def test_replan_prompt_rewrite_for_gui_first_download_after_browser_open() -> No
     assert "Treat the current screenshot as the primary source of truth" in rewritten
     assert "Continue from the visible browser/download UI with Python GUI automation" in rewritten
     assert "Do not use urllib, requests, regex-based HTML scraping" in rewritten
+    assert "click_download_like_target() or click_text_targets([...])" in rewritten
     assert "click the visible download control" in rewritten
 
 

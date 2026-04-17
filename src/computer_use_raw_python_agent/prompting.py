@@ -33,6 +33,9 @@ Avoid docstrings and explanatory comments unless absolutely necessary.
 Do not stop after imports, variable setup, or print statements; perform the task in the same script.
 Prefer helper functions when possible:
 - open_url_and_wait
+- ocr_screen_text_regions
+- click_text_targets
+- click_download_like_target
 - focus_window
 - press_key
 - press_hotkey
@@ -146,6 +149,7 @@ GUI_FIRST_EXECUTION_APPEND = """
 Execution style: gui_first
 - Continue returning executable Python only, but prefer browser/UI-driven progression when relevant UI is already visible.
 - When a browser page, search results page, vendor page, installer wizard, UAC prompt, or completion dialog is already on screen, prefer advancing that visible state before bypassing it with a fresh direct download or silent install attempt.
+- When a visible page likely contains a download or installer control, prefer OCR-grounded helpers such as `click_download_like_target()` or `click_text_targets([...])` before switching to HTTP fetching or HTML parsing.
 - For download/install tasks, it is acceptable to navigate search results, click visible official download controls, use browser download UI, and drive installer dialogs like a user when that is the most grounded next action from the screenshot.
 - If the current screenshot or prompt indicates a grounded browser/download/installer UI path, do not switch to new urllib/requests HTML scraping, regex-based direct artifact discovery, or fresh silent-install shortcuts in the same step unless the latest execution clearly shows that visible UI path failed or stalled.
 - For install-launch chunks where the installer `.exe` is already present, do not start by retrying `/VERYSILENT`, `/SILENT`, `/SP-`, or `/NORESTART` unless the latest execution already proved a normal visible installer flow is impossible.
