@@ -565,33 +565,98 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
         destination_dir = downloads / relative_dir
         destination_dir.mkdir(parents=True, exist_ok=True)
 
-    request = urllib.request.Request(target_url, headers={"User-Agent": user_agent})
-    with urllib.request.urlopen(request, timeout=60) as response:
+    def _registrable_host(host):
+        labels = [label for label in str(host or "").lower().split(".") if label]
+        if len(labels) >= 2:
+            return ".".join(labels[-2:])
+        return str(host or "").lower()
+
+    def _normalized_html(raw_html):
+        return (
+            str(raw_html or "")
+            .replace("\\\\u002F", "/")
+            .replace("\\\\u003A", ":")
+            .replace("\\\\/", "/")
+            .replace("&amp;", "&")
+        )
+
+    def _extract_page_links(base_url, html_text, *, allowed_registrable):
+        page_candidates = []
+        seen_pages = set()
+        for raw in re.findall(r'(?:href|src)\\s*=\\s*["\\']([^"\\']+)["\\']', html_text, flags=re.IGNORECASE):
+            resolved = urljoin(base_url, str(raw).split("#", 1)[0])
+            lowered = resolved.lower()
+            if not lowered.startswith("http") or lowered in seen_pages:
+                continue
+            parsed = urlparse(resolved)
+            registrable = _registrable_host(parsed.netloc)
+            if registrable != allowed_registrable:
+                continue
+            path_lower = unquote(parsed.path).lower()
+            if path_lower.endswith(".exe"):
+                continue
+            if not any(marker in path_lower for marker in ("download", "downloads", "release", "releases", "files", "file", "community", "edition", "windows")):
+                continue
+            seen_pages.add(lowered)
+            page_candidates.append(resolved)
+        return page_candidates
+
+    def _extract_exe_links(base_url, html_text):
+        exe_candidates = []
+        seen_exe = set()
+        patterns = (
+            r'https?://[^\\s"\\'<>]+\\.exe(?:\\?[^\\s"\\'<>]*)?',
+            r'(?:href|src)\\s*=\\s*["\\']([^"\\']+\\.exe[^"\\']*)["\\']',
+        )
+        for pattern in patterns:
+            for raw in re.findall(pattern, html_text, flags=re.IGNORECASE):
+                resolved = urljoin(base_url, str(raw).split("#", 1)[0])
+                lowered = resolved.lower()
+                if lowered in seen_exe or not lowered.startswith("http"):
+                    continue
+                seen_exe.add(lowered)
+                exe_candidates.append(resolved)
+        return exe_candidates
+
+    initial_request = urllib.request.Request(target_url, headers={"User-Agent": user_agent})
+    with urllib.request.urlopen(initial_request, timeout=60) as response:
         final_page_url = response.geturl()
         html_text = response.read().decode("utf-8", errors="ignore")
 
-    normalized_text = (
-        html_text
-        .replace("\\\\u002F", "/")
-        .replace("\\\\u003A", ":")
-        .replace("\\\\/", "/")
-        .replace("&amp;", "&")
-    )
-
+    base_registrable = _registrable_host(urlparse(final_page_url).netloc)
+    page_queue = [final_page_url]
+    visited_pages = set()
     candidates = []
     seen = set()
-    patterns = (
-        r'https?://[^\\s"\\'<>]+\\.exe',
-        r'(?:href|src)\\s*=\\s*["\\']([^"\\']+\\.exe[^"\\']*)["\\']',
-    )
-    for pattern in patterns:
-        for raw in re.findall(pattern, normalized_text, flags=re.IGNORECASE):
-            resolved = urljoin(final_page_url, str(raw).split("#", 1)[0])
-            lowered = resolved.lower()
-            if lowered in seen or not lowered.startswith("http"):
+    page_budget = 0
+    while page_queue and page_budget < 8:
+        page_budget += 1
+        current_page = page_queue.pop(0)
+        current_key = current_page.lower()
+        if current_key in visited_pages:
+            continue
+        visited_pages.add(current_key)
+        if current_page == final_page_url:
+            current_html = _normalized_html(html_text)
+        else:
+            page_request = urllib.request.Request(current_page, headers={"User-Agent": user_agent})
+            with urllib.request.urlopen(page_request, timeout=60) as response:
+                current_page = response.geturl()
+                if _registrable_host(urlparse(current_page).netloc) != base_registrable:
+                    continue
+                current_html = _normalized_html(response.read().decode("utf-8", errors="ignore"))
+
+        for page_link in _extract_page_links(current_page, current_html, allowed_registrable=base_registrable):
+            page_key = page_link.lower()
+            if page_key not in visited_pages and page_key not in {value.lower() for value in page_queue}:
+                page_queue.append(page_link)
+
+        for candidate in _extract_exe_links(current_page, current_html):
+            lowered = candidate.lower()
+            if lowered in seen:
                 continue
             seen.add(lowered)
-            candidates.append(resolved)
+            candidates.append(candidate)
 
     def _score(url):
         lowered = unquote(urlparse(url).path).lower()
@@ -2578,6 +2643,8 @@ def _context_path_expr_for_flow(
     normalized_glob = str(download_glob or "").strip().replace("\\", "/")
     if "/" in normalized_glob:
         context_dir = normalized_glob.rsplit("/", 1)[0]
+        if not context_dir.startswith("~/") and not context_dir.startswith("/"):
+            context_dir = f"~/Downloads/{context_dir.lstrip('/')}"
         return f'Path(os.path.expanduser({json.dumps(context_dir + "/computer-use-agent-context.json", ensure_ascii=False)}))'
     return 'Path.home() / "Downloads" / "computer-use-agent-context.json"'
 
@@ -2637,9 +2704,11 @@ def _synthesized_visible_download_completion_code(
         install_marker_path=_extract_prompt_install_marker_path(request.user_prompt),
         launch_marker_path=_extract_prompt_launch_marker_path(request.user_prompt),
     )
-    if prompt_url and not initial_search_first:
+    if not prompt_url:
         fallback_search_url = _fallback_browser_search_url(request.user_prompt)
     lines: list[str] = []
+    lines.append("import fnmatch")
+    lines.append("from pathlib import Path")
     lines.append(f"search_first = {repr(bool(initial_search_first))}")
     lines.append(f"CONTEXT_PATH = {context_path_expr}")
     if prompt_url:
@@ -2654,17 +2723,6 @@ def _synthesized_visible_download_completion_code(
         lines.append(
             'open_url_and_wait(prompt_url, '
             f'expected_title_tokens={json.dumps(extra_targets, ensure_ascii=False)})'
-        )
-        lines.extend(
-            [
-                "if fallback_search_url and browser_page_has_error_state(expected_title_tokens="
-                f"{json.dumps(extra_targets, ensure_ascii=False)}):",
-                "    open_url_and_wait(",
-                "        fallback_search_url,",
-                f"        expected_title_tokens={json.dumps(extra_targets, ensure_ascii=False)},",
-                "    )",
-                "    search_first = True",
-            ]
         )
     lines.extend(
         [
@@ -2685,15 +2743,29 @@ def _synthesized_visible_download_completion_code(
                 "    context_payload = read_action_context(CONTEXT_PATH)",
                 '    context_installer = str(context_payload.get("installer_path") or "").strip().strip(\'"\')',
                 "    if context_installer:",
-                "        try:",
-                "            installer = wait_for_stable_download(",
-                "                context_installer,",
-                "                min_bytes=1_000_000,",
-                "                timeout_s=8.0,",
-                "            )",
-                '            print(f"using context installer: {installer}")',
-                "        except SystemExit as context_exc:",
-                '            print(f"ignoring stale context installer: {context_exc}")',
+                "        context_installer_lower = str(context_installer).lower()",
+                "        context_installer_name = Path(context_installer).name.lower()",
+                "        context_matches_glob = True",
+                "        context_matches_keywords = True",
+                f"        expected_download_glob = {json.dumps(download_glob.lower(), ensure_ascii=False)}",
+                "        if expected_download_glob:",
+                "            context_matches_glob = fnmatch.fnmatch(context_installer_name, expected_download_glob)",
+                f"        target_keywords = {[str(item).lower() for item in extra_targets]}",
+                "        if target_keywords:",
+                "            context_matches_keywords = any(keyword in context_installer_lower for keyword in target_keywords)",
+                "        if context_matches_glob and context_matches_keywords:",
+                "            try:",
+                "                installer = wait_for_stable_download(",
+                "                    context_installer,",
+                "                    min_bytes=1_000_000,",
+                "                    timeout_s=8.0,",
+                "                )",
+                '                print(f"using context installer: {installer}")',
+                "            except SystemExit as context_exc:",
+                '                print(f"ignoring stale context installer: {context_exc}")',
+                "                installer = None",
+                "        else:",
+                '            print(f"ignoring mismatched context installer: {context_installer}")',
                 "            installer = None",
                 "    last_download_error = None",
                 "    for download_attempt in range(2):",
@@ -4435,6 +4507,36 @@ def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
     text = str(user_prompt or "").lower()
     if "launch-success.json" in text or "launch marker" in text:
         return False
+    download_stage_markers = (
+        "obtain the official windows installer",
+        "download the official windows installer",
+        "download the windows installer",
+        "download the installer",
+        "download the official",
+        "save it to",
+        "save it into",
+        "downloads folder",
+        "download completed",
+        "다운로드하세요",
+        "다운로드가 끝나면",
+        "다운로드 버튼",
+        "다운로드 진행 ui",
+    )
+    strong_install_markers = (
+        "run the installer",
+        "launch the installer",
+        "installer wizard",
+        "uac prompt",
+        "license dialog",
+        "destination dialog",
+        "completion dialog",
+        "do not download anything in this chunk",
+        "설치 ui가 없을 때만",
+        "설치 ui가 없으면",
+        "설치 마법사",
+        "uac가 뜨면",
+        "찾아 실행",
+    )
     launch_markers = (
         "downloaded installer",
         "already exists in downloads",
@@ -4454,6 +4556,10 @@ def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
         "launch the installer",
         "installer wizard",
         "uac prompt",
+        "license dialog",
+        "destination dialog",
+        "completion dialog",
+        "do not download anything in this chunk",
         "이미 다운로드된 installer",
         "이미 다운로드된 설치 파일",
         "다운로드된 installer",
@@ -4466,10 +4572,25 @@ def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
     )
     if not _looks_like_download_or_install_task(text):
         return False
+    if any(marker in text for marker in download_stage_markers) and not any(marker in text for marker in strong_install_markers):
+        return False
     if any(marker in text for marker in launch_markers):
         return True
     has_installer_artifact = any(token in text for token in (".exe", "installer", "setup", "설치 파일"))
     has_existing_location = any(token in text for token in ("downloads", "다운로드", "userprofile"))
+    has_existing_installer_signal = any(
+        token in text
+        for token in (
+            "already exists in downloads",
+            "existing installer",
+            "already downloaded",
+            "already present in downloads",
+            "do not download anything in this chunk",
+            "이미 다운로드된",
+            "설치 ui가 없을 때만",
+            "설치 ui가 없으면",
+        )
+    )
     has_run_signal = any(
         token in text
         for token in (
@@ -4489,7 +4610,7 @@ def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
             "마법사",
         )
     )
-    return has_installer_artifact and has_existing_location and has_run_signal
+    return has_installer_artifact and has_existing_location and has_existing_installer_signal and has_run_signal
 
 
 def _looks_like_launch_app_chunk_task(user_prompt: str) -> bool:
@@ -4999,7 +5120,43 @@ def _select_prompt_browser_url(text: str) -> str | None:
             score += 6
         return (score, -len(url))
 
-    return sorted(prompt_urls, key=_score, reverse=True)[0]
+    selected = sorted(prompt_urls, key=_score, reverse=True)[0]
+    return _canonicalize_prompt_browser_url(selected)
+
+
+def _canonicalize_prompt_browser_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return raw
+    parsed = urllib.parse.urlparse(raw)
+    path = str(parsed.path or "")
+    lowered_path = path.lower()
+    if parsed.scheme not in {"http", "https"}:
+        return raw
+    segments = [segment for segment in path.split("/") if segment]
+    if not segments:
+        return raw
+    root = segments[0].lower()
+    if root not in {"download", "downloads"}:
+        return raw
+    if len(segments) <= 1:
+        return raw
+    tail = segments[-1]
+    if "." in tail:
+        return raw
+    canonical_path = f"/{segments[0]}/"
+    if lowered_path == canonical_path.lower():
+        return raw
+    return urllib.parse.urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            canonical_path,
+            "",
+            "",
+            "",
+        )
+    )
 
 
 def _url_looks_like_search_results(url: str | None) -> bool:
@@ -5132,10 +5289,11 @@ def _generated_code_ignores_prompt_urls(
             "click_text_targets(",
             "open_url_and_wait(",
         )
+        prompt_urls_are_search_results = all(_url_looks_like_search_results(url) for url in prompt_urls)
         allowed_discovery_urls = [
             url
             for url in code_urls
-            if _url_looks_like_search_results(url)
+            if prompt_urls_are_search_results and _url_looks_like_search_results(url)
         ]
         if allowed_discovery_urls and any(token in normalized_code for token in visible_download_flow_tokens):
             disallowed_urls = [
@@ -5925,6 +6083,12 @@ def extract_links(base_url: str, html_text: str) -> tuple[list[str], list[str]]:
             exe_links.append(resolved)
     return page_links[:8], exe_links
 
+def registrable_host(host: str) -> str:
+    labels = [label for label in str(host or "").lower().split(".") if label]
+    if len(labels) >= 2:
+        return ".".join(labels[-2:])
+    return str(host or "").lower()
+
 def candidate_destination(url: str) -> Path:
     name = Path(unquote(urlparse(url).path)).name or "installer.exe"
     if not name.lower().endswith(".exe"):
@@ -5950,6 +6114,7 @@ visited_pages = set()
 page_queue = list(PROMPT_URLS)
 exe_candidates: list[str] = []
 seen_candidate_urls = set()
+base_registrables = {registrable_host(urlparse(url).netloc) for url in PROMPT_URLS if url}
 
 while page_queue and len(visited_pages) < 10:
     page_url = page_queue.pop(0)
@@ -5964,6 +6129,8 @@ while page_queue and len(visited_pages) < 10:
         continue
     extra_pages, exe_links = extract_links(final_page_url, html_text)
     for extra_page in extra_pages:
+        if registrable_host(urlparse(extra_page).netloc) not in base_registrables:
+            continue
         if extra_page not in visited_pages:
             page_queue.append(extra_page)
     for exe_url in exe_links:

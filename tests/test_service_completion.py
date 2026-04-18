@@ -438,6 +438,15 @@ def test_select_prompt_browser_url_prefers_korean_locale_for_hangul_task() -> No
     assert _select_prompt_browser_url(prompt) == "https://www.example.com/page/service/app?lang=ko"
 
 
+def test_select_prompt_browser_url_canonicalizes_variant_download_page_to_root_download_page() -> None:
+    prompt = (
+        "Use the official vendor URLs first: "
+        "https://downloads.vendor.example/download/lite/ "
+        "and do not leave the official site."
+    )
+    assert _select_prompt_browser_url(prompt) == "https://downloads.vendor.example/download/"
+
+
 def test_prompt_keyword_candidates_drop_install_control_stopwords() -> None:
     prompt = (
         "Return executable Python only. "
@@ -450,7 +459,7 @@ def test_prompt_keyword_candidates_drop_install_control_stopwords() -> None:
     assert "silent-install" not in keywords
 
 
-def test_synthesized_visible_download_completion_code_adds_search_recovery_for_bad_prompt_url() -> None:
+def test_synthesized_visible_download_completion_code_prefers_official_prompt_url_over_search_fallback() -> None:
     request = StepRequest(
         user_prompt="카카오톡 pc버전 프로그램을 설치해줘",
         execution_style="gui_first",
@@ -459,12 +468,10 @@ def test_synthesized_visible_download_completion_code_adds_search_recovery_for_b
         request,
         prompt_url="https://pc.example.com/talk",
     )
-    assert "fallback_search_url =" in code
+    assert "fallback_search_url = None" in code
     assert 'prompt_url = "https://pc.example.com/talk"' in code
-    assert "browser_page_has_error_state(" in code
-    assert "search_first = True" in code
-    assert "https://www.bing.com/search?q=" in code
-    assert "search_url=fallback_search_url" in code
+    assert "browser_page_has_error_state(" not in code
+    assert "https://www.bing.com/search?q=" not in code
 
 
 def test_synthesized_visible_download_completion_code_retries_visible_flow_before_failing_download_wait() -> None:
@@ -483,6 +490,15 @@ def test_synthesized_visible_download_completion_code_retries_visible_flow_befor
     assert "CONTEXT_PATH = Path(os.path.expanduser(\"~/Downloads/computer-use-agent/targetapp-1234/computer-use-agent-context.json\"))" in code
     assert "read_action_context(CONTEXT_PATH)" in code
     assert "write_action_context(" in code
+
+
+def test_existing_installer_launch_task_does_not_match_download_chunk_prompt() -> None:
+    prompt = (
+        "Use executable Python on the Windows machine to obtain the official Windows installer `.exe` "
+        "and save it to Downloads. If an installer already exists in Downloads you may reuse it instead "
+        "of downloading again, but this chunk is still the download step."
+    )
+    assert _looks_like_existing_installer_launch_task(prompt) is False
 
 
 def test_synthesized_visible_installer_recovery_uses_context_path_and_context_installer() -> None:
@@ -536,8 +552,27 @@ def test_synthesized_visible_download_completion_code_waits_for_prompt_named_ins
         request,
         prompt_url="https://downloads.vendor.example/releases/TargetApp_Setup.exe",
     )
+    assert code.startswith("import fnmatch\nfrom pathlib import Path\n")
     assert 'wait_for_stable_download("TargetApp_Setup.exe"' in code
     assert 'print(f"download ready: {installer}")' in code
+
+
+def test_synthesized_visible_download_completion_code_rejects_mismatched_context_installer() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Open the official vendor download page and download the Windows installer `.exe` "
+            "as `TargetApp_Setup.exe` into Downloads."
+        ),
+        execution_style="gui_first",
+    )
+    code = _synthesized_visible_download_completion_code(
+        request,
+        prompt_url="https://vendor.example/download/",
+    )
+    assert code.startswith("import fnmatch\nfrom pathlib import Path\n")
+    assert "context_installer_name = Path(context_installer).name.lower()" in code
+    assert 'expected_download_glob = "targetapp_setup.exe"' in code
+    assert 'print(f"ignoring mismatched context installer: {context_installer}")' in code
 
 
 def test_existing_installer_launch_task_detected_for_generic_downloaded_installer_prompt() -> None:
@@ -591,10 +626,11 @@ def test_synthesized_visible_installer_recovery_does_not_use_extension_token_as_
     )
     code = _synthesized_visible_installer_recovery_code(request)
     assert "def _normalize_tokens(values, *, skip_extension_tokens: bool = False)" in code
-    assert "extension_tokens = {\"exe\", \"msi\", \"bat\", \"cmd\", \"lnk\", \"com\", \"scr\"}" in code
+    assert "extension_tokens = ('exe', 'msi', 'bat', 'cmd', 'lnk', 'com', 'scr')" in code
     assert "FILENAME_TARGET_KEYWORDS = _normalize_tokens(" in code
-    assert "[path.stem for path in INSTALLERS]" in code
-    assert "*[path.name for path in INSTALLERS]" not in code.split("FILENAME_TARGET_KEYWORDS =", 1)[1].split("def _is_temp_like_path", 1)[0]
+    target_section = code.split("FILENAME_TARGET_KEYWORDS =", 1)[1].split("def _is_temp_like_path", 1)[0]
+    assert "REQUESTED_INSTALLER_KEYWORDS or EXTRA_TARGETS" in target_section
+    assert ".name for path in INSTALLERS" not in target_section
 
 
 def test_expand_runtime_helpers_includes_browser_region_heuristic_click() -> None:
@@ -602,7 +638,7 @@ def test_expand_runtime_helpers_includes_browser_region_heuristic_click() -> Non
     assert "def _heuristic_browser_click(" in expanded
     assert "browser_search_result_region" in expanded
     assert "screen-browser-region-fallback" in expanded
-    assert "crop_region=browser_region" in expanded
+    assert "active_region = _browser_window_region()" in expanded
 
 
 def test_expand_runtime_helpers_includes_responsive_header_menu_flow() -> None:
@@ -655,7 +691,7 @@ def test_expand_runtime_helpers_includes_official_page_download_recovery() -> No
     assert "all official installer candidates failed" in expanded
 
 
-def test_prompt_url_violation_allows_gui_first_search_discovery_flow() -> None:
+def test_prompt_url_violation_rejects_search_discovery_when_official_url_exists() -> None:
     user_prompt = (
         "Use Python to continue from the visible browser first and download the Windows installer. "
         "Official URL: https://pc.example.com/download"
@@ -671,7 +707,7 @@ print(flow)
             python_code=code,
             active_replan_reasons=[],
         )
-        is False
+        is True
     )
 
 
