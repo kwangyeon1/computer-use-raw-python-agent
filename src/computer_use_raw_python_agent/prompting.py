@@ -32,6 +32,11 @@ If you define a helper function, call it in the same script.
 Avoid docstrings and explanatory comments unless absolutely necessary.
 Do not stop after imports, variable setup, or print statements; perform the task in the same script.
 Prefer helper functions when possible:
+- open_url_and_wait
+- ocr_screen_text_regions
+- click_text_targets
+- click_download_like_target
+- open_responsive_header_menu
 - focus_window
 - press_key
 - press_hotkey
@@ -40,6 +45,7 @@ Prefer helper functions when possible:
 - sleep
 - wait_for_window
 - capture_note
+- wait_for_stable_download
 
 If helper functions are not sufficient, direct library usage is allowed.
 Always generate code that can run as a standalone script.
@@ -53,6 +59,7 @@ State-inspection discipline:
 - For download tasks, stay inside Python when possible. Prefer `urllib.request`, `requests`, regex/HTML parsing, and normal Python file I/O over shell-only tools such as `curl`, `wget`, `powershell Invoke-WebRequest`, or launching a local `http.server` helper.
 - On Windows, when writing into user profile paths such as Downloads or Desktop, resolve them with `os.environ`, `Path.home()`, or `os.path.expandvars`. Do not use a literal `%USERPROFILE%` or `%TEMP%` token as an unexpanded path segment.
 - For download tasks, if an official URL is already known from the current page, previous step, or web_search_context, prefer downloading the target file directly into the user's Downloads folder and then verifying the file exists with a plausible size.
+- If the current prompt, current page, or web_search_context already provides one or more official vendor URLs, fetch those exact URLs first before inventing a nearby host, shortened domain, or guessed `latest` path.
 - If a browser already shows search results or a vendor page, use the visible result, current page state, or web_search_context. Do not invent or guess a download URL that is not evidenced by the current screenshot, last_execution, or web_search_context.
 - Prefer official vendor domains and direct artifact URLs. Avoid SEO mirror or third-party download hosts unless the latest evidence clearly shows they are the official source.
 - For download/install tasks, use a deterministic sequence when possible: obtain the official installer, verify the file exists, launch it, detect installer windows, advance the installer, then verify the installed app or executable exists.
@@ -87,8 +94,11 @@ State-inspection discipline:
   `subprocess.Popen([str(app_exe)])`
   `...verify process...`
 - If a direct installer URL returns 404, not found, or another download error, do not guess a nearby filename pattern. Fetch the known official page HTML or current vendor page and extract a fresh official `.exe` link from that source before retrying.
+- Do not treat guessed artifact directories such as `/files/latest`, `/download/latest`, or similar patterns as HTML pages unless that exact URL was already linked from fetched official vendor HTML or provided as an official URL in the prompt/context.
 - If a vendor landing page does not expose a raw installer link, try at least one alternate official page or official release page in the same Python script before giving up.
 - When extracting installer URLs from HTML, do not search only for `href="..."`. Also scan the full HTML/text for absolute `https://...exe` candidates and verify candidate URLs with a real HTTP request before choosing one.
+- When a vendor page contains relative download links, resolve them against the fetched official page with `urllib.parse.urljoin` before filtering or downloading.
+- Do not assume installer URLs contain a version number or match only digit-heavy regex patterns. Accept relative or absolute official `.exe` links when they resolve cleanly.
 - If the previous attempt failed because an external download tool was missing or hung, do not switch to another external tool. Use a pure-Python HTTP request plus HTML parsing flow instead.
 - If a browser already shows a completed download, prefer interacting with the downloaded file path directly instead of repeatedly clicking browser download UI.
 - If an installer is visibly loading, unpacking, or showing a progress dialog, prefer waiting and re-inspecting state over sending blind clicks or Enter presses.
@@ -127,6 +137,27 @@ If web_search_context is present:
 - Use it when selecting URLs, official download pages, troubleshooting steps, or public documentation.
 - Prefer official/vendor domains when the results indicate them.
 - Do not fabricate search results that are not present in web_search_context.
+"""
+
+PYTHON_FIRST_EXECUTION_APPEND = """
+Execution style: python_first
+- Keep the current Python-first behavior.
+- For install/download tasks, prefer deterministic Python-side progress before browser wandering: direct official download, file verification, subprocess launches, installer path checks, and process verification.
+- Prefer direct file/process/state inspection over browsing/searching when the next action can already be taken locally.
+"""
+
+GUI_FIRST_EXECUTION_APPEND = """
+Execution style: gui_first
+- Continue returning executable Python only, but prefer browser/UI-driven progression when relevant UI is already visible.
+- When a browser page, search results page, vendor page, installer wizard, UAC prompt, or completion dialog is already on screen, prefer advancing that visible state before bypassing it with a fresh direct download or silent install attempt.
+- When a visible page likely contains a download or installer control, prefer OCR-grounded helpers such as `click_download_like_target()` or `click_text_targets([...])` before switching to HTTP fetching or HTML parsing.
+- If the visible page appears to use a collapsed or responsive navigation header and the download control is not yet visible, prefer opening that visible menu with `open_responsive_header_menu()` before falling back to fresh network discovery.
+- For download/install tasks, it is acceptable to navigate search results, click visible official download controls, use browser download UI, and drive installer dialogs like a user when that is the most grounded next action from the screenshot.
+- If the current screenshot or prompt indicates a grounded browser/download/installer UI path, do not switch to new urllib/requests HTML scraping, regex-based direct artifact discovery, or fresh silent-install shortcuts in the same step unless the latest execution clearly shows that visible UI path failed or stalled.
+- For install-launch chunks where the installer `.exe` is already present, do not start by retrying `/VERYSILENT`, `/SILENT`, `/SP-`, or `/NORESTART` unless the latest execution already proved a normal visible installer flow is impossible.
+- For gui_first install chunks, prefer this order: inspect visible installer/UAC/completion UI, advance that UI with Python GUI automation, then verify install paths or launch the installed app.
+- Use direct Python HTTP download, silent switches, or filesystem-only shortcuts only when there is no useful visible UI state or the visible UI path has clearly stalled.
+- Prefer continuing from the current browser/app/installer state instead of restarting the task from scratch.
 """
 
 REASONING_ENABLED_APPEND = """
@@ -221,9 +252,19 @@ def _compact_last_execution_for_prompt(last_execution: dict | None) -> dict[str,
     return compact
 
 
+def _normalize_execution_style(value: str | None) -> str:
+    normalized = str(value or "python_first").strip().lower().replace("-", "_")
+    if normalized == "gui":
+        normalized = "gui_first"
+    if normalized not in {"python_first", "gui_first"}:
+        normalized = "python_first"
+    return normalized
+
+
 def render_user_prompt(
     session_prompt: str,
     policy: RuntimePolicy,
+    execution_style: str = "python_first",
     observation_text: str | None = None,
     recent_history: Iterable[str] | None = None,
     last_execution: dict | None = None,
@@ -233,6 +274,7 @@ def render_user_prompt(
     strong_visual_grounding: bool = False,
     reasoning_enabled: bool = False,
 ) -> str:
+    execution_style = _normalize_execution_style(execution_style)
     history = list(recent_history or [])
     last_execution_payload = _compact_last_execution_for_prompt(last_execution)
     replan_reason_list = [str(item) for item in (replan_reasons or [])]
@@ -240,6 +282,7 @@ def render_user_prompt(
         "user_prompt": session_prompt,
         "runtime_policy": policy.to_dict(),
         "request_kind": "task_step",
+        "execution_style": execution_style,
         "repair_context": None,
         "replan_requested": replan_requested,
         "replan_reasons": replan_reason_list,
@@ -258,6 +301,7 @@ def render_user_prompt(
 def render_prompt_bundle(
     session_prompt: str,
     policy: RuntimePolicy,
+    execution_style: str = "python_first",
     observation_text: str | None = None,
     recent_history: Iterable[str] | None = None,
     last_execution: dict | None = None,
@@ -267,10 +311,15 @@ def render_prompt_bundle(
     strong_visual_grounding: bool = False,
     reasoning_enabled: bool = False,
 ) -> PromptBundle:
+    execution_style = _normalize_execution_style(execution_style)
     history = list(recent_history or [])
     last_execution_payload = _compact_last_execution_for_prompt(last_execution)
     replan_reason_list = [str(item) for item in (replan_reasons or [])]
     system_prompt = RAW_PYTHON_SYSTEM_PROMPT
+    if execution_style == "gui_first":
+        system_prompt = system_prompt + "\n" + GUI_FIRST_EXECUTION_APPEND.strip() + "\n"
+    else:
+        system_prompt = system_prompt + "\n" + PYTHON_FIRST_EXECUTION_APPEND.strip() + "\n"
     if reasoning_enabled:
         system_prompt = system_prompt + "\n" + REASONING_ENABLED_APPEND.strip() + "\n"
     if strong_visual_grounding:
@@ -280,6 +329,7 @@ def render_prompt_bundle(
         user_prompt=render_user_prompt(
             session_prompt=session_prompt,
             policy=policy,
+            execution_style=execution_style,
             observation_text=observation_text,
             web_search_context=web_search_context,
             recent_history=history,
@@ -291,6 +341,7 @@ def render_prompt_bundle(
         ),
         session_prompt=session_prompt,
         policy=policy.to_dict(),
+        execution_style=execution_style,
         reasoning_enabled=reasoning_enabled,
         observation_text=observation_text,
         last_execution=last_execution_payload,
@@ -308,6 +359,7 @@ def render_prompt_bundle_from_step_request(request: StepRequest) -> PromptBundle
     bundle = render_prompt_bundle(
         session_prompt=request.user_prompt,
         policy=policy,
+        execution_style=request.execution_style,
         observation_text=request.observation_text,
         web_search_context=request.web_search_context,
         recent_history=history,
@@ -319,6 +371,7 @@ def render_prompt_bundle_from_step_request(request: StepRequest) -> PromptBundle
     )
     user_payload = json.loads(bundle.user_prompt)
     user_payload["request_kind"] = request.request_kind
+    user_payload["execution_style"] = _normalize_execution_style(request.execution_style)
     user_payload["repair_context"] = request.repair_context or None
     user_payload["replan_requested"] = request.replan_requested
     user_payload["replan_reasons"] = request.replan_reasons
@@ -348,6 +401,7 @@ def render_web_search_decision_bundle_from_step_request(
     payload = {
         "user_prompt": request.user_prompt,
         "request_kind": "web_search_decision",
+        "execution_style": _normalize_execution_style(request.execution_style),
         "strong_visual_grounding": request.strong_visual_grounding,
         "observation_text": request.observation_text,
         "last_execution": last_execution_payload or None,
@@ -369,6 +423,7 @@ def render_web_search_decision_bundle_from_step_request(
         user_prompt=json.dumps(payload, ensure_ascii=False, indent=2),
         session_prompt=request.user_prompt,
         policy=policy.to_dict(),
+        execution_style=_normalize_execution_style(request.execution_style),
         reasoning_enabled=reasoning_enabled,
         observation_text=request.observation_text,
         last_execution=last_execution_payload,

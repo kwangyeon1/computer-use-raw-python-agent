@@ -229,6 +229,7 @@ def _handle_run(daemon_state: AgentDaemonState, payload: dict[str, Any]) -> dict
             run_dir=run_dir,
             max_iterations=int(defaults.get("max_iterations", 5)),
             max_new_tokens=int(defaults.get("max_new_tokens", 256)),
+            execution_style=str(defaults.get("execution_style", "python_first")),
             strong_visual_grounding=bool(defaults.get("strong_visual_grounding", False)),
             reasoning_enabled=bool(defaults.get("reasoning_enabled", False)),
             replan_enabled=bool(defaults.get("replan_enabled", False)),

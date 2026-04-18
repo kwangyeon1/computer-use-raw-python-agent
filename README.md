@@ -71,6 +71,7 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-ag
   "run_dir": "../data/runs",
   "max_iterations": 5,
   "max_new_tokens": 256,
+  "execution_style": "gui_first",
   "strong_visual_grounding": false,
   "reasoning_enabled": false,
   "replan_enabled": false,
@@ -94,6 +95,17 @@ cd /home/kss930/model-projects/gui-owl-8B-think-1.0.0/computer-use-raw-python-ag
 ```
 
 `agent.default.json`은 backend-neutral config 입니다. 공통 loop/prompt 정책만 담고, 어떤 생성기를 붙일지는 CLI 인자나 별도 프로필에서 정합니다.
+
+`execution_style`로 Python 코드의 진행 전략을 고를 수 있습니다.
+- `python_first`: direct download, 파일 검증, silent install, 프로세스/설치 경로 확인 같은 Python-side 진행을 우선
+- `gui_first`: 현재 화면에 보이는 브라우저/검색 결과/다운로드 UI/installer wizard를 사람처럼 이어서 진행하는 쪽을 우선
+
+CLI에서도 덮어쓸 수 있습니다.
+
+```bash
+./.venv/bin/computer-use-raw-python-agent --execution-style gui_first --prompt "..."
+./.venv/bin/qwen-computer-use-agent --execution-style python_first --prompt "..."
+```
 
 선택적으로 아래 키를 추가하면 특정 config를 외부 CLI backend로 고정할 수 있습니다.
 
