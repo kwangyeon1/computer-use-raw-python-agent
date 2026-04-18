@@ -364,6 +364,17 @@ def test_visible_flow_extra_targets_ignore_helper_names_and_keep_app_keyword() -
     assert _visible_flow_extra_targets(request, limit=3) == ["카카오톡"]
 
 
+def test_visible_flow_extra_targets_prefer_explicit_installer_filename() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Locate `C:\\Users\\user\\Downloads\\KakaoTalk_Setup.exe`, verify it is the downloaded Windows installer, "
+            "and run it with Python automation. 이번엔 network-fetch logic로 돌아가지 마세요."
+        ),
+        execution_style="gui_first",
+    )
+    assert _visible_flow_extra_targets(request, limit=3) == ["kakaotalk"]
+
+
 def test_synthesized_visible_launch_recovery_ignores_invalid_install_marker_and_writes_launch_marker() -> None:
     request = StepRequest(
         user_prompt=(
@@ -559,6 +570,15 @@ def test_synthesized_visible_installer_recovery_prefers_prompt_named_installer()
     code = _synthesized_visible_installer_recovery_code(request)
     assert 'EXPECTED_INSTALLER_GLOB = "TargetApp_Setup.exe"' in code
     assert "for path in TARGET_DIR.glob(pattern):" in code
+
+
+def test_expand_runtime_helpers_visible_installer_flow_handles_cancel_confirmation_dialogs() -> None:
+    expanded = _expand_runtime_helpers("advance_visible_installer_flow(extra_targets=['targetapp'])")
+    assert "def _dialog_regions(region):" in expanded
+    assert "def _find_cancel_confirmation_region(region):" in expanded
+    assert '"installer_cancel_detected"' in expanded
+    assert '"installer_cancel_decline_keys"' in expanded
+    assert "for key_name in ('alt+n', 'enter'):" in expanded or 'for key_name in ("alt+n", "enter"):' in expanded
 
 
 def test_synthesized_visible_installer_recovery_does_not_use_extension_token_as_filename_target() -> None:

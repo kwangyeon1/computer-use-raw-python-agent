@@ -2005,10 +2005,55 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
             return ""
         return " | ".join(str(item.get("text") or "").strip().lower() for item in lines if isinstance(item, dict))
 
-    def _cancel_confirmation_visible(region):
-        combined = _read_ocr_text(region)
-        if not combined:
-            combined = _read_ocr_text(None)
+    def _dialog_regions(region):
+        if region is None:
+            return [None]
+        left = int(region.get("left", 0) or 0)
+        top = int(region.get("top", 0) or 0)
+        right = int(region.get("right", left) or left)
+        bottom = int(region.get("bottom", top) or top)
+        width = max(0, right - left)
+        height = max(0, bottom - top)
+        regions = [region]
+        if width >= 280 and height >= 180:
+            regions.append(
+                {
+                    "left": left + int(width * 0.42),
+                    "top": top + int(height * 0.50),
+                    "right": left + int(width * 0.94),
+                    "bottom": top + int(height * 0.97),
+                }
+            )
+            regions.append(
+                {
+                    "left": left + int(width * 0.28),
+                    "top": top + int(height * 0.46),
+                    "right": left + int(width * 0.98),
+                    "bottom": top + int(height * 0.99),
+                }
+            )
+        regions.append(None)
+        deduped = []
+        seen = set()
+        for item in regions:
+            if item is None:
+                key = None
+            elif isinstance(item, dict):
+                key = (
+                    int(item.get("left", 0) or 0),
+                    int(item.get("top", 0) or 0),
+                    int(item.get("right", 0) or 0),
+                    int(item.get("bottom", 0) or 0),
+                )
+            else:
+                key = tuple(int(value) for value in item)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    def _find_cancel_confirmation_region(region):
         cancel_markers = (
             "cancel setup",
             "cancel installation",
@@ -2027,7 +2072,15 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
             "종료하시겠습니까",
         )
         decision_markers = ("yes", "예", "no", "아니오")
-        return any(marker in combined for marker in cancel_markers) and any(marker in combined for marker in decision_markers)
+        for candidate_region in _dialog_regions(region):
+            combined = _read_ocr_text(candidate_region)
+            if not combined:
+                continue
+            if any(marker in combined for marker in cancel_markers) and any(
+                marker in combined for marker in decision_markers
+            ):
+                return candidate_region
+        return None
 
     def _next_like_installer_prompt_visible(region):
         combined = _read_ocr_text(region)
@@ -2065,7 +2118,9 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
         installer_region = _activate_target_installer_window()
         if installer_region is not None:
             attempts.append({"stage": "installer_window_target", "window": installer_region, "attempt": attempt_index})
-        if installer_region is not None and _cancel_confirmation_visible(installer_region):
+        cancel_region = _find_cancel_confirmation_region(installer_region)
+        if installer_region is not None and cancel_region is not None:
+            attempts.append({"stage": "installer_cancel_detected", "region": cancel_region, "attempt": attempt_index})
             try:
                 clicked = click_text_targets(
                     ["no", "아니오", "continue", "계속", "resume", "돌아가기"],
@@ -2074,7 +2129,7 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
                     min_primary_hits=1,
                     click_horizontal_bias="matched_token_right",
                     image_path=None,
-                    crop_region=None,
+                    crop_region=cancel_region,
                     timeout_s=min(stage_timeout, 4.0),
                     poll_interval_s=0.8,
                     prefer_bottom=True,
@@ -2088,7 +2143,21 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
                 continue
             except SystemExit as exc:
                 attempts.append({"stage": "installer_cancel_decline_click", "error": str(exc), "attempt": attempt_index})
+            try:
+                for key_name in ("alt+n", "enter"):
+                    if key_name == "enter":
+                        _press(0x0D)
+                    elif key_name == "alt+n":
+                        _press_alt(0x4E)
+                    time.sleep(0.25)
+                attempts.append({"stage": "installer_cancel_decline_keys", "keys": ["alt+n", "enter"], "attempt": attempt_index})
+                progress_made = True
+                time.sleep(1.0)
+                continue
+            except Exception as exc:
+                attempts.append({"stage": "installer_cancel_decline_keys", "error": str(exc), "attempt": attempt_index})
         for key_sequence in (
+            ("alt+n", "enter"),
             ("enter",),
             ("alt+n",),
             ("space",),
@@ -2422,21 +2491,39 @@ def _extract_prompt_download_glob(user_prompt: str) -> str | None:
             for match in re.finditer(pattern, text, flags=re.IGNORECASE)
         )
     seen: set[str] = set()
+    ranked_candidates: list[tuple[int, str]] = []
     for raw_candidate in candidate_tokens:
         candidate = str(raw_candidate or "").strip().strip("`'\"")
         if not candidate or candidate in seen:
             continue
         seen.add(candidate)
+        original_candidate = candidate
         if "://" in candidate:
             candidate = urllib.parse.urlparse(candidate).path
         candidate = urllib.parse.unquote(candidate)
-        candidate = candidate.split("?", 1)[0].split("#", 1)[0].rstrip("/").replace("\\", "/")
-        if not candidate:
+        normalized_candidate = candidate.split("?", 1)[0].split("#", 1)[0].rstrip("/").replace("\\", "/")
+        if not normalized_candidate:
             continue
-        basename = candidate.rsplit("/", 1)[-1].strip()
+        basename = normalized_candidate.rsplit("/", 1)[-1].strip()
         stem = basename[:-4].strip(" ._-") if basename.lower().endswith(".exe") else ""
-        if basename and basename.lower().endswith(".exe") and stem:
-            return basename
+        if not (basename and basename.lower().endswith(".exe") and stem):
+            continue
+        lowered = basename.lower()
+        score = 0
+        if any(marker in lowered for marker in ("setup", "installer", "install", "launcher")):
+            score += 40
+        if any(sep in original_candidate for sep in ("\\", "/")):
+            score += 30
+        if "downloads" in original_candidate.lower():
+            score += 20
+        if any(marker in lowered for marker in ("update", "updater", "uninstall", "unins")):
+            score -= 120
+        if lowered.endswith(".exe"):
+            score += 10
+        ranked_candidates.append((score, basename))
+    if ranked_candidates:
+        ranked_candidates.sort(key=lambda item: item[0], reverse=True)
+        return ranked_candidates[0][1]
     return None
 
 
@@ -2870,12 +2957,16 @@ def _context_candidate(raw_value: str) -> Path | None:
     return candidate
 
 INSTALLERS = _iter_expected_installers()
+REQUESTED_INSTALLER_KEYWORDS = _normalize_tokens(
+    [Path(str(EXPECTED_INSTALLER_GLOB or "")).stem, *EXTRA_TARGETS],
+    skip_extension_tokens=True,
+)
 TARGET_KEYWORDS = _normalize_tokens(
-    [*EXTRA_TARGETS, *[path.stem for path in INSTALLERS], *[path.name for path in INSTALLERS], MARKER_PATH.parent.name],
+    [*REQUESTED_INSTALLER_KEYWORDS, *EXTRA_TARGETS, MARKER_PATH.parent.name],
     skip_extension_tokens=True,
 )
 FILENAME_TARGET_KEYWORDS = _normalize_tokens(
-    [path.stem for path in INSTALLERS],
+    REQUESTED_INSTALLER_KEYWORDS or EXTRA_TARGETS,
     skip_extension_tokens=True,
 )
 
@@ -2907,6 +2998,42 @@ def _is_valid_installed_executable(path: Path) -> bool:
         if str(TARGET_DIR).lower() in str(resolved).lower():
             return False
     return True
+
+def _clear_invalid_install_marker() -> None:
+    if not MARKER_PATH.exists() or not MARKER_PATH.is_file():
+        return
+    try:
+        payload = json.loads(MARKER_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        MARKER_PATH.unlink(missing_ok=True)
+        print(f"cleared unreadable install marker: {{MARKER_PATH}}")
+        return
+    raw = str((payload or {{}}).get("installed_exe") or "").strip().strip('"')
+    candidate = _context_candidate(raw)
+    if candidate is None or not _is_valid_installed_executable(candidate) or not _matches_filename_target(candidate):
+        MARKER_PATH.unlink(missing_ok=True)
+        print(f"cleared stale install marker: {{MARKER_PATH}}")
+
+def _prune_context_install_state() -> None:
+    payload = read_action_context(CONTEXT_PATH)
+    if not payload.get("_exists"):
+        return
+    changed = False
+    sanitized = {{}}
+    for key, value in payload.items():
+        if str(key).startswith("_"):
+            continue
+        sanitized[key] = value
+    for field in ("installed_exe", "launch_exe"):
+        candidate = _context_candidate(sanitized.get(field))
+        if candidate is not None and _is_valid_installed_executable(candidate) and _matches_filename_target(candidate):
+            continue
+        if field in sanitized:
+            sanitized.pop(field, None)
+            changed = True
+    if changed:
+        CONTEXT_PATH.write_text(json.dumps(sanitized, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"pruned stale install state from context: {{CONTEXT_PATH}}")
 
 def _matches_filename_target(path: Path) -> bool:
     lowered = str(path).lower()
@@ -2955,8 +3082,15 @@ def find_existing_installer() -> Path:
             return context_installer
     if not INSTALLERS:
         raise SystemExit("No installer found in target directory")
+    candidate_installers = [
+        path
+        for path in INSTALLERS
+        if not FILENAME_TARGET_KEYWORDS or _matches_filename_target(path)
+    ]
+    if not candidate_installers:
+        raise SystemExit("No target-matching installer found in target directory")
     ranked = sorted(
-        INSTALLERS,
+        candidate_installers,
         key=lambda path: (
             _score_path(path)[0],
             _score_path(path)[1],
@@ -3133,6 +3267,8 @@ def _context_installed_executable() -> Path | None:
 
 installer = find_existing_installer()
 print(f"Found installer: {{installer}}")
+_clear_invalid_install_marker()
+_prune_context_install_state()
 write_action_context(
     CONTEXT_PATH,
     phase="installer_ready",
@@ -3324,16 +3460,35 @@ def _synthesized_visible_launch_recovery_code(
     if not prompt_download_glob and last_execution_code:
         prompt_download_glob = _extract_prompt_download_glob(last_execution_code)
     if prompt_download_glob:
+        installer_name_stop_words = {
+            "setup",
+            "installer",
+            "install",
+            "launcher",
+            "launch",
+            "client",
+            "desktop",
+            "windows",
+            "win32",
+            "win64",
+            "x64",
+            "x86",
+            "x86_64",
+            "exe",
+        }
+        download_glob_stem = Path(prompt_download_glob).stem.lower().replace("_", " ").replace("-", " ")
         download_glob_keywords = [
             keyword
-            for keyword in _prompt_keyword_candidates(Path(prompt_download_glob).stem, limit=4)
-            if keyword not in fallback_stop_words
+            for keyword in _prompt_keyword_candidates(download_glob_stem, limit=6)
+            if keyword not in fallback_stop_words and keyword not in installer_name_stop_words
         ]
         if not download_glob_keywords:
             download_glob_keywords = [
                 token.strip("._-")
-                for token in re.findall(r"[a-z0-9가-힣][a-z0-9가-힣._-]{1,}", Path(prompt_download_glob).stem.lower())
-                if token.strip("._-") and token.strip("._-") not in fallback_stop_words
+                for token in re.findall(r"[a-z0-9가-힣][a-z0-9가-힣]{1,}", download_glob_stem)
+                if token.strip("._-")
+                and token.strip("._-") not in fallback_stop_words
+                and token.strip("._-") not in installer_name_stop_words
             ][:4]
         if download_glob_keywords:
             prompt_target_keywords = list(dict.fromkeys(download_glob_keywords))
@@ -3576,6 +3731,56 @@ def _read_install_marker_candidate() -> Path | None:
     print(f"ignoring invalid install marker candidate: {{candidate}}")
     return None
 
+def _clear_invalid_marker(path: Path, *, field: str) -> None:
+    if not path.exists() or not path.is_file():
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        path.unlink(missing_ok=True)
+        print(f"cleared unreadable marker: {{path}}")
+        return
+    raw = str((payload or {{}}).get(field) or "").strip().strip('"')
+    if not raw:
+        path.unlink(missing_ok=True)
+        print(f"cleared empty marker: {{path}}")
+        return
+    candidate = Path(os.path.expandvars(os.path.expanduser(raw)))
+    if _is_valid_installed_executable(candidate) and (
+        not FILENAME_TARGET_KEYWORDS or any(keyword in str(candidate).lower() for keyword in FILENAME_TARGET_KEYWORDS)
+    ):
+        return
+    path.unlink(missing_ok=True)
+    print(f"cleared stale marker: {{path}}")
+
+def _prune_context_launch_state() -> None:
+    payload = read_action_context(CONTEXT_PATH)
+    if not payload.get("_exists"):
+        return
+    changed = False
+    sanitized = {{}}
+    for key, value in payload.items():
+        if str(key).startswith("_"):
+            continue
+        sanitized[key] = value
+    for field in ("installed_exe", "launch_exe"):
+        raw = str(sanitized.get(field) or "").strip().strip('"')
+        if not raw:
+            if field in sanitized:
+                sanitized.pop(field, None)
+                changed = True
+            continue
+        candidate = Path(os.path.expandvars(os.path.expanduser(raw)))
+        if _is_valid_installed_executable(candidate) and (
+            not FILENAME_TARGET_KEYWORDS or any(keyword in str(candidate).lower() for keyword in FILENAME_TARGET_KEYWORDS)
+        ):
+            continue
+        sanitized.pop(field, None)
+        changed = True
+    if changed:
+        CONTEXT_PATH.write_text(json.dumps(sanitized, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"pruned stale launch state from context: {{CONTEXT_PATH}}")
+
 def _read_context_candidate() -> Path | None:
     context_payload = read_action_context(CONTEXT_PATH)
     raw = str(context_payload.get("installed_exe") or context_payload.get("launch_exe") or "").strip().strip('"')
@@ -3681,6 +3886,10 @@ def write_launch_marker(exe_path: Path) -> None:
     payload = {{"launched_exe": str(exe_path), "process_name": exe_path.name}}
     with open(LAUNCH_MARKER_PATH, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+_clear_invalid_marker(INSTALL_MARKER_PATH, field="installed_exe")
+_clear_invalid_marker(LAUNCH_MARKER_PATH, field="launched_exe")
+_prune_context_launch_state()
 
 exe_path = find_installed_executable()
 if exe_path is None:
@@ -5263,6 +5472,9 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
     if request is None:
         return []
     generic_workflow_keywords = {
+        "setup",
+        "install",
+        "installer",
         "network",
         "parsing",
         "logic",
@@ -5345,6 +5557,16 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
         "root",
         "targetapp",
     }
+    explicit_installer = _extract_prompt_download_glob(request.user_prompt or "")
+    if explicit_installer:
+        installer_stem = Path(str(explicit_installer)).stem.replace("_", " ").replace("-", " ")
+        explicit_keywords = [
+            keyword
+            for keyword in _prompt_keyword_candidates(installer_stem, limit=limit)
+            if keyword not in generic_workflow_keywords
+        ]
+        if explicit_keywords:
+            return explicit_keywords[:limit]
     merged: list[str] = []
     last_execution_payload = dict(request.last_execution.get("payload_metadata") or {})
     last_execution_code = str(last_execution_payload.get("executed_python_code") or "")
