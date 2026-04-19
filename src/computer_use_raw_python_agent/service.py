@@ -308,14 +308,43 @@ def wait_for_stable_download(path_or_pattern, *, min_bytes=1_000_000, stable_che
     deadline = time.time() + max(float(timeout_s), float(poll_interval_s))
     downloads = Path(os.path.expanduser(str(download_dir))) if download_dir else (Path.home() / "Downloads")
 
+    def _candidate_patterns():
+        patterns = [raw]
+        lowered = raw.lower()
+        if lowered.endswith(".exe"):
+            patterns.append(raw[:-4] + ".msi")
+        elif lowered.endswith(".msi"):
+            patterns.append(raw[:-4] + ".exe")
+        deduped = []
+        seen = set()
+        for pattern in patterns:
+            key = pattern.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(pattern)
+        return deduped
+
     def _matches():
-        expanded = os.path.expanduser(raw)
-        if any(ch in raw for ch in "*?[]"):
-            return [Path(item) for item in glob.glob(expanded, recursive=True)]
-        candidate = Path(expanded)
-        if candidate.is_absolute() or raw.startswith("~"):
-            return [candidate]
-        return list(downloads.glob(raw))
+        matches = []
+        seen = set()
+        for pattern in _candidate_patterns():
+            expanded = os.path.expanduser(pattern)
+            if any(ch in pattern for ch in "*?[]"):
+                candidates = [Path(item) for item in glob.glob(expanded, recursive=True)]
+            else:
+                candidate = Path(expanded)
+                if candidate.is_absolute() or pattern.startswith("~"):
+                    candidates = [candidate]
+                else:
+                    candidates = list(downloads.glob(pattern))
+            for candidate in candidates:
+                key = str(candidate).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                matches.append(candidate)
+        return matches
 
     def _partial_files(candidate):
         candidate_name = candidate.name.lower() if candidate is not None else ""
@@ -553,17 +582,20 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
 
     user_agent = "Mozilla/5.0"
     keywords = [str(item).strip().lower() for item in (extra_targets or []) if str(item).strip()]
-    avoid_markers = ("android", "iphone", "ios", "mac", "macos", "linux", "portable", ".zip", ".7z", ".tar", ".gz", ".msi", ".pkg")
-    preferred_markers = ("windows", "win32", "win64", "x64", "x86_64", "setup", "install", "installer", ".exe")
+    avoid_markers = ("android", "iphone", "ios", "mac", "macos", "linux", "portable", ".zip", ".7z", ".tar", ".gz", ".pkg")
+    preferred_markers = ("windows", "win32", "win64", "x64", "x86_64", "setup", "install", "installer", "standard", ".exe", ".msi")
 
     downloads = Path.home() / "Downloads"
     downloads.mkdir(parents=True, exist_ok=True)
     destination_dir = downloads
     glob_text = str(download_glob or "").strip()
-    if glob_text.startswith("computer-use-agent/") and glob_text.endswith("/*.exe"):
-        relative_dir = glob_text[: -len("/*.exe")]
-        destination_dir = downloads / relative_dir
-        destination_dir.mkdir(parents=True, exist_ok=True)
+    if glob_text.startswith("computer-use-agent/"):
+        for suffix in ("/*.exe", "/*.msi", "/*"):
+            if glob_text.endswith(suffix):
+                relative_dir = glob_text[: -len(suffix)]
+                destination_dir = downloads / relative_dir
+                destination_dir.mkdir(parents=True, exist_ok=True)
+                break
 
     def _registrable_host(host):
         labels = [label for label in str(host or "").lower().split(".") if label]
@@ -593,7 +625,7 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
             if registrable != allowed_registrable:
                 continue
             path_lower = unquote(parsed.path).lower()
-            if path_lower.endswith(".exe"):
+            if path_lower.endswith((".exe", ".msi")):
                 continue
             if not any(marker in path_lower for marker in ("download", "downloads", "release", "releases", "files", "file", "community", "edition", "windows")):
                 continue
@@ -602,21 +634,21 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
         return page_candidates
 
     def _extract_exe_links(base_url, html_text):
-        exe_candidates = []
-        seen_exe = set()
+        installer_candidates = []
+        seen_installer = set()
         patterns = (
-            r'https?://[^\\s"\\'<>]+\\.exe(?:\\?[^\\s"\\'<>]*)?',
-            r'(?:href|src)\\s*=\\s*["\\']([^"\\']+\\.exe[^"\\']*)["\\']',
+            r'https?://[^\\s"\\'<>]+\\.(?:exe|msi)(?:\\?[^\\s"\\'<>]*)?',
+            r'(?:href|src)\\s*=\\s*["\\']([^"\\']+\\.(?:exe|msi)[^"\\']*)["\\']',
         )
         for pattern in patterns:
             for raw in re.findall(pattern, html_text, flags=re.IGNORECASE):
                 resolved = urljoin(base_url, str(raw).split("#", 1)[0])
                 lowered = resolved.lower()
-                if lowered in seen_exe or not lowered.startswith("http"):
+                if lowered in seen_installer or not lowered.startswith("http"):
                     continue
-                seen_exe.add(lowered)
-                exe_candidates.append(resolved)
-        return exe_candidates
+                seen_installer.add(lowered)
+                installer_candidates.append(resolved)
+        return installer_candidates
 
     initial_request = urllib.request.Request(target_url, headers={"User-Agent": user_agent})
     with urllib.request.urlopen(initial_request, timeout=60) as response:
@@ -661,7 +693,7 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
     def _score(url):
         lowered = unquote(urlparse(url).path).lower()
         score = 0
-        if lowered.endswith(".exe"):
+        if lowered.endswith((".exe", ".msi")):
             score += 120
         for keyword in keywords:
             if keyword and keyword in lowered:
@@ -677,14 +709,14 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
     candidates = [url for url in candidates if _score(url) > 0]
     candidates.sort(key=_score, reverse=True)
     if not candidates:
-        raise SystemExit("no official Windows installer .exe candidate found on the current page")
+        raise SystemExit("no official Windows installer .exe/.msi candidate found on the current page")
 
     last_error = None
     for candidate in candidates:
         try:
             filename = Path(unquote(urlparse(candidate).path)).name or "installer.exe"
-            if not filename.lower().endswith(".exe"):
-                filename = "installer.exe"
+            if not filename.lower().endswith((".exe", ".msi")):
+                filename = "installer.msi" if ".msi" in candidate.lower() else "installer.exe"
             destination = destination_dir / filename
             req = urllib.request.Request(candidate, headers={"User-Agent": user_agent})
             with urllib.request.urlopen(req, timeout=90) as response, open(destination, "wb") as handle:
@@ -957,9 +989,9 @@ def click_text_targets(
         for token in avoid_terms:
             if token and token in lowered:
                 score -= 80
-        if any(token in lowered for token in ("download", "다운로드", "install", "installer", "setup", "설치")):
+        if any(token in lowered for token in ("download", "다운로드", "install", "installer", "setup", "standard", "설치", "msi")):
             score += 25
-        if any(token in lowered for token in ("windows", "pc", "exe", "next", "확인", "동의")):
+        if any(token in lowered for token in ("windows", "pc", "exe", "msi", "64-bit", "32-bit", "x64", "x86", "next", "확인", "동의")):
             score += 10
         terminal_markers = (
             ".venv",
@@ -990,7 +1022,7 @@ def click_text_targets(
             score -= 55
         if re.fullmatch(r"[a-z0-9.-]+\.(com|net|org|co|io|app|dev|kr|tv|me|gg|ai|info)", lowered):
             score -= 55
-        elif "." in lowered and " " not in lowered and not lowered.endswith(".exe"):
+        elif "." in lowered and " " not in lowered and not lowered.endswith((".exe", ".msi")):
             score -= 35
         if any(ext in lowered for ext in (".json", ".py", ".log", ".md", ".txt")):
             score -= 60
@@ -1008,7 +1040,7 @@ def click_text_targets(
             match_ratio = matched_start / char_count
             if matched_token in primary_terms:
                 score += 18
-            if matched_token in {"download", "다운로드", "install", "installer", "setup", "설치", "받기", "exe"}:
+            if matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi"}:
                 score += 16
             if match_ratio >= 0.55:
                 score += 18
@@ -1304,7 +1336,7 @@ def click_text_targets(
                             score += 18
                         elif relative_top >= int(browser_height * 0.55):
                             score -= 35
-                    elif relative_top <= min(220, browser_height // 3) and matched_token in {"download", "다운로드", "install", "installer", "setup", "설치", "받기", "exe"}:
+                    elif relative_top <= min(220, browser_height // 3) and matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi"}:
                         score += 24
                 if width > 520:
                     score -= 45
@@ -1316,9 +1348,9 @@ def click_text_targets(
                     score += 12
                 if top < 220 and width > 320:
                     score -= 20
-                if matched_token in {"download", "다운로드", "install", "installer", "setup", "설치", "받기", "exe"} and width > 280:
+                if matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi"} and width > 280:
                     score += 28
-                if matched_token in {"download", "다운로드", "install", "installer", "setup", "설치", "받기", "exe"} and top < 220 and width > 320:
+                if matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi"} and top < 220 and width > 320:
                     score += 20
                 if score <= 0:
                     continue
@@ -1359,7 +1391,7 @@ def click_text_targets(
                 "y": center_y,
                 "score": best_candidate["score"],
             }
-        if allow_heuristic_fallback and active_region is not None:
+        if allow_heuristic_fallback and active_region is not None and sweep_index >= 2:
             heuristic_candidate = _heuristic_browser_click(active_region, attempt_index=sweep_index)
             if heuristic_candidate is not None:
                 _click_point(int(heuristic_candidate["x"]), int(heuristic_candidate["y"]))
@@ -1386,10 +1418,17 @@ def click_download_like_target(*, extra_targets=None, avoid_targets=None, image_
         "install",
         "installer",
         "setup",
+        "standard",
+        "standard installer",
         "받기",
         "pc",
         "windows",
         "exe",
+        "msi",
+        "64-bit",
+        "32-bit",
+        "x64",
+        "x86",
     ]
     avoid = [
         "android",
@@ -1399,9 +1438,14 @@ def click_download_like_target(*, extra_targets=None, avoid_targets=None, image_
         "macos",
         "linux",
         "portable",
+        "no installer",
         "zip",
         "archive",
         "source",
+        "nightly",
+        "nightly builds",
+        "alpha",
+        "beta",
         "sdk",
         "server",
         "guide",
@@ -1444,7 +1488,7 @@ def click_download_like_target(*, extra_targets=None, avoid_targets=None, image_
     return click_text_targets(
         targets,
         avoid_targets=avoid,
-        primary_targets=["download", "다운로드", "install", "installer", "setup", "설치", "받기", "exe"],
+        primary_targets=["download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi"],
         min_primary_hits=1,
         window_title_tokens=[*targets],
         restrict_to_browser_window=True,
@@ -1715,11 +1759,18 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
             "install",
             "installer",
             "setup",
+            "standard",
             "설치",
             "받기",
             ".exe",
+            ".msi",
+            "msi",
             "windows",
             "pc",
+            "64-bit",
+            "32-bit",
+            "x64",
+            "x86",
         )
     )
     menu_cues_present = any(
@@ -1791,10 +1842,17 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
                 "install",
                 "installer",
                 "setup",
+                "standard",
+                "standard installer",
                 "받기",
                 "pc",
                 "windows",
                 "exe",
+                "msi",
+                "64-bit",
+                "32-bit",
+                "x64",
+                "x86",
             ],
             avoid_targets=[
                 "android",
@@ -1804,9 +1862,14 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
                 "macos",
                 "linux",
                 "portable",
+                "no installer",
                 "zip",
                 "archive",
                 "source",
+                "nightly",
+                "nightly builds",
+                "alpha",
+                "beta",
                 "sdk",
                 "server",
                 "blog",
@@ -1814,7 +1877,7 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
                 "forum",
                 "커뮤니티",
             ],
-            primary_targets=["download", "다운로드", "install", "installer", "setup", "설치", "받기", "exe"],
+            primary_targets=["download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi"],
             min_primary_hits=1,
             window_title_tokens=[*(list(extra_targets or [])), "chrome", "edge", "firefox", "brave", "opera", "official", "공식", "download", "다운로드"],
             restrict_to_browser_window=True,
@@ -1955,6 +2018,10 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
             "bash",
             "python",
             "codex",
+            "computer-use",
+            "training-generator",
+            "model-projects",
+            "gui-owl",
             "visual studio code",
             "vscode",
             "explorer",
@@ -1979,13 +2046,16 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
             if any(token in lowered for token in excluded_terms):
                 continue
             score = 0
-            if any(token in lowered for token in generic_window_terms):
+            generic_title_hit = any(token in lowered for token in generic_window_terms)
+            if generic_title_hit:
                 score += 24
             title_keyword_hits = 0
             for token in target_window_keywords:
                 if token in lowered:
                     title_keyword_hits += 1
                     score += 90
+            if not generic_title_hit and title_keyword_hits <= 0:
+                continue
             if active_window is not None and window is active_window:
                 score += 18
             if width >= 420:
@@ -2009,6 +2079,7 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
                     "right": int(getattr(window, "left", 0) or 0) + int(getattr(window, "width", 0) or 0),
                     "bottom": int(getattr(window, "top", 0) or 0) + int(getattr(window, "height", 0) or 0),
                     "title": str(getattr(window, "title", "") or ""),
+                    "hwnd": int(getattr(window, "_hWnd", 0) or getattr(window, "hWnd", 0) or 0),
                 }
             except Exception as exc:
                 attempts.append({"stage": "installer_window_activate", "error": str(exc), "title": title})
@@ -2177,12 +2248,112 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
         )
         return any(marker in combined for marker in positive_markers) and not any(marker in combined for marker in negative_markers)
 
+    def _license_accept_prompt_visible(region):
+        combined = _read_ocr_text(region)
+        if not combined:
+            combined = _read_ocr_text(None)
+        if not combined:
+            return False
+        positive_markers = (
+            "i accept",
+            "accept the terms",
+            "license agreement",
+            "end-user license",
+            "terms in the license",
+            "agree to the terms",
+            "사용권",
+            "라이선스",
+            "동의",
+        )
+        negative_markers = (
+            "do not accept",
+            "decline",
+            "동의하지",
+        )
+        return any(marker in combined for marker in positive_markers) and not any(marker in combined for marker in negative_markers)
+
+    def _click_license_checkbox(region):
+        if region is None:
+            return False
+        user32 = ctypes.windll.user32
+        left = int(region.get("left", 0) or 0)
+        top = int(region.get("top", 0) or 0)
+        right = int(region.get("right", left) or left)
+        bottom = int(region.get("bottom", top) or top)
+        width = max(0, right - left)
+        height = max(0, bottom - top)
+        if width <= 0 or height <= 0:
+            return False
+        x = left + max(24, int(width * 0.08))
+        y = bottom - max(58, int(height * 0.22))
+        user32.SetCursorPos(int(x), int(y))
+        time.sleep(0.08)
+        user32.mouse_event(0x0002, 0, 0, 0, 0)
+        time.sleep(0.05)
+        user32.mouse_event(0x0004, 0, 0, 0, 0)
+        time.sleep(0.4)
+        return True
+
+    def _set_license_checkbox_child_checked(region):
+        if region is None:
+            return False
+        hwnd = int(region.get("hwnd", 0) or 0)
+        if not hwnd:
+            return False
+        user32 = ctypes.windll.user32
+        matching_terms = (
+            "accept",
+            "agree",
+            "license",
+            "terms",
+            "동의",
+            "라이선스",
+            "사용권",
+        )
+        matched = []
+        enum_proc_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _enum_child(child_hwnd, _lparam):
+            class_buffer = ctypes.create_unicode_buffer(128)
+            text_buffer = ctypes.create_unicode_buffer(512)
+            try:
+                user32.GetClassNameW(child_hwnd, class_buffer, len(class_buffer))
+                user32.GetWindowTextW(child_hwnd, text_buffer, len(text_buffer))
+            except Exception:
+                return True
+            class_name = str(class_buffer.value or "").lower()
+            text = str(text_buffer.value or "")
+            lowered = text.lower()
+            if class_name == "button" and lowered and any(term in lowered for term in matching_terms):
+                try:
+                    current_state = int(user32.SendMessageW(child_hwnd, 0x00F0, 0, 0) or 0)
+                    user32.SendMessageW(child_hwnd, 0x00F5, 0, 0)
+                    if current_state:
+                        time.sleep(0.1)
+                        user32.SendMessageW(child_hwnd, 0x00F5, 0, 0)
+                    time.sleep(0.1)
+                    user32.SendMessageW(child_hwnd, 0x00F1, 1, 0)
+                    matched.append(text)
+                except Exception:
+                    pass
+            return True
+
+        callback = enum_proc_type(_enum_child)
+        try:
+            user32.EnumChildWindows(hwnd, callback, 0)
+        except Exception:
+            return False
+        return bool(matched)
+
     stage_timeout = max(5.0, min(float(timeout_s), 8.0))
     progress_made = False
     for attempt_index in range(5):
         installer_region = _activate_target_installer_window()
         if installer_region is not None:
             attempts.append({"stage": "installer_window_target", "window": installer_region, "attempt": attempt_index})
+        else:
+            attempts.append({"stage": "installer_window_target", "error": "no installer-like window", "attempt": attempt_index})
+            break
         cancel_region = _find_cancel_confirmation_region(installer_region)
         if installer_region is not None and cancel_region is not None:
             attempts.append({"stage": "installer_cancel_detected", "region": cancel_region, "attempt": attempt_index})
@@ -2221,6 +2392,69 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
                 continue
             except Exception as exc:
                 attempts.append({"stage": "installer_cancel_decline_keys", "error": str(exc), "attempt": attempt_index})
+        license_checkbox_checked = _set_license_checkbox_child_checked(installer_region)
+        if license_checkbox_checked or _license_accept_prompt_visible(installer_region):
+            try:
+                clicked = False if license_checkbox_checked else _click_license_checkbox(installer_region)
+                key_sequence = ("alt+n", "enter") if license_checkbox_checked or clicked else ("space", "alt+n", "enter")
+                for key_name in key_sequence:
+                    if key_name == "space":
+                        _press(0x20)
+                    elif key_name == "enter":
+                        _press(0x0D)
+                    elif key_name == "alt+n":
+                        _press_alt(0x4E)
+                    time.sleep(0.25)
+                attempts.append({"stage": "installer_license_accept_keys", "checked_child": license_checkbox_checked, "clicked": clicked, "keys": list(key_sequence), "attempt": attempt_index})
+                progress_made = True
+                time.sleep(1.4)
+                continue
+            except Exception as exc:
+                attempts.append({"stage": "installer_license_accept_keys", "error": str(exc), "attempt": attempt_index})
+        try:
+            clicked = click_text_targets(
+                target_terms,
+                avoid_targets=avoid_terms,
+                primary_targets=[
+                    "ok",
+                    "확인",
+                    "next",
+                    "다음",
+                    "install",
+                    "설치",
+                    "agree",
+                    "동의",
+                    "accept",
+                    "yes",
+                    "예",
+                    "continue",
+                    "계속",
+                    "finish",
+                    "완료",
+                    "launch",
+                    "실행",
+                    "start",
+                    "시작",
+                    "language",
+                    "언어",
+                ],
+                min_primary_hits=1,
+                click_horizontal_bias="matched_token_right",
+                image_path=None,
+                crop_region=installer_region,
+                timeout_s=min(stage_timeout, 4.5),
+                poll_interval_s=0.8,
+                prefer_bottom=True,
+                double_click=False,
+                allow_heuristic_fallback=False,
+                heuristic_mode="installer",
+            )
+            attempts.append({"stage": "installer_text_click_first", "clicked": clicked, "attempt": attempt_index})
+            progress_made = True
+            time.sleep(1.4)
+            continue
+        except SystemExit as exc:
+            attempts.append({"stage": "installer_text_click_first", "error": str(exc), "attempt": attempt_index})
         for key_sequence in (
             ("alt+n", "enter"),
             ("enter",),
@@ -2546,10 +2780,10 @@ def _extract_prompt_download_glob(user_prompt: str) -> str | None:
     candidate_tokens: list[str] = []
     candidate_tokens.extend(_extract_prompt_urls(text))
     for pattern in (
-        r"`([^`]*?\.exe(?:\?[^`]*)?)`",
-        r'"([^"]*?\.exe(?:\?[^"]*)?)"',
-        r"'([^']*?\.exe(?:\?[^']*)?)'",
-        r"\b([^\s`\"'>)]+\.exe)\b",
+        r"`([^`]*?\.(?:exe|msi)(?:\?[^`]*)?)`",
+        r'"([^"]*?\.(?:exe|msi)(?:\?[^"]*)?)"',
+        r"'([^']*?\.(?:exe|msi)(?:\?[^']*)?)'",
+        r"\b([^\s`\"'>)]+\.(?:exe|msi))\b",
     ):
         candidate_tokens.extend(
             str(match.group(1) or "").strip()
@@ -2570,10 +2804,11 @@ def _extract_prompt_download_glob(user_prompt: str) -> str | None:
         if not normalized_candidate:
             continue
         basename = normalized_candidate.rsplit("/", 1)[-1].strip()
-        stem = basename[:-4].strip(" ._-") if basename.lower().endswith(".exe") else ""
-        if not (basename and basename.lower().endswith(".exe") and stem):
-            continue
         lowered = basename.lower()
+        installer_suffix = ".msi" if lowered.endswith(".msi") else ".exe" if lowered.endswith(".exe") else ""
+        stem = basename[: -len(installer_suffix)].strip(" ._-") if installer_suffix else ""
+        if not (basename and installer_suffix and stem):
+            continue
         score = 0
         if any(marker in lowered for marker in ("setup", "installer", "install", "launcher")):
             score += 40
@@ -2583,7 +2818,7 @@ def _extract_prompt_download_glob(user_prompt: str) -> str | None:
             score += 20
         if any(marker in lowered for marker in ("update", "updater", "uninstall", "unins")):
             score -= 120
-        if lowered.endswith(".exe"):
+        if lowered.endswith((".exe", ".msi")):
             score += 10
         ranked_candidates.append((score, basename))
     if ranked_candidates:
@@ -2895,7 +3130,7 @@ def _synthesized_visible_ui_click_recovery_code(request: StepRequest | None, *, 
 def _synthesized_visible_installer_recovery_code(
     request: StepRequest,
     *,
-    timeout_s: float = 28.0,
+    timeout_s: float = 90.0,
 ) -> str:
     extra_targets = _visible_flow_extra_targets(request, limit=3)
     download_glob = _extract_prompt_download_glob(request.user_prompt) or "*.exe"
@@ -2959,6 +3194,7 @@ GENERIC_TARGET_TOKENS = {{
     "official",
     "visible",
     "flow",
+    "for",
 }}
 SYSTEM_APP_NAMES = {{
     "store.exe",
@@ -2999,8 +3235,16 @@ def _iter_expected_installers() -> list[Path]:
     patterns = [str(EXPECTED_INSTALLER_GLOB or "").strip()]
     if not patterns[0]:
         patterns = []
+    for pattern in list(patterns):
+        lowered = pattern.lower()
+        if lowered.endswith(".exe"):
+            patterns.append(pattern[:-4] + ".msi")
+        elif lowered.endswith(".msi"):
+            patterns.append(pattern[:-4] + ".exe")
     if "*.exe" not in patterns:
         patterns.append("*.exe")
+    if "*.msi" not in patterns:
+        patterns.append("*.msi")
     matches = []
     seen = set()
     for pattern in patterns:
@@ -3024,7 +3268,7 @@ def _context_candidate(raw_value: str) -> Path | None:
     if not candidate_text:
         return None
     candidate = Path(os.path.expandvars(os.path.expanduser(candidate_text)))
-    if not candidate.exists() or not candidate.is_file() or candidate.suffix.lower() != ".exe":
+    if not candidate.exists() or not candidate.is_file() or candidate.suffix.lower() not in {".exe", ".msi"}:
         return None
     return candidate
 
@@ -3127,7 +3371,7 @@ def _score_path(path: Path) -> tuple[int, int, float]:
         elif normalized in lowered:
             score += 18
             matched_keywords += 1
-    if lowered.endswith(".exe"):
+    if lowered.endswith((".exe", ".msi")):
         score += 10
     if path.name.lower() in SYSTEM_APP_NAMES:
         score -= 240
@@ -3337,6 +3581,27 @@ def _context_installed_executable() -> Path | None:
         return None
     return candidate
 
+def _launch_installer(reason: str) -> None:
+    try:
+        if installer.suffix.lower() == ".msi":
+            subprocess.Popen(["msiexec.exe", "/i", str(installer), "/passive", "/norestart"])
+        else:
+            try:
+                os.startfile(str(installer))
+            except AttributeError:
+                subprocess.Popen([str(installer)])
+    except Exception as launch_exc:
+        raise SystemExit(f"failed to launch installer: {{launch_exc}}") from launch_exc
+    print(f"installer launched in GUI mode ({{reason}})")
+    write_action_context(
+        CONTEXT_PATH,
+        phase="installer_started",
+        installer_path=str(installer),
+        expected_installer_glob=str(EXPECTED_INSTALLER_GLOB or ""),
+        target_keywords=EXTRA_TARGETS,
+    )
+    time.sleep(6.0)
+
 installer = find_existing_installer()
 print(f"Found installer: {{installer}}")
 _clear_invalid_install_marker()
@@ -3361,20 +3626,10 @@ if context_existing is not None:
     print(f"already installed from context: {{context_existing}}")
     sys.exit(0)
 
+launched_installer = False
 if not VISIBLE_INSTALLER:
-    try:
-        os.startfile(str(installer))
-    except AttributeError:
-        subprocess.Popen([str(installer)])
-    print("installer launched in normal GUI mode")
-    write_action_context(
-        CONTEXT_PATH,
-        phase="installer_started",
-        installer_path=str(installer),
-        expected_installer_glob=str(EXPECTED_INSTALLER_GLOB or ""),
-        target_keywords=EXTRA_TARGETS,
-    )
-    time.sleep(6.0)
+    _launch_installer("no visible installer UI")
+    launched_installer = True
 
 deadline = time.time() + max({float(timeout_s):.1f}, 16.0)
 attempt_index = 0
@@ -3384,6 +3639,10 @@ while time.time() < deadline:
         print(f"advanced visible installer flow: {{flow}}")
     except SystemExit as installer_exc:
         print(f"visible installer automation incomplete: {{installer_exc}}")
+        if not launched_installer:
+            _launch_installer("visible installer UI not confirmed")
+            launched_installer = True
+            continue
     time.sleep(3.0)
     existing = find_installed_executable()
     if existing is not None:
@@ -3412,12 +3671,9 @@ while time.time() < deadline:
     if attempt_index == 2 and VISIBLE_INSTALLER:
         continue
     if attempt_index == 3:
-        try:
-            os.startfile(str(installer))
-            print("re-launched installer in GUI mode")
-            time.sleep(5.0)
-        except Exception as relaunch_exc:
-            print(f"installer relaunch skipped: {{relaunch_exc}}")
+        if not launched_installer:
+            _launch_installer("retry after no installer progress")
+            launched_installer = True
 
 raise SystemExit("installer ui flow did not produce an installed app executable")
 """
@@ -3467,6 +3723,7 @@ def _synthesized_visible_launch_recovery_code(
         "that",
         "this",
         "then",
+        "for",
         "if",
         "it",
         "its",
@@ -3547,8 +3804,10 @@ def _synthesized_visible_launch_recovery_code(
             "x86",
             "x86_64",
             "exe",
+            "msi",
+            "for",
         }
-        download_glob_stem = Path(prompt_download_glob).stem.lower().replace("_", " ").replace("-", " ")
+        download_glob_stem = Path(prompt_download_glob).stem.lower().replace("_", " ").replace("-", " ").replace(".", " ")
         download_glob_keywords = [
             keyword
             for keyword in _prompt_keyword_candidates(download_glob_stem, limit=6)
@@ -3621,6 +3880,7 @@ GENERIC_TARGET_TOKENS = {{
     "official",
     "visible",
     "flow",
+    "for",
 }}
 SYSTEM_APP_NAMES = {{
     "store.exe",
@@ -4525,6 +4785,12 @@ def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
     strong_install_markers = (
         "run the installer",
         "launch the installer",
+        "launch the downloaded",
+        "launching `msiexec",
+        "launching msiexec",
+        "msiexec /i",
+        "locate the downloaded msi",
+        "downloaded msi",
         "installer wizard",
         "uac prompt",
         "license dialog",
@@ -4554,6 +4820,12 @@ def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
         "locate the downloaded",
         "run the installer",
         "launch the installer",
+        "launch the downloaded",
+        "launching `msiexec",
+        "launching msiexec",
+        "msiexec /i",
+        "locate the downloaded msi",
+        "downloaded msi",
         "installer wizard",
         "uac prompt",
         "license dialog",
@@ -4576,7 +4848,7 @@ def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
         return False
     if any(marker in text for marker in launch_markers):
         return True
-    has_installer_artifact = any(token in text for token in (".exe", "installer", "setup", "설치 파일"))
+    has_installer_artifact = any(token in text for token in (".exe", ".msi", "msi", "installer", "setup", "설치 파일"))
     has_existing_location = any(token in text for token in ("downloads", "다운로드", "userprofile"))
     has_existing_installer_signal = any(
         token in text
@@ -4584,13 +4856,15 @@ def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
             "already exists in downloads",
             "existing installer",
             "already downloaded",
+            "downloaded msi",
+            "downloaded installer",
             "already present in downloads",
             "do not download anything in this chunk",
             "이미 다운로드된",
             "설치 ui가 없을 때만",
             "설치 ui가 없으면",
         )
-    )
+    ) or ("downloaded" in text and any(token in text for token in ("installer", ".msi", " msi", ".exe")))
     has_run_signal = any(
         token in text
         for token in (
@@ -5626,6 +5900,54 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
     return result
 
 
+def _installer_filename_keywords(value: str, *, limit: int = 4) -> list[str]:
+    generic = {
+        "setup",
+        "installer",
+        "install",
+        "launcher",
+        "launch",
+        "client",
+        "desktop",
+        "windows",
+        "window",
+        "win",
+        "win32",
+        "win64",
+        "x64",
+        "x86",
+        "x86_64",
+        "amd64",
+        "arm64",
+        "exe",
+        "msi",
+        "for",
+        "the",
+        "and",
+        "official",
+        "download",
+        "downloads",
+        "latest",
+        "stable",
+        "release",
+    }
+    stem = Path(str(value or "")).stem.lower()
+    result: list[str] = []
+    for token in re.split(r"[^a-z0-9가-힣]+", stem):
+        cleaned = token.strip("._-")
+        if not cleaned or cleaned in generic or cleaned in result:
+            continue
+        if cleaned.isdigit() or re.fullmatch(r"v?\d+(?:\d+)?", cleaned):
+            continue
+        min_len = 2 if re.search(r"[가-힣]", cleaned) else 2
+        if len(cleaned) < min_len:
+            continue
+        result.append(cleaned)
+        if len(result) >= limit:
+            break
+    return result
+
+
 def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) -> list[str]:
     if request is None:
         return []
@@ -5717,12 +6039,7 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
     }
     explicit_installer = _extract_prompt_download_glob(request.user_prompt or "")
     if explicit_installer:
-        installer_stem = Path(str(explicit_installer)).stem.replace("_", " ").replace("-", " ")
-        explicit_keywords = [
-            keyword
-            for keyword in _prompt_keyword_candidates(installer_stem, limit=limit)
-            if keyword not in generic_workflow_keywords
-        ]
+        explicit_keywords = _installer_filename_keywords(explicit_installer, limit=limit)
         if explicit_keywords:
             return explicit_keywords[:limit]
     merged: list[str] = []
@@ -6033,13 +6350,13 @@ USER_AGENT = "Mozilla/5.0"
 downloads = Path.home() / "Downloads"
 downloads.mkdir(parents=True, exist_ok=True)
 
-generic_bad = ("portable", ".zip", ".7z", ".tar", ".gz", ".msi", ".pkg")
-preferred_markers = ("setup", "installer", "install", "win64", "windows", "x64")
+generic_bad = ("portable", ".zip", ".7z", ".tar", ".gz", ".pkg")
+preferred_markers = ("setup", "installer", "install", "standard", "win64", "windows", "x64", ".exe", ".msi")
 
 def score_url(url: str) -> int:
     lowered = unquote(urlparse(url).path).lower()
     score = 0
-    if lowered.endswith(".exe"):
+    if lowered.endswith((".exe", ".msi")):
         score += 100
     for keyword in KEYWORDS:
         if keyword in lowered:
@@ -6059,18 +6376,18 @@ def request_bytes(url: str) -> tuple[str, bytes]:
 
 def extract_links(base_url: str, html_text: str) -> tuple[list[str], list[str]]:
     page_links: list[str] = []
-    exe_links: list[str] = []
+    installer_links: list[str] = []
     seen_pages = set()
-    seen_exe = set()
+    seen_installer = set()
     attr_matches = re.findall(r'''(?:href|src)\\s*=\\s*["\\']([^"\\']+)["\\']''', html_text, flags=re.IGNORECASE)
     for raw in attr_matches:
         resolved = urljoin(base_url, unescape(raw)).split("#", 1)[0]
         lowered = resolved.lower()
         if not lowered.startswith("http"):
             continue
-        if lowered.endswith(".exe") and lowered not in seen_exe:
-            seen_exe.add(lowered)
-            exe_links.append(resolved)
+        if lowered.endswith((".exe", ".msi")) and lowered not in seen_installer:
+            seen_installer.add(lowered)
+            installer_links.append(resolved)
             continue
         if any(token in lowered for token in ("download", "install", "release", "community", "edition")) and lowered not in seen_pages:
             seen_pages.add(lowered)
@@ -6078,10 +6395,10 @@ def extract_links(base_url: str, html_text: str) -> tuple[list[str], list[str]]:
     for raw in re.findall(r'https://[^\\s"\\'<>]+', html_text, flags=re.IGNORECASE):
         resolved = raw.split("#", 1)[0]
         lowered = resolved.lower()
-        if lowered.endswith(".exe") and lowered not in seen_exe:
-            seen_exe.add(lowered)
-            exe_links.append(resolved)
-    return page_links[:8], exe_links
+        if lowered.endswith((".exe", ".msi")) and lowered not in seen_installer:
+            seen_installer.add(lowered)
+            installer_links.append(resolved)
+    return page_links[:8], installer_links
 
 def registrable_host(host: str) -> str:
     labels = [label for label in str(host or "").lower().split(".") if label]
@@ -6091,19 +6408,20 @@ def registrable_host(host: str) -> str:
 
 def candidate_destination(url: str) -> Path:
     name = Path(unquote(urlparse(url).path)).name or "installer.exe"
-    if not name.lower().endswith(".exe"):
-        name = "installer.exe"
+    if not name.lower().endswith((".exe", ".msi")):
+        name = "installer.msi" if ".msi" in url.lower() else "installer.exe"
     return downloads / name
 
 existing_candidates = []
-for path in downloads.glob("*.exe"):
-    lowered = path.name.lower()
-    if not KEYWORDS:
-        continue
-    if not any(keyword in lowered for keyword in KEYWORDS):
-        continue
-    if path.stat().st_size > 1_000_000:
-        existing_candidates.append(path)
+for pattern in ("*.exe", "*.msi"):
+    for path in downloads.glob(pattern):
+        lowered = path.name.lower()
+        if not KEYWORDS:
+            continue
+        if not any(keyword in lowered for keyword in KEYWORDS):
+            continue
+        if path.stat().st_size > 1_000_000:
+            existing_candidates.append(path)
 
 if existing_candidates:
     existing = max(existing_candidates, key=lambda p: p.stat().st_mtime)
@@ -6114,7 +6432,7 @@ visited_pages = set()
 page_queue = list(PROMPT_URLS)
 exe_candidates: list[str] = []
 seen_candidate_urls = set()
-base_registrables = {registrable_host(urlparse(url).netloc) for url in PROMPT_URLS if url}
+base_registrables = {{registrable_host(urlparse(url).netloc) for url in PROMPT_URLS if url}}
 
 while page_queue and len(visited_pages) < 10:
     page_url = page_queue.pop(0)
@@ -6142,7 +6460,7 @@ while page_queue and len(visited_pages) < 10:
 exe_candidates.sort(key=score_url, reverse=True)
 
 if not exe_candidates:
-    raise SystemExit("No official Windows installer .exe candidate found from the prompt URLs.")
+    raise SystemExit("No official Windows installer .exe/.msi candidate found from the prompt URLs.")
 
 for exe_url in exe_candidates:
     dest = candidate_destination(exe_url)

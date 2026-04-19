@@ -115,6 +115,12 @@ def _read_state_file() -> dict[str, Any] | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _write_response_file(path: Path, payload: dict[str, Any]) -> None:
+    temp_path = path.with_name(f"{path.name}.tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(path)
+
+
 def _send_request(payload: dict[str, Any], *, timeout_s: float = 5.0) -> dict[str, Any]:
     request_id = uuid.uuid4().hex
     requests_dir = daemon_requests_dir()
@@ -355,7 +361,7 @@ def _serve() -> int:
                         response = _handle_run(daemon_state, payload)
                     elif action == "shutdown":
                         response = {"ok": True}
-                        response_path.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
+                        _write_response_file(response_path, response)
                         request_path.unlink(missing_ok=True)
                         return 0
                     else:
@@ -369,7 +375,7 @@ def _serve() -> int:
                         "error_type": type(exc).__name__,
                         "traceback": traceback.format_exc(),
                     }
-                response_path.write_text(json.dumps(response, ensure_ascii=False, indent=2), encoding="utf-8")
+                _write_response_file(response_path, response)
                 request_path.unlink(missing_ok=True)
             if not handled_any:
                 time.sleep(0.05)

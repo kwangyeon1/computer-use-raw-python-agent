@@ -39,6 +39,7 @@ from computer_use_raw_python_agent.service import (
     _synthesized_visible_ui_click_recovery_code,
     _should_use_framework_visible_launch_recovery,
     _should_use_framework_visible_installer_recovery,
+    _should_use_framework_visible_download_flow,
     _should_use_framework_official_download_recovery,
     _should_omit_screenshot_for_generation,
     _visible_flow_extra_targets,
@@ -301,6 +302,34 @@ def test_framework_visible_installer_recovery_selected_for_gui_first_existing_in
     assert _should_use_framework_visible_installer_recovery(request) is True
 
 
+def test_framework_visible_installer_recovery_selected_for_downloaded_msi_install_chunk() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Use Python to locate the downloaded MSI in `~/Downloads`, then install the app by "
+            "launching `msiexec /i <installer.msi>` from Python. Prefer the normal interactive "
+            "Windows Installer flow rather than a silent install."
+        ),
+        execution_style="gui_first",
+    )
+    assert _looks_like_existing_installer_launch_task(request.user_prompt) is True
+    assert _should_use_framework_visible_installer_recovery(request) is True
+    assert _should_use_framework_visible_download_flow(request) is False
+
+
+def test_framework_visible_installer_recovery_selected_for_launch_downloaded_named_msi_chunk() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Using Python automation, launch the downloaded DB Browser for SQLite MSI installer "
+            "from Downloads and complete the installation with default GUI options. Prefer a "
+            "normal MSI run via subprocess or msiexec if needed."
+        ),
+        execution_style="gui_first",
+    )
+    assert _looks_like_existing_installer_launch_task(request.user_prompt) is True
+    assert _should_use_framework_visible_installer_recovery(request) is True
+    assert _should_use_framework_visible_download_flow(request) is False
+
+
 def test_existing_installer_recovery_not_selected_for_launch_chunk() -> None:
     request = StepRequest(
         user_prompt=(
@@ -526,6 +555,14 @@ def test_extract_prompt_download_glob_uses_official_exe_url_basename() -> None:
     assert _extract_prompt_download_glob(prompt) == "TargetApp_Setup.exe"
 
 
+def test_extract_prompt_download_glob_uses_official_msi_url_basename() -> None:
+    prompt = (
+        "Use Python-first automation on Windows to download the official Windows installer `.msi` "
+        "from `https://downloads.vendor.example/releases/TargetApp_Setup.msi` and wait for it to finish."
+    )
+    assert _extract_prompt_download_glob(prompt) == "TargetApp_Setup.msi"
+
+
 def test_extract_prompt_download_glob_uses_explicit_downloads_path_filename() -> None:
     prompt = (
         "Save it to the user's Downloads folder as `~/Downloads/targetapp-windows-installer.exe` "
@@ -607,6 +644,19 @@ def test_synthesized_visible_installer_recovery_prefers_prompt_named_installer()
     assert "for path in TARGET_DIR.glob(pattern):" in code
 
 
+def test_visible_flow_extra_targets_prefers_installer_filename_tokens() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Launch `~/Downloads/DB.Browser.for.SQLite-v3.13.1-win32.msi` and complete installation. "
+            "Previous stdout summary: network-fetch idb found"
+        ),
+        execution_style="gui_first",
+    )
+    code = _synthesized_visible_installer_recovery_code(request)
+    assert 'EXTRA_TARGETS = ["db", "browser", "sqlite"]' in code
+    assert "network-fetch" not in code
+
+
 def test_expand_runtime_helpers_visible_installer_flow_handles_cancel_confirmation_dialogs() -> None:
     expanded = _expand_runtime_helpers("advance_visible_installer_flow(extra_targets=['targetapp'])")
     assert "def _dialog_regions(region):" in expanded
@@ -614,6 +664,38 @@ def test_expand_runtime_helpers_visible_installer_flow_handles_cancel_confirmati
     assert '"installer_cancel_detected"' in expanded
     assert '"installer_cancel_decline_keys"' in expanded
     assert "for key_name in ('alt+n', 'enter'):" in expanded or 'for key_name in ("alt+n", "enter"):' in expanded
+
+
+def test_expand_runtime_helpers_visible_installer_flow_does_not_target_runner_window() -> None:
+    expanded = _expand_runtime_helpers("advance_visible_installer_flow(extra_targets=['targetapp'])")
+    assert '"computer-use"' in expanded
+    assert '"training-generator"' in expanded
+    assert '"gui-owl"' in expanded
+    assert "if not generic_title_hit and title_keyword_hits <= 0:" in expanded
+    assert '"no installer-like window"' in expanded
+    assert '"installer_text_click_first"' in expanded
+    assert "def _license_accept_prompt_visible(region):" in expanded
+    assert "def _set_license_checkbox_child_checked(region):" in expanded
+    assert "SendMessageW(child_hwnd, 0x00F5, 0, 0)" in expanded
+    assert "SendMessageW(child_hwnd, 0x00F1, 1, 0)" in expanded
+    assert '"hwnd": int(getattr(window, "_hWnd", 0)' in expanded
+    assert '"installer_license_accept_keys"' in expanded
+
+
+def test_synthesized_visible_installer_recovery_launches_msi_when_ui_not_confirmed() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Launch `~/Downloads/TargetApp-v1.2.3.msi` and complete installation. "
+            "End only when `~/Downloads/install-success.json` exists."
+        ),
+        execution_style="gui_first",
+        observation_text="OCR visible text: desktop",
+    )
+    code = _synthesized_visible_installer_recovery_code(request)
+    assert 'VISIBLE_INSTALLER = False' in code
+    assert 'subprocess.Popen(["msiexec.exe", "/i", str(installer), "/passive", "/norestart"])' in code
+    assert '_launch_installer("no visible installer UI")' in code
+    assert '_launch_installer("visible installer UI not confirmed")' in code
 
 
 def test_synthesized_visible_installer_recovery_does_not_use_extension_token_as_filename_target() -> None:
@@ -1191,10 +1273,15 @@ print(result)
     assert "def click_text_targets(" in expanded
     assert "def ocr_screen_text_regions(" in expanded
     assert '"download",' in expanded
+    assert '"msi",' in expanded
+    assert '"standard",' in expanded
+    assert '"no installer",' in expanded
+    assert '"nightly",' in expanded
     assert '"guide",' in expanded
     assert '"support",' in expanded
     assert 'click_horizontal_bias="matched_token_right"' in expanded
     assert "browser_download_cta_region" in expanded
+    assert "sweep_index >= 2" in expanded
 
 
 def test_expand_runtime_helpers_injects_advance_visible_download_flow_definition() -> None:
@@ -1217,6 +1304,7 @@ def test_framework_official_download_recovery_reuses_only_matching_existing_inst
     )
     assert 'if not KEYWORDS:' in code
     assert 'if not any(keyword in lowered for keyword in KEYWORDS):' in code
+    assert '(".exe", ".msi")' in code
 
 
 def test_duplicate_generation_detected_for_same_script() -> None:
