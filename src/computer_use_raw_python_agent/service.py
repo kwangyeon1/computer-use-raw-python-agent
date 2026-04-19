@@ -315,6 +315,10 @@ def wait_for_stable_download(path_or_pattern, *, min_bytes=1_000_000, stable_che
             patterns.append(raw[:-4] + ".msi")
         elif lowered.endswith(".msi"):
             patterns.append(raw[:-4] + ".exe")
+        elif lowered.endswith(".zip"):
+            patterns.append(raw[:-4] + ".alz")
+        elif lowered.endswith(".alz"):
+            patterns.append(raw[:-4] + ".zip")
         deduped = []
         seen = set()
         for pattern in patterns:
@@ -582,15 +586,16 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
 
     user_agent = "Mozilla/5.0"
     keywords = [str(item).strip().lower() for item in (extra_targets or []) if str(item).strip()]
-    avoid_markers = ("android", "iphone", "ios", "mac", "macos", "linux", "portable", ".zip", ".7z", ".tar", ".gz", ".pkg")
-    preferred_markers = ("windows", "win32", "win64", "x64", "x86_64", "setup", "install", "installer", "standard", ".exe", ".msi")
+    installer_suffixes = (".exe", ".msi", ".zip", ".alz")
+    avoid_markers = ("android", "iphone", "ios", "mac", "macos", "linux", "portable", ".7z", ".tar", ".gz", ".pkg", ".dmg")
+    preferred_markers = ("windows", "win32", "win64", "x64", "x86_64", "setup", "install", "installer", "standard", "package", "archive", ".exe", ".msi", ".zip", ".alz")
 
     downloads = Path.home() / "Downloads"
     downloads.mkdir(parents=True, exist_ok=True)
     destination_dir = downloads
     glob_text = str(download_glob or "").strip()
     if glob_text.startswith("computer-use-agent/"):
-        for suffix in ("/*.exe", "/*.msi", "/*"):
+        for suffix in ("/*.exe", "/*.msi", "/*.zip", "/*.alz", "/*"):
             if glob_text.endswith(suffix):
                 relative_dir = glob_text[: -len(suffix)]
                 destination_dir = downloads / relative_dir
@@ -625,7 +630,7 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
             if registrable != allowed_registrable:
                 continue
             path_lower = unquote(parsed.path).lower()
-            if path_lower.endswith((".exe", ".msi")):
+            if path_lower.endswith(installer_suffixes):
                 continue
             if not any(marker in path_lower for marker in ("download", "downloads", "release", "releases", "files", "file", "community", "edition", "windows")):
                 continue
@@ -637,8 +642,8 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
         installer_candidates = []
         seen_installer = set()
         patterns = (
-            r'https?://[^\\s"\\'<>]+\\.(?:exe|msi)(?:\\?[^\\s"\\'<>]*)?',
-            r'(?:href|src)\\s*=\\s*["\\']([^"\\']+\\.(?:exe|msi)[^"\\']*)["\\']',
+            r'https?://[^\\s"\\'<>]+\\.(?:exe|msi|zip|alz)(?:\\?[^\\s"\\'<>]*)?',
+            r'(?:href|src)\\s*=\\s*["\\']([^"\\']+\\.(?:exe|msi|zip|alz)[^"\\']*)["\\']',
         )
         for pattern in patterns:
             for raw in re.findall(pattern, html_text, flags=re.IGNORECASE):
@@ -693,7 +698,7 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
     def _score(url):
         lowered = unquote(urlparse(url).path).lower()
         score = 0
-        if lowered.endswith((".exe", ".msi")):
+        if lowered.endswith(installer_suffixes):
             score += 120
         for keyword in keywords:
             if keyword and keyword in lowered:
@@ -709,14 +714,22 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
     candidates = [url for url in candidates if _score(url) > 0]
     candidates.sort(key=_score, reverse=True)
     if not candidates:
-        raise SystemExit("no official Windows installer .exe/.msi candidate found on the current page")
+        raise SystemExit("no official Windows installer/archive candidate found on the current page")
 
     last_error = None
     for candidate in candidates:
         try:
             filename = Path(unquote(urlparse(candidate).path)).name or "installer.exe"
-            if not filename.lower().endswith((".exe", ".msi")):
-                filename = "installer.msi" if ".msi" in candidate.lower() else "installer.exe"
+            if not filename.lower().endswith(installer_suffixes):
+                lowered_candidate = candidate.lower()
+                if ".alz" in lowered_candidate:
+                    filename = "installer.alz"
+                elif ".zip" in lowered_candidate:
+                    filename = "installer.zip"
+                elif ".msi" in lowered_candidate:
+                    filename = "installer.msi"
+                else:
+                    filename = "installer.exe"
             destination = destination_dir / filename
             req = urllib.request.Request(candidate, headers={"User-Agent": user_agent})
             with urllib.request.urlopen(req, timeout=90) as response, open(destination, "wb") as handle:
@@ -989,9 +1002,9 @@ def click_text_targets(
         for token in avoid_terms:
             if token and token in lowered:
                 score -= 80
-        if any(token in lowered for token in ("download", "다운로드", "install", "installer", "setup", "standard", "설치", "msi")):
+        if any(token in lowered for token in ("download", "다운로드", "install", "installer", "setup", "standard", "설치", "msi", "zip", "alz", "archive", "package")):
             score += 25
-        if any(token in lowered for token in ("windows", "pc", "exe", "msi", "64-bit", "32-bit", "x64", "x86", "next", "확인", "동의")):
+        if any(token in lowered for token in ("windows", "pc", "exe", "msi", "zip", "alz", "64-bit", "32-bit", "x64", "x86", "next", "확인", "동의")):
             score += 10
         terminal_markers = (
             ".venv",
@@ -1022,7 +1035,7 @@ def click_text_targets(
             score -= 55
         if re.fullmatch(r"[a-z0-9.-]+\.(com|net|org|co|io|app|dev|kr|tv|me|gg|ai|info)", lowered):
             score -= 55
-        elif "." in lowered and " " not in lowered and not lowered.endswith((".exe", ".msi")):
+        elif "." in lowered and " " not in lowered and not lowered.endswith((".exe", ".msi", ".zip", ".alz")):
             score -= 35
         if any(ext in lowered for ext in (".json", ".py", ".log", ".md", ".txt")):
             score -= 60
@@ -1040,7 +1053,7 @@ def click_text_targets(
             match_ratio = matched_start / char_count
             if matched_token in primary_terms:
                 score += 18
-            if matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi"}:
+            if matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi", "zip", "alz", "archive", "package"}:
                 score += 16
             if match_ratio >= 0.55:
                 score += 18
@@ -1336,7 +1349,7 @@ def click_text_targets(
                             score += 18
                         elif relative_top >= int(browser_height * 0.55):
                             score -= 35
-                    elif relative_top <= min(220, browser_height // 3) and matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi"}:
+                    elif relative_top <= min(220, browser_height // 3) and matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi", "zip", "alz", "archive", "package"}:
                         score += 24
                 if width > 520:
                     score -= 45
@@ -1348,9 +1361,9 @@ def click_text_targets(
                     score += 12
                 if top < 220 and width > 320:
                     score -= 20
-                if matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi"} and width > 280:
+                if matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi", "zip", "alz", "archive", "package"} and width > 280:
                     score += 28
-                if matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi"} and top < 220 and width > 320:
+                if matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi", "zip", "alz", "archive", "package"} and top < 220 and width > 320:
                     score += 20
                 if score <= 0:
                     continue
@@ -1425,6 +1438,10 @@ def click_download_like_target(*, extra_targets=None, avoid_targets=None, image_
         "windows",
         "exe",
         "msi",
+        "zip",
+        "alz",
+        "archive",
+        "package",
         "64-bit",
         "32-bit",
         "x64",
@@ -1439,8 +1456,6 @@ def click_download_like_target(*, extra_targets=None, avoid_targets=None, image_
         "linux",
         "portable",
         "no installer",
-        "zip",
-        "archive",
         "source",
         "nightly",
         "nightly builds",
@@ -1488,7 +1503,7 @@ def click_download_like_target(*, extra_targets=None, avoid_targets=None, image_
     return click_text_targets(
         targets,
         avoid_targets=avoid,
-        primary_targets=["download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi"],
+        primary_targets=["download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi", "zip", "alz", "archive", "package"],
         min_primary_hits=1,
         window_title_tokens=[*targets],
         restrict_to_browser_window=True,
@@ -1530,8 +1545,6 @@ def click_search_result_like_target(*, extra_targets=None, avoid_targets=None, i
         "macos",
         "linux",
         "portable",
-        "zip",
-        "archive",
         "source",
         "sdk",
         "server",
@@ -1771,6 +1784,11 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
             "32-bit",
             "x64",
             "x86",
+            "zip",
+            "alz",
+            "archive",
+            "package",
+            "edition",
         )
     )
     menu_cues_present = any(
@@ -1849,6 +1867,10 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
                 "windows",
                 "exe",
                 "msi",
+                "zip",
+                "alz",
+                "archive",
+                "package",
                 "64-bit",
                 "32-bit",
                 "x64",
@@ -1863,8 +1885,6 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
                 "linux",
                 "portable",
                 "no installer",
-                "zip",
-                "archive",
                 "source",
                 "nightly",
                 "nightly builds",
@@ -1877,7 +1897,7 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
                 "forum",
                 "커뮤니티",
             ],
-            primary_targets=["download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi"],
+            primary_targets=["download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi", "zip", "alz", "archive", "package"],
             min_primary_hits=1,
             window_title_tokens=[*(list(extra_targets or [])), "chrome", "edge", "firefox", "brave", "opera", "official", "공식", "download", "다운로드"],
             restrict_to_browser_window=True,
@@ -2776,14 +2796,21 @@ def _extract_prompt_download_glob(user_prompt: str) -> str | None:
         if match:
             subdir = str(match.group(1) or "").strip()
             if subdir:
+                lowered_text = text.lower()
+                if ".alz" in lowered_text or " alz" in lowered_text:
+                    return f"computer-use-agent/{subdir}/*.alz"
+                if ".zip" in lowered_text or " zip" in lowered_text or "archive" in lowered_text:
+                    return f"computer-use-agent/{subdir}/*.zip"
+                if ".msi" in lowered_text or " msi" in lowered_text:
+                    return f"computer-use-agent/{subdir}/*.msi"
                 return f"computer-use-agent/{subdir}/*.exe"
     candidate_tokens: list[str] = []
     candidate_tokens.extend(_extract_prompt_urls(text))
     for pattern in (
-        r"`([^`]*?\.(?:exe|msi)(?:\?[^`]*)?)`",
-        r'"([^"]*?\.(?:exe|msi)(?:\?[^"]*)?)"',
-        r"'([^']*?\.(?:exe|msi)(?:\?[^']*)?)'",
-        r"\b([^\s`\"'>)]+\.(?:exe|msi))\b",
+        r"`([^`]*?\.(?:exe|msi|zip|alz)(?:\?[^`]*)?)`",
+        r'"([^"]*?\.(?:exe|msi|zip|alz)(?:\?[^"]*)?)"',
+        r"'([^']*?\.(?:exe|msi|zip|alz)(?:\?[^']*)?)'",
+        r"\b([^\s`\"'>)]+\.(?:exe|msi|zip|alz))\b",
     ):
         candidate_tokens.extend(
             str(match.group(1) or "").strip()
@@ -2805,12 +2832,15 @@ def _extract_prompt_download_glob(user_prompt: str) -> str | None:
             continue
         basename = normalized_candidate.rsplit("/", 1)[-1].strip()
         lowered = basename.lower()
-        installer_suffix = ".msi" if lowered.endswith(".msi") else ".exe" if lowered.endswith(".exe") else ""
+        installer_suffix = next(
+            (suffix for suffix in (".msi", ".exe", ".zip", ".alz") if lowered.endswith(suffix)),
+            "",
+        )
         stem = basename[: -len(installer_suffix)].strip(" ._-") if installer_suffix else ""
         if not (basename and installer_suffix and stem):
             continue
         score = 0
-        if any(marker in lowered for marker in ("setup", "installer", "install", "launcher")):
+        if any(marker in lowered for marker in ("setup", "installer", "install", "launcher", "package", "archive")):
             score += 40
         if any(sep in original_candidate for sep in ("\\", "/")):
             score += 30
@@ -2818,7 +2848,7 @@ def _extract_prompt_download_glob(user_prompt: str) -> str | None:
             score += 20
         if any(marker in lowered for marker in ("update", "updater", "uninstall", "unins")):
             score -= 120
-        if lowered.endswith((".exe", ".msi")):
+        if lowered.endswith((".exe", ".msi", ".zip", ".alz")):
             score += 10
         ranked_candidates.append((score, basename))
     if ranked_candidates:
@@ -5205,6 +5235,11 @@ def _looks_like_opened_page_only_step(python_code: str) -> bool:
     return not any(token in normalized for token in stronger_progress_tokens)
 
 
+def _contains_installer_artifact_suffix(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(suffix in lowered for suffix in (".exe", ".msi", ".zip", ".alz"))
+
+
 def _looks_like_reported_failure(last_execution: dict[str, Any]) -> bool:
     if not last_execution:
         return False
@@ -5246,7 +5281,7 @@ def _looks_like_direct_download_url_404(last_execution: dict[str, Any], python_c
     if "404" not in combined and "not found" not in combined:
         return False
     normalized = _normalize_python_code(python_code).lower()
-    if "http" not in normalized or ".exe" not in normalized:
+    if "http" not in normalized or not _contains_installer_artifact_suffix(normalized):
         return False
     direct_download_tokens = (
         "requests.get(",
@@ -5270,7 +5305,7 @@ def _looks_like_direct_download_url_403(last_execution: dict[str, Any], python_c
     if "403" not in combined and "forbidden" not in combined:
         return False
     normalized = _normalize_python_code(python_code).lower()
-    if "http" not in normalized or ".exe" not in normalized:
+    if "http" not in normalized or not _contains_installer_artifact_suffix(normalized):
         return False
     direct_download_tokens = (
         "requests.get(",
@@ -5301,7 +5336,7 @@ def _looks_like_installer_url_discovery_failure(last_execution: dict[str, Any], 
     if not any(marker in combined for marker in discovery_markers):
         return False
     normalized = _normalize_python_code(python_code).lower()
-    if ".exe" not in normalized:
+    if not _contains_installer_artifact_suffix(normalized):
         return False
     discovery_tokens = (
         "urllib.request.urlopen(",
@@ -5326,6 +5361,14 @@ def _extract_prompt_urls(text: str) -> list[str]:
         seen.add(cleaned)
         urls.append(cleaned)
     return urls
+
+
+def _registrable_host_from_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(str(url or "").strip())
+    labels = [label for label in str(parsed.netloc or "").lower().split(".") if label]
+    if len(labels) >= 2:
+        return ".".join(labels[-2:])
+    return str(parsed.netloc or "").lower()
 
 
 def _select_prompt_browser_url(text: str) -> str | None:
@@ -5578,6 +5621,13 @@ def _generated_code_ignores_prompt_urls(
             ]
             if not disallowed_urls:
                 return False
+        if not prompt_urls_are_search_results:
+            prompt_hosts = {_registrable_host_from_url(url) for url in prompt_urls}
+            prompt_hosts.discard("")
+            code_hosts = {_registrable_host_from_url(url) for url in code_urls}
+            code_hosts.discard("")
+            if prompt_hosts and code_hosts and code_hosts.issubset(prompt_hosts):
+                return False
     return not any(url.lower() in normalized_code for url in prompt_urls)
 
 
@@ -5607,7 +5657,12 @@ def _looks_like_download_chunk_completed(*, user_prompt: str, last_execution: di
         for marker in (
             "success target",
             "installer `.exe` exists",
+            "installer `.msi` exists",
+            "installer `.zip` exists",
+            "installer `.alz` exists",
             "installer `.exe`가 있",
+            "installer `.zip`가 있",
+            "installer `.alz`가 있",
             "downloads\\",
         )
     )
@@ -6350,13 +6405,14 @@ USER_AGENT = "Mozilla/5.0"
 downloads = Path.home() / "Downloads"
 downloads.mkdir(parents=True, exist_ok=True)
 
-generic_bad = ("portable", ".zip", ".7z", ".tar", ".gz", ".pkg")
-preferred_markers = ("setup", "installer", "install", "standard", "win64", "windows", "x64", ".exe", ".msi")
+installer_suffixes = (".exe", ".msi", ".zip", ".alz")
+generic_bad = ("portable", ".7z", ".tar", ".gz", ".pkg", ".dmg")
+preferred_markers = ("setup", "installer", "install", "standard", "package", "archive", "win64", "windows", "x64", ".exe", ".msi", ".zip", ".alz")
 
 def score_url(url: str) -> int:
     lowered = unquote(urlparse(url).path).lower()
     score = 0
-    if lowered.endswith((".exe", ".msi")):
+    if lowered.endswith(installer_suffixes):
         score += 100
     for keyword in KEYWORDS:
         if keyword in lowered:
@@ -6383,9 +6439,10 @@ def extract_links(base_url: str, html_text: str) -> tuple[list[str], list[str]]:
     for raw in attr_matches:
         resolved = urljoin(base_url, unescape(raw)).split("#", 1)[0]
         lowered = resolved.lower()
+        path_lower = unquote(urlparse(resolved).path).lower()
         if not lowered.startswith("http"):
             continue
-        if lowered.endswith((".exe", ".msi")) and lowered not in seen_installer:
+        if path_lower.endswith(installer_suffixes) and lowered not in seen_installer:
             seen_installer.add(lowered)
             installer_links.append(resolved)
             continue
@@ -6395,7 +6452,8 @@ def extract_links(base_url: str, html_text: str) -> tuple[list[str], list[str]]:
     for raw in re.findall(r'https://[^\\s"\\'<>]+', html_text, flags=re.IGNORECASE):
         resolved = raw.split("#", 1)[0]
         lowered = resolved.lower()
-        if lowered.endswith((".exe", ".msi")) and lowered not in seen_installer:
+        path_lower = unquote(urlparse(resolved).path).lower()
+        if path_lower.endswith(installer_suffixes) and lowered not in seen_installer:
             seen_installer.add(lowered)
             installer_links.append(resolved)
     return page_links[:8], installer_links
@@ -6408,12 +6466,20 @@ def registrable_host(host: str) -> str:
 
 def candidate_destination(url: str) -> Path:
     name = Path(unquote(urlparse(url).path)).name or "installer.exe"
-    if not name.lower().endswith((".exe", ".msi")):
-        name = "installer.msi" if ".msi" in url.lower() else "installer.exe"
+    if not name.lower().endswith(installer_suffixes):
+        lowered_url = url.lower()
+        if ".alz" in lowered_url:
+            name = "installer.alz"
+        elif ".zip" in lowered_url:
+            name = "installer.zip"
+        elif ".msi" in lowered_url:
+            name = "installer.msi"
+        else:
+            name = "installer.exe"
     return downloads / name
 
 existing_candidates = []
-for pattern in ("*.exe", "*.msi"):
+for pattern in ("*.exe", "*.msi", "*.zip", "*.alz"):
     for path in downloads.glob(pattern):
         lowered = path.name.lower()
         if not KEYWORDS:
@@ -6460,7 +6526,7 @@ while page_queue and len(visited_pages) < 10:
 exe_candidates.sort(key=score_url, reverse=True)
 
 if not exe_candidates:
-    raise SystemExit("No official Windows installer .exe/.msi candidate found from the prompt URLs.")
+    raise SystemExit("No official Windows installer/archive candidate found from the prompt URLs.")
 
 for exe_url in exe_candidates:
     dest = candidate_destination(exe_url)

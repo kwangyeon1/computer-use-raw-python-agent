@@ -563,6 +563,30 @@ def test_extract_prompt_download_glob_uses_official_msi_url_basename() -> None:
     assert _extract_prompt_download_glob(prompt) == "TargetApp_Setup.msi"
 
 
+def test_extract_prompt_download_glob_uses_official_zip_url_basename() -> None:
+    prompt = (
+        "Use Python-first automation on Windows to download the official Windows installer archive `.zip` "
+        "from `https://downloads.vendor.example/releases/TargetApp_Installer.zip` and wait for it to finish."
+    )
+    assert _extract_prompt_download_glob(prompt) == "TargetApp_Installer.zip"
+
+
+def test_extract_prompt_download_glob_uses_official_alz_url_basename() -> None:
+    prompt = (
+        "Use Python-first automation on Windows to download the official Windows installer archive `.alz` "
+        "from `https://downloads.vendor.example/releases/TargetApp_Installer.alz` and wait for it to finish."
+    )
+    assert _extract_prompt_download_glob(prompt) == "TargetApp_Installer.alz"
+
+
+def test_extract_prompt_download_glob_uses_archive_subdir_pattern() -> None:
+    prompt = (
+        "Download into ~/Downloads/computer-use-agent/targetapp-1234/ "
+        "and wait for the installer archive .zip to appear."
+    )
+    assert _extract_prompt_download_glob(prompt) == "computer-use-agent/targetapp-1234/*.zip"
+
+
 def test_extract_prompt_download_glob_uses_explicit_downloads_path_filename() -> None:
     prompt = (
         "Save it to the user's Downloads folder as `~/Downloads/targetapp-windows-installer.exe` "
@@ -592,6 +616,48 @@ def test_synthesized_visible_download_completion_code_waits_for_prompt_named_ins
     assert code.startswith("import fnmatch\nfrom pathlib import Path\n")
     assert 'wait_for_stable_download("TargetApp_Setup.exe"' in code
     assert 'print(f"download ready: {installer}")' in code
+
+
+def test_synthesized_visible_download_completion_code_waits_for_prompt_named_archive() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Use Python-first automation on Windows to download the official Windows installer archive `.zip` "
+            "from `https://downloads.vendor.example/releases/TargetApp_Installer.zip`. "
+            "Save it to the user's Downloads folder as `TargetApp_Installer.zip`."
+        ),
+        execution_style="gui_first",
+    )
+    code = _synthesized_visible_download_completion_code(
+        request,
+        prompt_url="https://downloads.vendor.example/releases/TargetApp_Installer.zip",
+    )
+    assert 'wait_for_stable_download("TargetApp_Installer.zip"' in code
+    assert "download_official_installer_from_page(" in code
+    expanded = _expand_runtime_helpers("download_official_installer_from_page('https://vendor.example/download')")
+    assert 'installer_suffixes = (".exe", ".msi", ".zip", ".alz")' in expanded
+    assert "installer/archive candidate" in expanded
+
+
+def test_generated_code_ignores_prompt_urls_allows_same_official_registrable_host() -> None:
+    prompt = "Download the installer from the official page https://vendor.example/download/."
+    code = 'import urllib.request\nurllib.request.urlopen("https://cdn.vendor.example/releases/TargetApp_Installer.zip")'
+    assert (
+        _generated_code_ignores_prompt_urls(
+            user_prompt=prompt,
+            python_code=code,
+            active_replan_reasons=["execution_error"],
+        )
+        is False
+    )
+    unrelated_code = 'import urllib.request\nurllib.request.urlopen("https://unrelated.example/releases/TargetApp_Installer.zip")'
+    assert (
+        _generated_code_ignores_prompt_urls(
+            user_prompt=prompt,
+            python_code=unrelated_code,
+            active_replan_reasons=["execution_error"],
+        )
+        is True
+    )
 
 
 def test_synthesized_visible_download_completion_code_rejects_mismatched_context_installer() -> None:
@@ -1304,7 +1370,7 @@ def test_framework_official_download_recovery_reuses_only_matching_existing_inst
     )
     assert 'if not KEYWORDS:' in code
     assert 'if not any(keyword in lowered for keyword in KEYWORDS):' in code
-    assert '(".exe", ".msi")' in code
+    assert 'installer_suffixes = (".exe", ".msi", ".zip", ".alz")' in code
 
 
 def test_duplicate_generation_detected_for_same_script() -> None:
