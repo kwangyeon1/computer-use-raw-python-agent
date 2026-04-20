@@ -185,7 +185,7 @@ def test_select_prompt_browser_url_avoids_suspicious_prefixed_hosts_and_store_pa
 def test_fallback_browser_search_url_uses_korean_app_keyword() -> None:
     url = _fallback_browser_search_url("카카오톡 pc버전 프로그램을 설치해줘")
     assert url is not None
-    assert url.startswith("https://www.bing.com/search?q=")
+    assert url.startswith("https://www.google.com/search?q=")
     assert "%EC%B9%B4%EC%B9%B4%EC%98%A4%ED%86%A1" in url
 
 
@@ -211,7 +211,7 @@ def test_execute_code_step_auto_prefixes_search_url_when_no_prompt_url_exists(tm
 
     sent_code = executor.calls[0]["python_code"]
     assert "def open_url_and_wait(" in sent_code
-    assert 'open_url_and_wait("https://www.bing.com/search?q=' in sent_code
+    assert 'open_url_and_wait("https://www.google.com/search?q=' in sent_code
     assert 'print("continue download flow")' in sent_code
 
 
@@ -242,7 +242,7 @@ def test_execute_code_step_prefers_exact_prompt_url_over_search_fallback(tmp_pat
 
     sent_code = executor.calls[0]["python_code"]
     assert 'open_url_and_wait("https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko"' in sent_code
-    assert 'https://www.bing.com/search?q=' not in sent_code
+    assert 'https://www.google.com/search?q=' not in sent_code
 
 
 def test_execute_code_step_uses_search_result_helper_for_search_url(tmp_path: Path) -> None:
@@ -269,5 +269,6 @@ print(html[:100])
     )
 
     sent_code = executor.calls[0]["python_code"]
-    assert 'open_url_and_wait("https://www.bing.com/search?q=' in sent_code
+    assert 'prompt_url = "https://www.google.com/search?q=' in sent_code
+    assert "open_url_and_wait(prompt_url" in sent_code
     assert "clicked = click_search_result_like_target(" in sent_code

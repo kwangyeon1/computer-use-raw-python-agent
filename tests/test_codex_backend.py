@@ -233,10 +233,15 @@ def test_codex_backend_resumes_with_per_run_state(tmp_path: Path) -> None:
     assert state["request_count"] == 4
 
     log_records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
-    assert log_records[0]["args"][:2] == ["exec", "-"]
-    assert log_records[1]["args"][:4] == ["exec", "resume", "session-123", "-"]
-    assert log_records[2]["args"][:4] == ["exec", "resume", "session-123", "-"]
-    assert log_records[3]["args"][:4] == ["exec", "resume", "session-123", "-"]
+    assert log_records[0]["args"][0] == "exec"
+    assert log_records[0]["args"][-1] == "-"
+    assert "resume" not in log_records[0]["args"]
+    assert "-C" in log_records[0]["args"]
+    for record in log_records[1:]:
+        args = record["args"]
+        assert args[:2] == ["exec", "resume"]
+        assert args[-2:] == ["session-123", "-"]
+        assert "-C" not in args[2:]
     assert "recent_history" not in log_records[0]["prompt"]
     assert "agent_response" not in log_records[0]["prompt"]
     assert '"web_search_context"' in log_records[0]["prompt"]

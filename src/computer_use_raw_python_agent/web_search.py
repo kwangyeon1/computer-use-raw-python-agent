@@ -232,9 +232,7 @@ class SearXNGClient:
         normalized_query = normalize_query(query)
         normalized_allowed = [domain for domain in (_normalize_domain(item) for item in (allowed_domains or [])) if domain]
         normalized_blocked = [domain for domain in (_normalize_domain(item) for item in (blocked_domains or [])) if domain]
-        normalized_preferred_engines = [
-            engine for engine in (_normalize_engine(item) for item in (preferred_engines or [])) if engine
-        ]
+        normalized_preferred_engines = ["google"]
 
         def _fetch_payload(*, engines: list[str] | None) -> dict[str, Any]:
             query_params: dict[str, str] = {"q": normalized_query, "format": "json"}
@@ -280,29 +278,15 @@ class SearXNGClient:
                     break
             return parsed_results
 
-        last_error: Exception | None = None
-        payloads_to_try: list[dict[str, Any]] = []
-        if normalized_preferred_engines:
-            try:
-                payloads_to_try.append(_fetch_payload(engines=normalized_preferred_engines))
-            except Exception as exc:
-                last_error = exc
-        if not payloads_to_try:
-            payloads_to_try.append(_fetch_payload(engines=None))
+        payloads_to_try: list[dict[str, Any]] = [
+            _fetch_payload(engines=normalized_preferred_engines)
+        ]
 
         parsed_results: list[dict[str, Any]] = []
         for payload in payloads_to_try:
             parsed_results = _parse_results(payload.get("results", []))
             if parsed_results:
                 break
-        if not parsed_results and normalized_preferred_engines:
-            try:
-                fallback_payload = _fetch_payload(engines=None)
-            except Exception:
-                if last_error is not None:
-                    raise last_error
-                raise
-            parsed_results = _parse_results(fallback_payload.get("results", []))
         return WebSearchResult(
             source="searxng",
             query=normalized_query,

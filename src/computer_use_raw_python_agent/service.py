@@ -111,30 +111,31 @@ def open_url_and_wait(url, *, expected_title_tokens=None, timeout_s=20.0, poll_i
 
     launch_errors = []
 
-    def _launch_windows_browser():
+    def _launch_windows_browser(*, prefer_explicit=False):
         launched = False
-        try:
-            os.startfile(target_url)
-            launched = True
-        except Exception as exc:
-            launch_errors.append(f"os.startfile: {exc}")
-        if launched:
-            return True
-
-        try:
-            result = subprocess.run(
-                ["cmd", "/c", "start", "", target_url],
-                capture_output=True,
-                text=True,
-                errors="replace",
-                check=False,
-                timeout=10,
-            )
-            if int(result.returncode or 0) == 0:
+        if not prefer_explicit:
+            try:
+                os.startfile(target_url)
+                launched = True
+            except Exception as exc:
+                launch_errors.append(f"os.startfile: {exc}")
+            if launched:
                 return True
-            launch_errors.append(f'cmd-start rc={result.returncode} stderr={result.stderr.strip()}')
-        except Exception as exc:
-            launch_errors.append(f"cmd-start: {exc}")
+
+            try:
+                result = subprocess.run(
+                    ["cmd", "/c", "start", "", target_url],
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    check=False,
+                    timeout=10,
+                )
+                if int(result.returncode or 0) == 0:
+                    return True
+                launch_errors.append(f'cmd-start rc={result.returncode} stderr={result.stderr.strip()}')
+            except Exception as exc:
+                launch_errors.append(f"cmd-start: {exc}")
 
         candidate_paths = []
         env_candidates = [
@@ -252,6 +253,14 @@ def open_url_and_wait(url, *, expected_title_tokens=None, timeout_s=20.0, poll_i
     def _browser_window_visible():
         return bool(_browser_window_candidates())
 
+    def _browser_window_titles():
+        titles = []
+        for _, window in _browser_window_candidates():
+            title = str(getattr(window, "title", "") or "").strip()
+            if title:
+                titles.append(title)
+        return titles
+
     def _activate_browser_window():
         candidates = _browser_window_candidates()
         for _, window in candidates:
@@ -266,6 +275,23 @@ def open_url_and_wait(url, *, expected_title_tokens=None, timeout_s=20.0, poll_i
                 continue
         return False
 
+    def _screen_text_matches_expected():
+        if not expected:
+            return False
+        if not _activate_browser_window():
+            return False
+        try:
+            lines = ocr_screen_text_regions(max_lines=80)
+        except Exception:
+            return False
+        combined = " | ".join(
+            str(item.get("text") or "").strip().lower()
+            for item in lines
+            if isinstance(item, dict) and str(item.get("text") or "").strip()
+        )
+        return bool(combined and any(token in combined for token in expected))
+
+    explicit_launch_retry_used = False
     while time.time() < deadline:
         title_ready = _matching_title_visible()
         browser_ready = _browser_running()
@@ -274,17 +300,31 @@ def open_url_and_wait(url, *, expected_title_tokens=None, timeout_s=20.0, poll_i
         if title_ready and elapsed >= float(settle_time_s):
             _activate_browser_window()
             return True
-        if browser_window_ready and elapsed >= max(float(settle_time_s), 4.0):
-            _activate_browser_window()
-            return True
         if not expected:
+            if browser_window_ready and elapsed >= max(float(settle_time_s), 4.0):
+                _activate_browser_window()
+                return True
             if browser_ready and elapsed >= float(settle_time_s) and _activate_browser_window():
                 return True
-        elif browser_ready and elapsed >= max(float(settle_time_s), 4.0) and _activate_browser_window():
-            return True
+        elif browser_window_ready and elapsed >= max(float(settle_time_s), 4.0):
+            if _screen_text_matches_expected():
+                return True
+            if not explicit_launch_retry_used and elapsed >= max(float(settle_time_s), 6.0):
+                explicit_launch_retry_used = True
+                if _launch_windows_browser(prefer_explicit=True):
+                    time.sleep(1.0)
+                    continue
         time.sleep(float(poll_interval_s))
 
-    detail = f" ({'; '.join(launch_errors)})" if launch_errors else ""
+    detail_parts = []
+    if launch_errors:
+        detail_parts.append("; ".join(launch_errors))
+    if expected:
+        detail_parts.append(f"expected visible page tokens: {expected}")
+        titles = _browser_window_titles()
+        if titles:
+            detail_parts.append(f"visible browser titles: {titles[:5]}")
+    detail = f" ({'; '.join(detail_parts)})" if detail_parts else ""
     raise SystemExit(f"browser or page did not become ready for: {target_url}{detail}")
 """.strip(),
     "wait_for_stable_download": """
@@ -397,7 +437,7 @@ def wait_for_stable_download(path_or_pattern, *, min_bytes=1_000_000, stable_che
     raise SystemExit(f"download not found for pattern: {raw}")
 """.strip(),
     "read_action_context": """
-def read_action_context(context_path):
+def read_action_context(context_path, *, prompt_key=None):
     import json
     import os
     from pathlib import Path
@@ -413,12 +453,21 @@ def read_action_context(context_path):
         return {"_context_path": str(path), "_exists": True, "_error": f"invalid_json: {exc}"}
     if not isinstance(payload, dict):
         payload = {}
+    expected_prompt_key = str(prompt_key or "").strip()
+    stored_prompt_key = str(payload.get("prompt_key") or "").strip()
+    if expected_prompt_key and stored_prompt_key != expected_prompt_key:
+        return {
+            "_context_path": str(path),
+            "_exists": True,
+            "_prompt_mismatch": True,
+            "previous_prompt_key": stored_prompt_key,
+        }
     payload["_context_path"] = str(path)
     payload["_exists"] = True
     return payload
 """.strip(),
     "write_action_context": """
-def write_action_context(context_path, **updates):
+def write_action_context(context_path, *, prompt_key=None, prompt_excerpt=None, **updates):
     import json
     import os
     import time
@@ -435,6 +484,14 @@ def write_action_context(context_path, **updates):
                 existing = loaded
         except Exception:
             existing = {}
+    expected_prompt_key = str(prompt_key or "").strip()
+    stored_prompt_key = str(existing.get("prompt_key") or "").strip()
+    if expected_prompt_key and stored_prompt_key != expected_prompt_key:
+        existing = {}
+    if expected_prompt_key:
+        existing["prompt_key"] = expected_prompt_key
+    if prompt_excerpt is not None:
+        existing["prompt_excerpt"] = str(prompt_excerpt)
     for key, value in updates.items():
         if value is None:
             continue
@@ -446,6 +503,18 @@ def write_action_context(context_path, **updates):
     existing["_context_path"] = str(path)
     existing["_exists"] = True
     return existing
+""".strip(),
+    "ensure_action_context": """
+def ensure_action_context(context_path, *, prompt_key=None, prompt_excerpt=None):
+    payload = read_action_context(context_path, prompt_key=prompt_key)
+    if payload.get("_prompt_mismatch") or not payload.get("_exists") or payload.get("_error"):
+        return write_action_context(
+            context_path,
+            prompt_key=prompt_key,
+            prompt_excerpt=prompt_excerpt,
+            phase="context_started",
+        )
+    return payload
 """.strip(),
     "browser_page_has_error_state": """
 def browser_page_has_error_state(*, image_path=None, expected_title_tokens=None):
@@ -2914,6 +2983,22 @@ def _context_path_expr_for_flow(
     return 'Path.home() / "Downloads" / "computer-use-agent-context.json"'
 
 
+def _context_prompt_key_for_request(request: StepRequest | None) -> tuple[str, str]:
+    raw_prompt = str(getattr(request, "user_prompt", "") or "")
+    normalized_prompt = re.sub(r"\s+", " ", raw_prompt).strip()
+    if not normalized_prompt:
+        return "", ""
+    prompt_key = hashlib.sha256(normalized_prompt.encode("utf-8")).hexdigest()[:24]
+    excerpt = re.sub(
+        r"\bPrevious\s+(?:stdout|stderr)\s+summary:.*?(?=\s+(?:Previous\s+(?:stdout|stderr)\s+summary:|Return executable Python only\.|REPLAN OVERRIDE)|$)",
+        "",
+        normalized_prompt,
+        flags=re.IGNORECASE,
+    ).strip()
+    excerpt = re.sub(r"\s+", " ", excerpt)
+    return prompt_key, (excerpt or normalized_prompt)[:240]
+
+
 def _looks_like_visible_installer_observation(request: StepRequest | None) -> bool:
     if request is None:
         return False
@@ -2962,13 +3047,15 @@ def _synthesized_visible_download_completion_code(
 ) -> str:
     extra_targets = _visible_flow_extra_targets(request, limit=2)
     initial_search_first = _looks_like_search_results_observation(request) or _url_looks_like_search_results(prompt_url)
-    fallback_search_url = None
     download_glob = _extract_prompt_download_glob(request.user_prompt)
+    fallback_search_url = None
     context_path_expr = _context_path_expr_for_flow(
         download_glob=download_glob,
         install_marker_path=_extract_prompt_install_marker_path(request.user_prompt),
         launch_marker_path=_extract_prompt_launch_marker_path(request.user_prompt),
     )
+    context_prompt_key, context_prompt_excerpt = _context_prompt_key_for_request(request)
+    prompt_open_fallback_url = _fallback_browser_search_url(request.user_prompt) if prompt_url else None
     if not prompt_url:
         fallback_search_url = _fallback_browser_search_url(request.user_prompt)
     lines: list[str] = []
@@ -2976,6 +3063,8 @@ def _synthesized_visible_download_completion_code(
     lines.append("from pathlib import Path")
     lines.append(f"search_first = {repr(bool(initial_search_first))}")
     lines.append(f"CONTEXT_PATH = {context_path_expr}")
+    lines.append(f"CONTEXT_PROMPT_KEY = {json.dumps(context_prompt_key, ensure_ascii=False)}")
+    lines.append(f"CONTEXT_PROMPT_EXCERPT = {json.dumps(context_prompt_excerpt, ensure_ascii=False)}")
     if prompt_url:
         lines.append(f"prompt_url = {json.dumps(prompt_url, ensure_ascii=False)}")
     else:
@@ -2984,10 +3073,24 @@ def _synthesized_visible_download_completion_code(
         lines.append(f"fallback_search_url = {json.dumps(fallback_search_url, ensure_ascii=False)}")
     else:
         lines.append("fallback_search_url = None")
+    if prompt_open_fallback_url:
+        lines.append(f"prompt_open_fallback_url = {json.dumps(prompt_open_fallback_url, ensure_ascii=False)}")
+    else:
+        lines.append("prompt_open_fallback_url = None")
     if prompt_url:
-        lines.append(
-            'open_url_and_wait(prompt_url, '
-            f'expected_title_tokens={json.dumps(extra_targets, ensure_ascii=False)})'
+        lines.extend(
+            [
+                "try:",
+                "    open_url_and_wait(prompt_url, "
+                f"expected_title_tokens={json.dumps(extra_targets, ensure_ascii=False)})",
+                "except SystemExit as open_exc:",
+                '    print(f"prompt URL did not verify in browser: {open_exc}")',
+                "    if not prompt_open_fallback_url:",
+                "        raise",
+                "    fallback_search_url = prompt_open_fallback_url",
+                "    prompt_url = None",
+                "    search_first = True",
+            ]
         )
     lines.extend(
         [
@@ -3005,7 +3108,7 @@ def _synthesized_visible_download_completion_code(
         lines.extend(
             [
                 "    installer = None",
-                "    context_payload = read_action_context(CONTEXT_PATH)",
+                "    context_payload = ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)",
                 '    context_installer = str(context_payload.get("installer_path") or "").strip().strip(\'"\')',
                 "    if context_installer:",
                 "        context_installer_lower = str(context_installer).lower()",
@@ -3067,6 +3170,8 @@ def _synthesized_visible_download_completion_code(
                 "    if installer is not None:",
                 "        write_action_context(",
                 "            CONTEXT_PATH,",
+                "            prompt_key=CONTEXT_PROMPT_KEY,",
+                "            prompt_excerpt=CONTEXT_PROMPT_EXCERPT,",
                 '            phase="downloaded",',
                 "            installer_path=str(installer),",
                 f"            expected_installer_glob={json.dumps(download_glob, ensure_ascii=False)},",
@@ -3183,16 +3288,21 @@ def _synthesized_visible_installer_recovery_code(
         download_glob=download_glob,
         install_marker_path=marker_path,
     )
+    context_prompt_key, context_prompt_excerpt = _context_prompt_key_for_request(request)
     return f"""from pathlib import Path
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
+import zipfile
 
 TARGET_DIR = {target_dir_expr}
 MARKER_PATH = {marker_expr}
 CONTEXT_PATH = {context_expr}
+CONTEXT_PROMPT_KEY = {json.dumps(context_prompt_key, ensure_ascii=False)}
+CONTEXT_PROMPT_EXCERPT = {json.dumps(context_prompt_excerpt, ensure_ascii=False)}
 EXPECTED_INSTALLER_GLOB = {json.dumps(download_glob, ensure_ascii=False)}
 EXTRA_TARGETS = {json.dumps(extra_targets, ensure_ascii=False)}
 VISIBLE_INSTALLER = {repr(bool(visible_installer))}
@@ -3236,6 +3346,8 @@ SYSTEM_APP_NAMES = {{
     "pwsh.exe",
     "conhost.exe",
 }}
+RUNNABLE_INSTALLER_SUFFIXES = {{".exe", ".msi"}}
+ARCHIVE_INSTALLER_SUFFIXES = {{".zip", ".alz"}}
 
 TARGET_DIR.mkdir(parents=True, exist_ok=True)
 MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -3244,7 +3356,7 @@ CONTEXT_PATH.parent.mkdir(parents=True, exist_ok=True)
 def _normalize_tokens(values, *, skip_extension_tokens: bool = False) -> list[str]:
     import re
 
-    extension_tokens = {"exe", "msi", "bat", "cmd", "lnk", "com", "scr"}
+    extension_tokens = {"exe", "msi", "zip", "alz", "bat", "cmd", "lnk", "com", "scr"}
     normalized = []
     seen = set()
     for raw in values:
@@ -3271,10 +3383,18 @@ def _iter_expected_installers() -> list[Path]:
             patterns.append(pattern[:-4] + ".msi")
         elif lowered.endswith(".msi"):
             patterns.append(pattern[:-4] + ".exe")
+        elif lowered.endswith(".zip"):
+            patterns.append(pattern[:-4] + ".alz")
+        elif lowered.endswith(".alz"):
+            patterns.append(pattern[:-4] + ".zip")
     if "*.exe" not in patterns:
         patterns.append("*.exe")
     if "*.msi" not in patterns:
         patterns.append("*.msi")
+    if "*.zip" not in patterns:
+        patterns.append("*.zip")
+    if "*.alz" not in patterns:
+        patterns.append("*.alz")
     matches = []
     seen = set()
     for pattern in patterns:
@@ -3298,7 +3418,7 @@ def _context_candidate(raw_value: str) -> Path | None:
     if not candidate_text:
         return None
     candidate = Path(os.path.expandvars(os.path.expanduser(candidate_text)))
-    if not candidate.exists() or not candidate.is_file() or candidate.suffix.lower() not in {".exe", ".msi"}:
+    if not candidate.exists() or not candidate.is_file() or candidate.suffix.lower() not in (RUNNABLE_INSTALLER_SUFFIXES | ARCHIVE_INSTALLER_SUFFIXES):
         return None
     return candidate
 
@@ -3361,7 +3481,7 @@ def _clear_invalid_install_marker() -> None:
         print(f"cleared stale install marker: {{MARKER_PATH}}")
 
 def _prune_context_install_state() -> None:
-    payload = read_action_context(CONTEXT_PATH)
+    payload = ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)
     if not payload.get("_exists"):
         return
     changed = False
@@ -3401,7 +3521,7 @@ def _score_path(path: Path) -> tuple[int, int, float]:
         elif normalized in lowered:
             score += 18
             matched_keywords += 1
-    if lowered.endswith((".exe", ".msi")):
+    if lowered.endswith((".exe", ".msi", ".zip", ".alz")):
         score += 10
     if path.name.lower() in SYSTEM_APP_NAMES:
         score -= 240
@@ -3420,7 +3540,7 @@ def _score_path(path: Path) -> tuple[int, int, float]:
     return score, matched_keywords, mtime
 
 def find_existing_installer() -> Path:
-    context_payload = read_action_context(CONTEXT_PATH)
+    context_payload = ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)
     context_installer = _context_candidate(context_payload.get("installer_path"))
     if context_installer is not None:
         lowered = str(context_installer).lower()
@@ -3446,6 +3566,91 @@ def find_existing_installer() -> Path:
         reverse=True,
     )
     return ranked[0]
+
+def _is_acceptable_runnable_installer(path: Path) -> bool:
+    if not path.exists() or not path.is_file() or path.suffix.lower() not in RUNNABLE_INSTALLER_SUFFIXES:
+        return False
+    lowered_name = path.name.lower()
+    if lowered_name in SYSTEM_APP_NAMES:
+        return False
+    if any(token in lowered_name for token in ("uninstall", "unins", "updater", "update", "repair")):
+        return False
+    return True
+
+def _find_runnable_installer_under(root: Path) -> Path | None:
+    candidates = []
+    seen = set()
+    for pattern in ("*.msi", "*.exe", "*/*.msi", "*/*.exe", "*/*/*.msi", "*/*/*.exe"):
+        try:
+            iterable = root.glob(pattern)
+        except Exception:
+            continue
+        for path in iterable:
+            if not _is_acceptable_runnable_installer(path):
+                continue
+            key = str(path).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            score, matched_keywords, mtime = _score_path(path)
+            lowered = str(path).lower()
+            if FILENAME_TARGET_KEYWORDS and any(keyword in lowered for keyword in FILENAME_TARGET_KEYWORDS):
+                score += 80
+                matched_keywords += 1
+            if any(token in path.name.lower() for token in ("setup", "installer", "install")):
+                score += 30
+            if path.suffix.lower() == ".msi":
+                score += 12
+            candidates.append((score, matched_keywords, mtime, path.stat().st_size, path))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+    return candidates[0][4]
+
+def extract_archive_installer(archive: Path) -> Path:
+    suffix = archive.suffix.lower()
+    if suffix not in ARCHIVE_INSTALLER_SUFFIXES:
+        return archive
+    extract_root = TARGET_DIR / "computer-use-agent-extracted"
+    extract_dir = extract_root / archive.stem
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    existing = _find_runnable_installer_under(extract_dir)
+    if existing is not None:
+        return existing
+    if suffix == ".zip":
+        try:
+            with zipfile.ZipFile(archive) as handle:
+                handle.extractall(extract_dir)
+        except Exception as exc:
+            raise SystemExit(f"failed to extract installer archive: {{archive}}: {{exc}}") from exc
+    elif suffix == ".alz":
+        seven_zip = next((candidate for candidate in ("7z", "7za", "7zr") if shutil.which(candidate)), None)
+        if not seven_zip:
+            raise SystemExit("cannot extract .alz installer archive because 7-Zip command is unavailable")
+        completed = subprocess.run(
+            [seven_zip, "x", "-y", f"-o{{extract_dir}}", str(archive)],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            check=False,
+            timeout=120,
+        )
+        if completed.returncode != 0:
+            raise SystemExit(f"failed to extract .alz installer archive: {{completed.stderr[-500:] or completed.stdout[-500:]}}")
+    extracted = _find_runnable_installer_under(extract_dir)
+    if extracted is None:
+        raise SystemExit(f"archive did not contain a runnable .exe/.msi installer: {{archive}}")
+    write_action_context(
+        CONTEXT_PATH,
+        prompt_key=CONTEXT_PROMPT_KEY,
+        prompt_excerpt=CONTEXT_PROMPT_EXCERPT,
+        phase="archive_extracted",
+        archive_path=str(archive),
+        installer_path=str(extracted),
+        expected_installer_glob=str(EXPECTED_INSTALLER_GLOB or ""),
+        target_keywords=EXTRA_TARGETS,
+    )
+    return extracted
 
 def _iter_registry_candidate_paths() -> list[Path]:
     try:
@@ -3603,7 +3808,7 @@ def write_marker(exe_path: Path) -> None:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 def _context_installed_executable() -> Path | None:
-    context_payload = read_action_context(CONTEXT_PATH)
+    context_payload = ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)
     candidate = _context_candidate(context_payload.get("installed_exe"))
     if candidate is None:
         return None
@@ -3615,16 +3820,20 @@ def _launch_installer(reason: str) -> None:
     try:
         if installer.suffix.lower() == ".msi":
             subprocess.Popen(["msiexec.exe", "/i", str(installer), "/passive", "/norestart"])
-        else:
+        elif installer.suffix.lower() == ".exe":
             try:
                 os.startfile(str(installer))
             except AttributeError:
                 subprocess.Popen([str(installer)])
+        else:
+            raise SystemExit(f"resolved installer is not runnable: {{installer}}")
     except Exception as launch_exc:
         raise SystemExit(f"failed to launch installer: {{launch_exc}}") from launch_exc
     print(f"installer launched in GUI mode ({{reason}})")
     write_action_context(
         CONTEXT_PATH,
+        prompt_key=CONTEXT_PROMPT_KEY,
+        prompt_excerpt=CONTEXT_PROMPT_EXCERPT,
         phase="installer_started",
         installer_path=str(installer),
         expected_installer_glob=str(EXPECTED_INSTALLER_GLOB or ""),
@@ -3633,13 +3842,21 @@ def _launch_installer(reason: str) -> None:
     time.sleep(6.0)
 
 installer = find_existing_installer()
+archive_installer = None
+if installer.suffix.lower() in ARCHIVE_INSTALLER_SUFFIXES:
+    archive_installer = installer
+    installer = extract_archive_installer(archive_installer)
+    print(f"extracted runnable installer from archive: {{installer}}")
 print(f"Found installer: {{installer}}")
 _clear_invalid_install_marker()
 _prune_context_install_state()
 write_action_context(
     CONTEXT_PATH,
+    prompt_key=CONTEXT_PROMPT_KEY,
+    prompt_excerpt=CONTEXT_PROMPT_EXCERPT,
     phase="installer_ready",
     installer_path=str(installer),
+    archive_path=(str(archive_installer) if archive_installer is not None else None),
     expected_installer_glob=str(EXPECTED_INSTALLER_GLOB or ""),
     target_keywords=EXTRA_TARGETS,
 )
@@ -3649,8 +3866,11 @@ if context_existing is not None:
     write_marker(context_existing)
     write_action_context(
         CONTEXT_PATH,
+        prompt_key=CONTEXT_PROMPT_KEY,
+        prompt_excerpt=CONTEXT_PROMPT_EXCERPT,
         phase="installed",
         installer_path=str(installer),
+        archive_path=(str(archive_installer) if archive_installer is not None else None),
         installed_exe=str(context_existing),
     )
     print(f"already installed from context: {{context_existing}}")
@@ -3690,8 +3910,11 @@ while time.time() < deadline:
             write_marker(existing)
             write_action_context(
                 CONTEXT_PATH,
+                prompt_key=CONTEXT_PROMPT_KEY,
+                prompt_excerpt=CONTEXT_PROMPT_EXCERPT,
                 phase="installed",
                 installer_path=str(installer),
+                archive_path=(str(archive_installer) if archive_installer is not None else None),
                 installed_exe=str(existing),
             )
             print(f"installation complete: {{existing}}")
@@ -3781,6 +4004,12 @@ def _synthesized_visible_launch_recovery_code(
         "path",
         "expected_installer_glob",
         "marker_path",
+        "설치",
+        "설치해줘",
+        "프로그램",
+        "프로그램을",
+        "버전",
+        "pc버전",
     }
     prompt_target_keywords = [
         keyword
@@ -3800,6 +4029,11 @@ def _synthesized_visible_launch_recovery_code(
                 break
             for token in re.findall(r"[a-z0-9가-힣][a-z0-9가-힣._-]{1,}", source_text.lower()):
                 cleaned = token.strip("._-")
+                if re.search(r"[가-힣]", cleaned):
+                    for suffix in ("으로는", "에서는", "에게는", "한테는", "으로", "에서", "에게", "한테", "까지", "부터", "보다", "처럼", "라고", "이라", "라도", "이다", "은", "는", "이", "가", "을", "를", "에", "와", "과", "도"):
+                        if cleaned.endswith(suffix) and len(cleaned) > len(suffix) + 1:
+                            cleaned = cleaned[: -len(suffix)]
+                            break
                 if (
                     not cleaned
                     or cleaned in fallback_stop_words
@@ -3870,6 +4104,7 @@ def _synthesized_visible_launch_recovery_code(
         launch_marker_path=launch_marker_path,
         download_glob=prompt_download_glob,
     )
+    context_prompt_key, context_prompt_excerpt = _context_prompt_key_for_request(request)
     return f"""from pathlib import Path
 import json
 import os
@@ -3880,6 +4115,8 @@ import time
 INSTALL_MARKER_PATH = {install_marker_expr}
 LAUNCH_MARKER_PATH = {launch_marker_expr}
 CONTEXT_PATH = {context_expr}
+CONTEXT_PROMPT_KEY = {json.dumps(context_prompt_key, ensure_ascii=False)}
+CONTEXT_PROMPT_EXCERPT = {json.dumps(context_prompt_excerpt, ensure_ascii=False)}
 PROMPT_TARGETS = {json.dumps(prompt_target_keywords, ensure_ascii=False)}
 EXTRA_TARGETS = {json.dumps(extra_targets, ensure_ascii=False)}
 GENERIC_TARGET_TOKENS = {{
@@ -4116,7 +4353,7 @@ def _clear_invalid_marker(path: Path, *, field: str) -> None:
     print(f"cleared stale marker: {{path}}")
 
 def _prune_context_launch_state() -> None:
-    payload = read_action_context(CONTEXT_PATH)
+    payload = ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)
     if not payload.get("_exists"):
         return
     changed = False
@@ -4144,7 +4381,7 @@ def _prune_context_launch_state() -> None:
         print(f"pruned stale launch state from context: {{CONTEXT_PATH}}")
 
 def _read_context_candidate() -> Path | None:
-    context_payload = read_action_context(CONTEXT_PATH)
+    context_payload = ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)
     raw = str(context_payload.get("installed_exe") or context_payload.get("launch_exe") or "").strip().strip('"')
     if not raw:
         return None
@@ -4266,6 +4503,8 @@ while time.time() < deadline:
         write_launch_marker(exe_path)
         write_action_context(
             CONTEXT_PATH,
+            prompt_key=CONTEXT_PROMPT_KEY,
+            prompt_excerpt=CONTEXT_PROMPT_EXCERPT,
             phase="launched",
             installed_exe=str(exe_path),
             launch_exe=str(exe_path),
@@ -4387,12 +4626,6 @@ def _has_installer_launch_action(code: str) -> bool:
         "/sp-",
         "/norestart",
     )
-    if any(
-        launch_token in normalized and installer_token in normalized
-        for launch_token in launch_tokens
-        for installer_token in installer_tokens
-    ):
-        return True
     for line in normalized.splitlines():
         stripped = line.strip()
         if any(token in stripped for token in launch_tokens) and any(token in stripped for token in installer_tokens):
@@ -4967,7 +5200,7 @@ def _looks_like_installer_launched_but_app_not_found(last_execution: dict[str, A
     if not any(marker in combined for marker in failure_markers):
         return False
     normalized = _normalize_python_code(python_code).lower()
-    return "subprocess.popen(" in normalized and ".exe" in normalized
+    return _has_installer_launch_action(normalized)
 
 
 def _looks_like_incomplete_install_attempt(last_execution: dict[str, Any], python_code: str, user_prompt: str) -> bool:
@@ -5544,7 +5777,7 @@ def _fallback_browser_search_url(text: str) -> str | None:
         else:
             query_terms.append("(" + " OR ".join(f"site:{domain}" for domain in search_domains[:2]) + ")")
     query = urllib.parse.quote(" ".join(query_terms))
-    return f"https://www.bing.com/search?q={query}"
+    return f"https://www.google.com/search?q={query}"
 
 
 def _last_execution_opened_search_results(last_execution: dict[str, Any]) -> bool:
@@ -6636,9 +6869,11 @@ def generate_step_response(
             notes=["framework_visible_installer_recovery_used"],
         )
     if _should_use_framework_visible_download_flow(request):
-        prompt_url = None
-        if not _has_visible_gui_continuation_cues(request):
-            prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url(request.user_prompt)
+        payload_metadata = dict(request.last_execution.get("payload_metadata") or {})
+        last_execution_code = str(payload_metadata.get("executed_python_code") or "")
+        prompt_url = _select_prompt_browser_url(request.user_prompt) or _select_prompt_browser_url(last_execution_code)
+        if not prompt_url and not _has_visible_gui_continuation_cues(request):
+            prompt_url = _fallback_browser_search_url(request.user_prompt)
         code = _synthesized_visible_download_completion_code(
             request,
             prompt_url=prompt_url,
@@ -7108,7 +7343,7 @@ def run_agent_control_loop(
     dependency_repairs_used = 0
     empty_generation_retries_used = 0
     invalid_generation_retries_used = 0
-    normalized_preferred_search_engines = [str(engine).strip().lower() for engine in (searxng_preferred_engines or []) if str(engine).strip()]
+    normalized_preferred_search_engines = ["google"]
     searxng_client = SearXNGClient(base_url=searxng_base_url, timeout_s=web_search_timeout_s) if web_search_enabled else None
 
     for step_index in range(max_iterations):

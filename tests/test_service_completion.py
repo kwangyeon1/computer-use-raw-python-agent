@@ -203,7 +203,7 @@ print(html[:100])
     )
     assert "open_url_and_wait(" in prepared
     assert "advance_visible_download_flow(" in prepared
-    assert "browser_page_has_error_state(" in prepared
+    assert "browser_page_has_error_state(" not in prepared
     assert "urllib.request.urlopen" not in prepared
 
 
@@ -234,13 +234,13 @@ def test_prepare_python_code_for_execution_auto_clicks_search_result_for_visible
         observation_text="search results | official download | windows",
         last_execution={
             "payload_metadata": {
-                "executed_python_code": 'open_url_and_wait("https://www.bing.com/search?q=targetapp+official+windows+download", expected_title_tokens=["targetapp"])',
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=targetapp+official+windows+download", expected_title_tokens=["targetapp"])',
             }
         },
     )
     prepared = _prepare_python_code_for_execution(request, 'print("continue")')
     assert "advance_visible_download_flow(" in prepared
-    assert "search_first=True" in prepared
+    assert "search_first = True" in prepared
 
 
 def test_extract_prompt_install_marker_path() -> None:
@@ -498,9 +498,12 @@ def test_synthesized_visible_download_completion_code_prefers_official_prompt_ur
         prompt_url="https://pc.example.com/talk",
     )
     assert "fallback_search_url = None" in code
+    assert 'prompt_open_fallback_url = "https://www.google.com/search?q=' in code
     assert 'prompt_url = "https://pc.example.com/talk"' in code
+    assert "prompt URL did not verify in browser" in code
+    assert "fallback_search_url = prompt_open_fallback_url" in code
     assert "browser_page_has_error_state(" not in code
-    assert "https://www.bing.com/search?q=" not in code
+    assert code.index("open_url_and_wait(prompt_url") < code.index("advance_visible_download_flow(")
 
 
 def test_synthesized_visible_download_completion_code_retries_visible_flow_before_failing_download_wait() -> None:
@@ -517,7 +520,7 @@ def test_synthesized_visible_download_completion_code_retries_visible_flow_befor
     assert "page_down_browser_view(steps=1)" in code
     assert "download_official_installer_from_page(" in code
     assert "CONTEXT_PATH = Path(os.path.expanduser(\"~/Downloads/computer-use-agent/targetapp-1234/computer-use-agent-context.json\"))" in code
-    assert "read_action_context(CONTEXT_PATH)" in code
+    assert "ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)" in code
     assert "write_action_context(" in code
 
 
@@ -678,6 +681,50 @@ def test_synthesized_visible_download_completion_code_rejects_mismatched_context
     assert 'print(f"ignoring mismatched context installer: {context_installer}")' in code
 
 
+def test_synthesized_visible_download_completion_uses_prompt_scoped_global_context() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Open the official vendor download page and download the Windows installer `.exe` "
+            "as `TargetApp_Setup.exe` into Downloads."
+        ),
+        execution_style="gui_first",
+    )
+    code = _synthesized_visible_download_completion_code(
+        request,
+        prompt_url="https://vendor.example/download/",
+    )
+    assert 'Path.home() / "Downloads" / "computer-use-agent-context.json"' in code
+    assert "CONTEXT_PROMPT_KEY =" in code
+    assert "CONTEXT_PROMPT_EXCERPT =" in code
+    assert "ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)" in code
+    assert "prompt_key=CONTEXT_PROMPT_KEY" in code
+    expanded = _expand_runtime_helpers(code)
+    compile(expanded, "<visible-download-prompt-context>", "exec")
+
+
+def test_action_context_resets_when_prompt_key_changes(tmp_path) -> None:
+    context_path = tmp_path / "computer-use-agent-context.json"
+    code = _expand_runtime_helpers(
+        """
+payload1 = write_action_context(path, prompt_key="prompt-a", prompt_excerpt="first", installer_path="old.exe")
+payload2 = read_action_context(path, prompt_key="prompt-b")
+payload_started = ensure_action_context(path, prompt_key="prompt-b", prompt_excerpt="second")
+payload3 = write_action_context(path, prompt_key="prompt-b", prompt_excerpt="second", installer_path="new.exe")
+payload4 = read_action_context(path, prompt_key="prompt-b")
+"""
+    )
+    namespace = {"path": context_path}
+    exec(code, namespace)
+    assert namespace["payload1"]["installer_path"] == "old.exe"
+    assert namespace["payload2"]["_prompt_mismatch"] is True
+    assert "installer_path" not in namespace["payload2"]
+    assert namespace["payload_started"]["phase"] == "context_started"
+    assert "installer_path" not in namespace["payload_started"]
+    assert namespace["payload3"]["installer_path"] == "new.exe"
+    assert namespace["payload4"]["prompt_key"] == "prompt-b"
+    assert namespace["payload4"]["installer_path"] == "new.exe"
+
+
 def test_existing_installer_launch_task_detected_for_generic_downloaded_installer_prompt() -> None:
     prompt = (
         "Locate the downloaded installer `.exe` in Downloads, verify it is the Windows installer, "
@@ -708,6 +755,24 @@ def test_synthesized_visible_installer_recovery_prefers_prompt_named_installer()
     code = _synthesized_visible_installer_recovery_code(request)
     assert 'EXPECTED_INSTALLER_GLOB = "TargetApp_Setup.exe"' in code
     assert "for path in TARGET_DIR.glob(pattern):" in code
+
+
+def test_synthesized_visible_installer_recovery_extracts_prompt_named_archive() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Use executable Python to extract the downloaded `~/Downloads/TargetApp_Installer.zip`, "
+            "locate the Windows installer executable or MSI inside the extracted files, and run it."
+        ),
+        execution_style="gui_first",
+    )
+    code = _synthesized_visible_installer_recovery_code(request)
+    assert 'EXPECTED_INSTALLER_GLOB = "TargetApp_Installer.zip"' in code
+    assert 'ARCHIVE_INSTALLER_SUFFIXES = {".zip", ".alz"}' in code
+    assert "def extract_archive_installer(" in code
+    assert "zipfile.ZipFile(archive)" in code
+    assert "installer = extract_archive_installer(archive_installer)" in code
+    expanded = _expand_runtime_helpers(code)
+    compile(expanded, "<visible-installer-archive-recovery>", "exec")
 
 
 def test_visible_flow_extra_targets_prefers_installer_filename_tokens() -> None:
@@ -774,7 +839,7 @@ def test_synthesized_visible_installer_recovery_does_not_use_extension_token_as_
     )
     code = _synthesized_visible_installer_recovery_code(request)
     assert "def _normalize_tokens(values, *, skip_extension_tokens: bool = False)" in code
-    assert "extension_tokens = ('exe', 'msi', 'bat', 'cmd', 'lnk', 'com', 'scr')" in code
+    assert "extension_tokens = ('exe', 'msi', 'zip', 'alz', 'bat', 'cmd', 'lnk', 'com', 'scr')" in code
     assert "FILENAME_TARGET_KEYWORDS = _normalize_tokens(" in code
     target_section = code.split("FILENAME_TARGET_KEYWORDS =", 1)[1].split("def _is_temp_like_path", 1)[0]
     assert "REQUESTED_INSTALLER_KEYWORDS or EXTRA_TARGETS" in target_section
@@ -801,10 +866,13 @@ def test_expand_runtime_helpers_includes_responsive_header_menu_flow() -> None:
     assert 'after_menu": False' in expanded
 
 
-def test_expand_runtime_helpers_relaxes_browser_open_readiness_to_visible_window() -> None:
+def test_expand_runtime_helpers_requires_expected_page_evidence_for_browser_open() -> None:
     expanded = _expand_runtime_helpers('open_url_and_wait("https://example.com", expected_title_tokens=["example"])')
     assert "def _browser_window_candidates()" in expanded
-    assert 'elapsed >= max(float(settle_time_s), 4.0)' in expanded
+    assert "def _screen_text_matches_expected()" in expanded
+    assert "ocr_screen_text_regions(max_lines=80)" in expanded
+    assert "expected visible page tokens" in expanded
+    assert "_launch_windows_browser(prefer_explicit=True)" in expanded
 
 
 def test_expand_runtime_helpers_includes_browser_error_state_detection() -> None:
@@ -819,6 +887,7 @@ def test_expand_runtime_helpers_includes_browser_search_state_detection() -> Non
     expanded = _expand_runtime_helpers('browser_page_has_search_results(expected_title_tokens=["targetapp"])')
     assert "def browser_page_has_search_results(" in expanded
     assert "bing" in expanded
+    assert "google" in expanded
     assert "duckduckgo" in expanded
     assert "ocr_screen_text_regions(" in expanded
 
@@ -844,7 +913,7 @@ def test_prompt_url_violation_rejects_search_discovery_when_official_url_exists(
         "Use Python to continue from the visible browser first and download the Windows installer. "
         "Official URL: https://pc.example.com/download"
     )
-    search_url = "https://www.bing.com/search?q=targetapp%20official%20windows%20download"
+    search_url = "https://www.google.com/search?q=targetapp%20official%20windows%20download"
     code = f"""open_url_and_wait({search_url!r}, expected_title_tokens=["targetapp"])
 flow = advance_visible_download_flow(extra_targets=["targetapp"], search_first=True, timeout_s=18.0)
 print(flow)
@@ -884,7 +953,7 @@ def test_visible_ui_click_recovery_uses_search_result_helper_for_search_results(
         observation_text="search results | official download | windows",
         last_execution={
             "payload_metadata": {
-                "executed_python_code": 'open_url_and_wait("https://www.bing.com/search?q=targetapp+official+windows+download", expected_title_tokens=["targetapp"])',
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=targetapp+official+windows+download", expected_title_tokens=["targetapp"])',
             }
         },
     )
@@ -1494,7 +1563,7 @@ def test_replan_prompt_rewrite_for_install_path_scan_failure_avoids_broad_rglob(
     )
     assert "Do not retry `/VERYSILENT` or `/SILENT` first on this step." in rewritten
     assert "Do not rglob the whole of LOCALAPPDATA or Program Files." in rewritten
-    assert "LOCALAPPDATA\\\\Programs\\\\DBeaver" in rewritten
+    assert "LOCALAPPDATA\\\\Programs\\\\<TargetApp>" in rewritten
 
 
 def test_missing_module_install_name_override_for_pywin32() -> None:
