@@ -3,13 +3,19 @@ from __future__ import annotations
 from computer_use_raw_python_agent.service import (
     _dependency_repair_user_prompt,
     _expand_runtime_helpers,
+    _extract_click_points_from_python,
     _extract_prompt_download_glob,
     _extract_prompt_install_marker_path,
     _extract_prompt_launch_marker_path,
     _fallback_browser_search_url,
+    _fallback_browser_search_url_for_request,
     _generated_code_ignores_prompt_urls,
     _has_visible_gui_continuation_cues,
+    _history_for_invalid_python_retry_with_prompt,
     _infer_response_done,
+    _looks_like_guessed_artifact_url_generation,
+    _looks_like_gui_first_download_chunk_network_bypass,
+    _looks_like_gui_first_download_chunk_install_mix,
     _looks_like_gui_first_silent_install_shortcut,
     _looks_like_gui_first_visible_ui_bypass,
     _looks_like_duplicate_generation,
@@ -33,10 +39,15 @@ from computer_use_raw_python_agent.service import (
     _rewrite_user_prompt_for_replan,
     _retry_token_budget,
     _select_prompt_browser_url,
+    _sanitize_observation_text_for_model,
+    _step_token_budget,
+    _synthesized_framework_visible_download_recovery_code,
     _synthesized_visible_download_completion_code,
     _synthesized_visible_installer_recovery_code,
     _synthesized_visible_launch_recovery_code,
     _synthesized_visible_ui_click_recovery_code,
+    _should_soft_allow_gui_first_download_bypass_for_auto_open,
+    _uses_deprecated_ocr_helper,
     _should_use_framework_visible_launch_recovery,
     _should_use_framework_visible_installer_recovery,
     _should_use_framework_visible_download_flow,
@@ -172,7 +183,7 @@ def test_gui_first_download_retry_keeps_screenshot_for_generation() -> None:
     ) is False
 
 
-def test_prepare_python_code_for_execution_auto_clicks_download_control_for_gui_first_visible_ui() -> None:
+def test_prepare_python_code_for_execution_does_not_auto_click_download_control_for_gui_first_visible_ui() -> None:
     request = StepRequest(
         user_prompt="Use Python to open the official vendor page and download the Windows installer `.exe`.",
         execution_style="gui_first",
@@ -185,11 +196,100 @@ def test_prepare_python_code_for_execution_auto_clicks_download_control_for_gui_
         },
     )
     prepared = _prepare_python_code_for_execution(request, 'print("continue")')
+    assert prepared == 'print("continue")'
+    assert "advance_visible_download_flow(" not in prepared
+    assert "click_download_like_target(" not in prepared
+
+
+def test_prepare_python_code_for_execution_replaces_blind_percentage_click_with_visible_download_flow() -> None:
+    request = StepRequest(
+        user_prompt="Continue from the visible official download page and download `targetapp-setup.exe` into Downloads.",
+        execution_style="gui_first",
+        screenshot_base64="ZmFrZQ==",
+        observation_text="Visible browser page with the official targetapp download button and installer file name.",
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+    )
+    prepared = _prepare_python_code_for_execution(
+        request,
+        """import pyautogui, time
+screen_w, screen_h = pyautogui.size()
+btn_x = int(screen_w * 0.68)
+btn_y = int(screen_h * 0.58)
+pyautogui.click(btn_x, btn_y)
+time.sleep(2)
+""",
+    )
     assert "advance_visible_download_flow(" in prepared
-    assert "visible download automation incomplete:" in prepared
+    assert "wait_for_stable_download(" in prepared
+    assert "btn_x = int(screen_w * 0.68)" not in prepared
 
 
-def test_prepare_python_code_for_execution_replaces_gui_first_http_bypass_with_browser_click_flow() -> None:
+def test_prepare_python_code_for_execution_replaces_risky_pygetwindow_retry_with_visible_download_flow() -> None:
+    request = StepRequest(
+        user_prompt="Continue from the visible browser page and download `targetapp-setup.exe` only.",
+        execution_style="gui_first",
+        screenshot_base64="ZmFrZQ==",
+        observation_text="Visible browser page on the official vendor site with a download control.",
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+    )
+    prepared = _prepare_python_code_for_execution(
+        request,
+        """import pygetwindow as gw
+window = gw.getActiveWindow()
+gw = gw.getActiveWindow()
+for win in gw.getAllWindows():
+    print(win.title)
+""",
+    )
+    assert "advance_visible_download_flow(" in prepared
+    assert "gw = gw.getActiveWindow()" not in prepared
+
+
+def test_prepare_python_code_for_execution_replaces_single_coordinate_replan_click_with_visible_download_flow() -> None:
+    request = StepRequest(
+        user_prompt="Continue from the visible official download page and download `targetapp-setup.exe` only.",
+        execution_style="gui_first",
+        screenshot_base64="ZmFrZQ==",
+        observation_text="Visible official browser page with a download button.",
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+    )
+    prepared = _prepare_python_code_for_execution(
+        request,
+        """import pyautogui
+pyautogui.click(720, 480)
+""",
+    )
+    assert "advance_visible_download_flow(" in prepared
+    assert "pyautogui.click(720, 480)" not in prepared
+
+
+def test_prepare_python_code_for_execution_replaces_browser_save_shortcut_flow_with_visible_download_flow() -> None:
+    request = StepRequest(
+        user_prompt="Open the official page at https://vendor.example/download and download `targetapp-setup.exe`.",
+        execution_style="gui_first",
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+    )
+    prepared = _prepare_python_code_for_execution(
+        request,
+        """import pyautogui, time
+pyautogui.hotkey('ctrl', 't')
+pyautogui.write('https://vendor.example/download', interval=0.05)
+pyautogui.press('enter')
+time.sleep(2)
+pyautogui.click(600, 500)
+pyautogui.hotkey('ctrl', 's')
+""",
+    )
+    assert "advance_visible_download_flow(" in prepared
+    assert "open_url_and_wait(" in prepared
+    assert "pyautogui.hotkey('ctrl', 's')" not in prepared
+
+
+def test_prepare_python_code_for_execution_opens_search_without_replacing_http_bypass_with_ocr_flow() -> None:
     request = StepRequest(
         user_prompt="카카오톡 pc버전 프로그램을 설치해줘",
         execution_style="gui_first",
@@ -202,9 +302,10 @@ print(html[:100])
 """,
     )
     assert "open_url_and_wait(" in prepared
-    assert "advance_visible_download_flow(" in prepared
+    assert "advance_visible_download_flow(" not in prepared
+    assert "click_download_like_target(" not in prepared
     assert "browser_page_has_error_state(" not in prepared
-    assert "urllib.request.urlopen" not in prepared
+    assert "urllib.request.urlopen" in prepared
 
 
 def test_prepare_python_code_for_execution_does_not_treat_file_write_as_gui_progress() -> None:
@@ -222,8 +323,8 @@ with urllib.request.urlopen("https://example.com/download", timeout=30) as respo
 print(dest)
 """,
     )
-    assert "advance_visible_download_flow(" in prepared
-    assert "urllib.request.urlopen" not in prepared
+    assert "advance_visible_download_flow(" not in prepared
+    assert "urllib.request.urlopen" in prepared
 
 
 def test_prepare_python_code_for_execution_auto_clicks_search_result_for_visible_search_results() -> None:
@@ -239,8 +340,20 @@ def test_prepare_python_code_for_execution_auto_clicks_search_result_for_visible
         },
     )
     prepared = _prepare_python_code_for_execution(request, 'print("continue")')
-    assert "advance_visible_download_flow(" in prepared
-    assert "search_first = True" in prepared
+    assert prepared == 'print("continue")'
+    assert "advance_visible_download_flow(" not in prepared
+    assert "search_first = True" not in prepared
+
+
+def test_deprecated_ocr_helper_calls_are_detected() -> None:
+    assert _uses_deprecated_ocr_helper("result = click_download_like_target(timeout_s=3)") is True
+    assert _uses_deprecated_ocr_helper("lines = ocr_screen_text_regions(max_lines=20)") is True
+    assert _uses_deprecated_ocr_helper("import pyautogui\npyautogui.click(900, 420)") is False
+
+
+def test_ocr_observation_text_is_sanitized_when_framework_ocr_helpers_are_disabled() -> None:
+    assert _sanitize_observation_text_for_model("OCR visible text with download/install cues: 다운로드") is None
+    assert _sanitize_observation_text_for_model("Visible installer wizard is open") == "Visible installer wizard is open"
 
 
 def test_extract_prompt_install_marker_path() -> None:
@@ -316,6 +429,17 @@ def test_framework_visible_installer_recovery_selected_for_downloaded_msi_instal
     assert _should_use_framework_visible_download_flow(request) is False
 
 
+def test_framework_visible_download_flow_selected_for_gui_first_download_only_chunk() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Use Python to open the official vendor page and download only the Windows installer "
+            "to `~/Downloads/targetapp-setup.exe`."
+        ),
+        execution_style="gui_first",
+    )
+    assert _should_use_framework_visible_download_flow(request) is True
+
+
 def test_framework_visible_installer_recovery_selected_for_launch_downloaded_named_msi_chunk() -> None:
     request = StepRequest(
         user_prompt=(
@@ -383,8 +507,8 @@ def test_visible_flow_extra_targets_ignore_helper_names_and_keep_app_keyword() -
     request = StepRequest(
         user_prompt=(
             "대상 앱과 일치하는 installer만 사용하세요. 파일명은 가능하면 `카카오톡`, `install` 같은 대상 앱 키워드를 포함해야 하며, "
-            "보이는 download/install control 이 있으면 OCR-grounded helper 예를 들어 "
-            "`click_download_like_target()` 또는 `click_text_targets([...])` 같은 helper를 우선 고려하세요. "
+            "보이는 download/install control 이 있으면 screenshot-grounded coordinate click을 우선 고려하세요. "
+            "Do not use OCR helper names such as `click_download_like_target()` or `click_text_targets([...])`. "
             "Do not import pywin32, pywinauto, win32gui, win32con, win32api, pythoncom. "
             "Avoid recursively scanning %LOCALAPPDATA% or %ProgramFiles%."
         ),
@@ -421,6 +545,7 @@ def test_synthesized_visible_launch_recovery_ignores_invalid_install_marker_and_
     assert "_read_context_candidate()" in code
     assert "_iter_registry_candidate_paths()" in code
     assert "_process_running(exe_path)" in code
+    assert "write_install_marker(exe_path)" in code
     assert "write_launch_marker(exe_path)" in code
     assert "write_action_context(" in code
 
@@ -455,6 +580,37 @@ def test_fallback_browser_search_url_adds_vendor_domain_filters_from_prompt_urls
     assert url is not None
     assert "site%3Aexample.com" in url
     assert "site%3Aexamplecorp.com" in url
+
+
+def test_replan_fallback_browser_search_url_does_not_use_workflow_noise() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Do not use urllib, requests, regex-based HTML scraping, or fresh direct-download discovery.\n"
+            "Previous stderr summary: no official Windows installer/archive candidate found on the current page"
+        ),
+        execution_style="gui_first",
+        replan_requested=True,
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://mydev.kr/", expected_title_tokens=["memoit193", "mydev"])',
+            }
+        },
+    )
+    url = _fallback_browser_search_url_for_request(
+        request,
+        prompt_url="https://mydev.kr/",
+        extra_targets=["memoit193", "mydev"],
+    )
+    assert url is not None
+    assert "memoit" in url
+    assert "memoit193" not in url
+    assert "mydev" in url
+    assert "site%3Amydev.kr" in url
+    assert "site%3Agoogle.com" not in url
+    assert "network" not in url
+    assert "parsing" not in url
+    assert "logic" not in url
 
 
 def test_select_prompt_browser_url_prefers_korean_locale_for_hangul_task() -> None:
@@ -504,6 +660,58 @@ def test_synthesized_visible_download_completion_code_prefers_official_prompt_ur
     assert "fallback_search_url = prompt_open_fallback_url" in code
     assert "browser_page_has_error_state(" not in code
     assert code.index("open_url_and_wait(prompt_url") < code.index("advance_visible_download_flow(")
+
+
+def test_synthesized_framework_visible_download_recovery_code_uses_prompt_url_without_visible_browser() -> None:
+    request = StepRequest(
+        user_prompt="카카오톡 pc버전 프로그램을 설치해줘",
+        execution_style="gui_first",
+        observation_text=None,
+    )
+    code = _synthesized_framework_visible_download_recovery_code(request)
+    assert 'prompt_url = "https://www.google.com/search?q=' in code
+    assert "open_url_and_wait(prompt_url" in code
+    assert "advance_visible_download_flow(" in code
+    assert "wait_for_recent_download_artifact(" in code
+    assert "since_ts=download_started_at" in code
+
+
+def test_synthesized_framework_visible_download_recovery_code_stays_on_visible_browser_when_grounded() -> None:
+    request = StepRequest(
+        user_prompt="Continue from the visible browser page and download the installer.",
+        execution_style="gui_first",
+        observation_text="Visible browser page with download button and installer name.",
+    )
+    code = _synthesized_framework_visible_download_recovery_code(request)
+    assert "prompt_url = None" in code
+    assert "open_url_and_wait(prompt_url" not in code
+    assert "advance_visible_download_flow(" in code
+
+
+def test_synthesized_visible_download_completion_code_uses_stable_replan_fallback_query() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Continue from the visible browser/download UI.\n"
+            "Do not use urllib, requests, regex-based HTML scraping, or fresh direct-download discovery.\n"
+            "Previous stderr summary: no official Windows installer/archive candidate found on the current page"
+        ),
+        execution_style="gui_first",
+        replan_requested=True,
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://mydev.kr/", expected_title_tokens=["memoit193", "mydev"])',
+            }
+        },
+    )
+    code = _synthesized_visible_download_completion_code(
+        request,
+        prompt_url="https://mydev.kr/",
+    )
+    assert "network%20parsing%20logic" not in code
+    assert "memoit" in code
+    assert "site%3Amydev.kr" in code
+    assert "site%3Agoogle.com" not in code
 
 
 def test_synthesized_visible_download_completion_code_retries_visible_flow_before_failing_download_wait() -> None:
@@ -616,7 +824,7 @@ def test_synthesized_visible_download_completion_code_waits_for_prompt_named_ins
         request,
         prompt_url="https://downloads.vendor.example/releases/TargetApp_Setup.exe",
     )
-    assert code.startswith("import fnmatch\nfrom pathlib import Path\n")
+    assert code.startswith("import fnmatch\nimport time\nfrom pathlib import Path\n")
     assert 'wait_for_stable_download("TargetApp_Setup.exe"' in code
     assert 'print(f"download ready: {installer}")' in code
 
@@ -675,7 +883,7 @@ def test_synthesized_visible_download_completion_code_rejects_mismatched_context
         request,
         prompt_url="https://vendor.example/download/",
     )
-    assert code.startswith("import fnmatch\nfrom pathlib import Path\n")
+    assert code.startswith("import fnmatch\nimport time\nfrom pathlib import Path\n")
     assert "context_installer_name = Path(context_installer).name.lower()" in code
     assert 'expected_download_glob = "targetapp_setup.exe"' in code
     assert 'print(f"ignoring mismatched context installer: {context_installer}")' in code
@@ -733,7 +941,7 @@ def test_existing_installer_launch_task_detected_for_generic_downloaded_installe
     assert _looks_like_existing_installer_launch_task(prompt) is True
 
 
-def test_visible_installer_recovery_selected_for_generic_installer_prompt() -> None:
+def test_visible_installer_recovery_not_selected_for_generic_installer_prompt() -> None:
     request = StepRequest(
         user_prompt=(
             "Locate the downloaded installer `.exe` in Downloads, verify it is the Windows installer, "
@@ -755,6 +963,19 @@ def test_synthesized_visible_installer_recovery_prefers_prompt_named_installer()
     code = _synthesized_visible_installer_recovery_code(request)
     assert 'EXPECTED_INSTALLER_GLOB = "TargetApp_Setup.exe"' in code
     assert "for path in TARGET_DIR.glob(pattern):" in code
+
+
+def test_synthesized_visible_installer_recovery_reuses_running_installer() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Locate `~/Downloads/TargetApp_Setup.exe`, verify it is the downloaded Windows installer, "
+            "reuse an already-running matching installer if it is open, and continue through the installer wizard."
+        ),
+        execution_style="gui_first",
+    )
+    code = _synthesized_visible_installer_recovery_code(request)
+    assert "def _installer_process_running() -> bool:" in code
+    assert 'print(f"reusing running installer: {installer}")' in code
 
 
 def test_synthesized_visible_installer_recovery_extracts_prompt_named_archive() -> None:
@@ -806,11 +1027,24 @@ def test_expand_runtime_helpers_visible_installer_flow_does_not_target_runner_wi
     assert '"no installer-like window"' in expanded
     assert '"installer_text_click_first"' in expanded
     assert "def _license_accept_prompt_visible(region):" in expanded
+    assert "def _install_action_prompt_visible(region):" in expanded
     assert "def _set_license_checkbox_child_checked(region):" in expanded
     assert "SendMessageW(child_hwnd, 0x00F5, 0, 0)" in expanded
     assert "SendMessageW(child_hwnd, 0x00F1, 1, 0)" in expanded
-    assert '"hwnd": int(getattr(window, "_hWnd", 0)' in expanded
+    assert '"hwnd": hwnd' in expanded
+    assert '"process_name": str(process_meta.get("name") or "")' in expanded
     assert '"installer_license_accept_keys"' in expanded
+    assert '"installer_keyboard_primary_guided_install"' in expanded
+    assert '"installer_guided_action_click"' in expanded
+    assert "def _installer_candidate_allowed(" in expanded
+    assert 'heuristic_sweep_threshold = 0 if installer_mode else 2' in expanded
+    assert 'candidate_source="word_bbox"' in expanded
+    assert 'candidate_source="line_bbox"' in expanded
+    assert '(0.78, 0.90)' in expanded
+    assert '(0.90, 0.90)' in expanded
+    assert "def _enumerate_child_controls(region):" in expanded
+    assert "def _click_primary_action_child_button(region):" in expanded
+    assert '"installer_child_button_click"' in expanded
 
 
 def test_synthesized_visible_installer_recovery_launches_msi_when_ui_not_confirmed() -> None:
@@ -846,12 +1080,18 @@ def test_synthesized_visible_installer_recovery_does_not_use_extension_token_as_
     assert ".name for path in INSTALLERS" not in target_section
 
 
-def test_expand_runtime_helpers_includes_browser_region_heuristic_click() -> None:
+def test_expand_runtime_helpers_search_result_click_avoids_blind_heuristics() -> None:
     expanded = _expand_runtime_helpers("click_search_result_like_target(extra_targets=['targetapp'])")
     assert "def _heuristic_browser_click(" in expanded
     assert "browser_search_result_region" in expanded
     assert "screen-browser-region-fallback" in expanded
     assert "active_region = _browser_window_region()" in expanded
+    helper_section = expanded.split("def click_search_result_like_target(", 1)[1].split("def click_text_targets(", 1)[0]
+    assert "context_match_scope=\"near\"" in helper_section
+    assert "allow_heuristic_fallback=False" in helper_section
+    assert "query_reject_texts.append" in helper_section
+    assert "reject_texts=query_reject_texts" in helper_section
+    assert "min_relative_top_px=210" in helper_section
 
 
 def test_expand_runtime_helpers_includes_responsive_header_menu_flow() -> None:
@@ -859,20 +1099,59 @@ def test_expand_runtime_helpers_includes_responsive_header_menu_flow() -> None:
     assert "def open_responsive_header_menu(" in expanded
     assert 'heuristic_mode="menu"' in expanded
     assert "browser_header_menu_region" in expanded
+    menu_section = expanded.split("def open_responsive_header_menu(", 1)[1].split("def click_text_targets(", 1)[0]
+    assert "targets.extend" not in menu_section
+    assert "min_primary_hits=1" in menu_section
+    assert "skip_click_points=skip_click_points" in menu_section
+    assert "max_relative_top_px=240" not in menu_section
+    assert "exact_word_targets=True" not in menu_section
     assert "responsive_header_menu_prefetch" in expanded
+    assert "responsive_header_menu_retry" in expanded
+    assert "menu_clicked_points" in expanded
+    assert "_try_menu_candidates_then_download" in expanded
+    assert "def _budgeted_timeout" in expanded
+    assert "visible download flow time budget exhausted" in expanded
+    assert "candidate retry budget exhausted" in expanded
     assert "diversion_cues_present" in expanded
     assert "allow_heuristic_fallback=False" in expanded
-    assert "download_control_heuristic" in expanded
+    assert "download_control_scroll_retry" in expanded
+    assert "download_keyboard_fallback" not in expanded
+    assert "search_result_keyboard_fallback" not in expanded
+    assert "def _tab_enter(" not in expanded
+    assert "page_down_browser_view(steps=1" in expanded
+    assert "context_targets=list(extra_targets or [])" in expanded
+    assert "require_context=bool(extra_targets)" in expanded
+    assert "download_context_scope = \"near\" if search_results_visible else \"page\"" in expanded
+    assert "context_match_scope=download_context_scope" in expanded
+    assert "def click_download_related_fallback(" in expanded
+    assert "download_related_window_fallback_skipped" in expanded
+    assert "clear_download_page_required" in expanded
+    assert "download_action_text" in expanded
+    assert "candidate_index" in expanded
+    assert "skip_click_points=clicked_points" in expanded
+    assert "download_related_window_fallback_page_open" in expanded
     assert 'after_menu": False' in expanded
 
 
-def test_expand_runtime_helpers_requires_expected_page_evidence_for_browser_open() -> None:
+def test_expand_runtime_helpers_overlay_dismiss_does_not_click_without_overlay() -> None:
+    expanded = _expand_runtime_helpers("dismiss_browser_overlay()")
+    assert "if not overlay_detected:" in expanded
+    assert "overlay_context_detected and overlay_action_detected" in expanded
+    assert "context_targets=overlay_context_terms" in expanded
+    assert '"더보기"' not in expanded
+    assert '"more"' not in expanded
+    assert '"dismissed": False' in expanded
+    no_overlay_section = expanded.split("if not overlay_detected:", 1)[1].split("try:", 1)[0]
+    assert "SetCursorPos" not in no_overlay_section
+    assert "mouse_event" not in no_overlay_section
+
+
+def test_expand_runtime_helpers_open_url_does_not_pull_ocr_helper() -> None:
     expanded = _expand_runtime_helpers('open_url_and_wait("https://example.com", expected_title_tokens=["example"])')
     assert "def _browser_window_candidates()" in expanded
-    assert "def _screen_text_matches_expected()" in expanded
-    assert "ocr_screen_text_regions(max_lines=80)" in expanded
+    assert "def _screen_text_matches_expected()" not in expanded
+    assert "ocr_screen_text_regions(" not in expanded
     assert "expected visible page tokens" in expanded
-    assert "_launch_windows_browser(prefer_explicit=True)" in expanded
 
 
 def test_expand_runtime_helpers_includes_browser_error_state_detection() -> None:
@@ -1240,6 +1519,20 @@ def test_visible_flow_extra_targets_use_last_execution_prompt_url_on_retry() -> 
     assert "테스트만" not in keywords
 
 
+def test_visible_flow_extra_targets_keep_installer_prefix_and_task_keywords() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Using Python on Windows, open the official Memoit site at https://mydev.kr/ "
+            "and download only `setup_memoit193.exe` for 메모잇."
+        ),
+        execution_style="gui_first",
+    )
+    keywords = _visible_flow_extra_targets(request, limit=4)
+    assert "memoit193" in keywords
+    assert "memoit" in keywords
+    assert "메모잇" in keywords
+
+
 def test_prompt_keyword_candidates_ignore_percent_encoded_fragments() -> None:
     text = (
         "Open https://pc.example.com/talk/notices/en%3Fagent%3Dwin32 and continue the official flow."
@@ -1336,6 +1629,133 @@ pyautogui.press("enter")
     assert _looks_like_gui_first_visible_ui_bypass(request, code) is False
 
 
+def test_guessed_artifact_url_generation_detected_for_page_prompt_same_host_exe_jump() -> None:
+    prompt = (
+        "Open the official vendor page at https://mydev.kr/ and download the installer only after discovering the real link from that official page."
+    )
+    code = """from pathlib import Path
+import urllib.request
+target = Path.home() / "Downloads" / "setup_memoit193.exe"
+with urllib.request.urlopen("https://mydev.kr/setup_memoit193.exe", timeout=60) as resp, open(target, "wb") as fh:
+    fh.write(resp.read())
+"""
+    assert _looks_like_guessed_artifact_url_generation(user_prompt=prompt, python_code=code) is True
+
+
+def test_guessed_artifact_url_generation_not_detected_when_prompt_page_html_is_fetched_first() -> None:
+    prompt = (
+        "Open the official vendor page at https://mydev.kr/ and discover the installer link from that page."
+    )
+    code = """import re, urllib.request
+html = urllib.request.urlopen("https://mydev.kr/", timeout=60).read().decode("utf-8", errors="replace")
+match = re.findall(r'https://[^\\s"\']+\\.exe', html)
+print(match[:1])
+"""
+    assert _looks_like_guessed_artifact_url_generation(user_prompt=prompt, python_code=code) is False
+
+
+def test_gui_first_download_chunk_install_mix_detected_for_download_only_chunk() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Current chunk success target: The installer `setup_memoit193.exe` is present in Downloads and has a nontrivial file size. "
+            "Do only this chunk. Do not skip ahead to later chunks."
+        ),
+        execution_style="gui_first",
+    )
+    code = """from pathlib import Path
+import subprocess
+target = Path.home() / "Downloads" / "setup_memoit193.exe"
+subprocess.Popen([str(target), "/VERYSILENT", "/SP-", "/NORESTART"])
+"""
+    assert _looks_like_gui_first_download_chunk_install_mix(request, code) is True
+
+
+def test_gui_first_download_chunk_install_mix_ignores_browser_start_url_to_exe() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Current chunk success target: The installer `setup_target.exe` is present in Downloads and has a nontrivial file size. "
+            "Do only this chunk. Do not skip ahead to later chunks."
+        ),
+        execution_style="gui_first",
+    )
+    code = """import subprocess
+subprocess.run(["start", "https://vendor.example/download/setup_target.exe"], shell=True)
+"""
+    assert _looks_like_gui_first_download_chunk_install_mix(request, code) is False
+
+
+def test_gui_first_download_chunk_network_bypass_detected_for_html_scraping_without_gui() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Current chunk success target: A target-app installer `.exe` or `.msi` exists in Downloads and is non-empty. "
+            "Do only this chunk. Do not skip ahead to later chunks."
+        ),
+        execution_style="gui_first",
+    )
+    code = """import re
+import urllib.request
+html = urllib.request.urlopen("https://vendor.example/download", timeout=60).read().decode("utf-8")
+links = re.findall(r'https?://[^\\s"\']+\\.exe', html)
+print(links[:1])
+"""
+    assert _looks_like_gui_first_download_chunk_network_bypass(request, code) is True
+
+
+def test_gui_first_download_bypass_can_execute_when_auto_open_prelude_is_available() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Open the official vendor page at https://vendor.example/download and download the Windows installer `.exe`. "
+            "Current chunk success target: A target-app installer `.exe` exists in Downloads."
+        ),
+        execution_style="gui_first",
+    )
+    code = """import urllib.request
+html = urllib.request.urlopen("https://vendor.example/download", timeout=60).read().decode("utf-8")
+print(html[:80])
+"""
+    assert _looks_like_gui_first_download_chunk_network_bypass(request, code) is True
+    assert _should_soft_allow_gui_first_download_bypass_for_auto_open(
+        request,
+        code,
+        gui_first_download_chunk_network_bypass=True,
+    ) is False
+    prepared = _prepare_python_code_for_execution(request, code)
+    assert "open_url_and_wait(" in prepared
+    assert "urllib.request.urlopen" in prepared
+
+
+def test_gui_first_download_bypass_not_soft_allowed_when_visible_ui_exists() -> None:
+    request = StepRequest(
+        user_prompt="Current chunk success target: A target-app installer `.exe` exists in Downloads.",
+        execution_style="gui_first",
+        observation_text="visible browser page with download button",
+    )
+    code = """import urllib.request
+urllib.request.urlopen("https://vendor.example/download").read()
+"""
+    assert _should_soft_allow_gui_first_download_bypass_for_auto_open(
+        request,
+        code,
+        gui_first_download_chunk_network_bypass=True,
+    ) is False
+
+
+def test_gui_first_download_chunk_network_bypass_allows_screenshot_grounded_gui_code() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Current chunk success target: A target-app installer `.exe` or `.msi` exists in Downloads and is non-empty. "
+            "Do only this chunk. Do not skip ahead to later chunks."
+        ),
+        execution_style="gui_first",
+    )
+    code = """import pyautogui
+import time
+pyautogui.click(1180, 430)
+time.sleep(3)
+"""
+    assert _looks_like_gui_first_download_chunk_network_bypass(request, code) is False
+
+
 def test_gui_first_silent_install_shortcut_detected_for_existing_installer_task() -> None:
     request = StepRequest(
         user_prompt=(
@@ -1371,6 +1791,25 @@ def test_gui_first_silent_install_shortcut_not_detected_when_gui_progress_exists
     assert _looks_like_gui_first_silent_install_shortcut(request, code) is False
 
 
+def test_invalid_retry_prompt_drops_silent_switch_guidance_after_gui_first_silent_shortcut() -> None:
+    history = _history_for_invalid_python_retry_with_prompt(
+        [],
+        user_prompt=(
+            "Locate the downloaded installer `.exe` in Downloads and complete the installer wizard. "
+            "If installer UI is visible, continue from that visible UI first."
+        ),
+        step_index=0,
+        previous_code="import subprocess\nsubprocess.Popen(['setup.exe', '/SILENT'])\n",
+        gui_first_silent_install_shortcut=True,
+    )
+
+    joined = "\n".join(history)
+    assert "do not start with /SILENT, /VERYSILENT, /SP-, or /NORESTART" in joined
+    assert "launches it normally or advances the visible installer UI" in joined
+    assert "tries silent install switches" not in joined
+    assert "prefer common Windows silent installer switches" not in joined
+
+
 def test_expand_runtime_helpers_injects_wait_for_stable_download_definition() -> None:
     code = """from pathlib import Path
 downloads = Path.home() / "Downloads"
@@ -1384,6 +1823,15 @@ print(installer)
     assert "min_quiet_time_s" in expanded
 
 
+def test_expand_runtime_helpers_injects_recent_download_waiter_definition() -> None:
+    expanded = _expand_runtime_helpers(
+        'installer = wait_for_recent_download_artifact(extra_targets=["targetapp"], since_ts=123.0)'
+    )
+    assert "def wait_for_recent_download_artifact(" in expanded
+    assert "wait_for_stable_download(" in expanded
+    assert 'installer = wait_for_recent_download_artifact(extra_targets=["targetapp"], since_ts=123.0)' in expanded
+
+
 def test_expand_runtime_helpers_injects_open_url_and_wait_definition() -> None:
     code = """opened = open_url_and_wait(
     "https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=en",
@@ -1392,7 +1840,9 @@ def test_expand_runtime_helpers_injects_open_url_and_wait_definition() -> None:
 print(opened)
 """
     expanded = _expand_runtime_helpers(code)
+    assert "def ensure_windows_dpi_aware(" in expanded
     assert "def open_url_and_wait(" in expanded
+    assert "ensure_windows_dpi_aware()" in expanded
     assert 'os.startfile(target_url)' in expanded
     assert '["cmd", "/c", "start", "", target_url]' in expanded
     assert '"--new-tab", target_url' in expanded
@@ -1404,9 +1854,11 @@ def test_expand_runtime_helpers_injects_recursive_download_click_helpers() -> No
 print(result)
 """
     expanded = _expand_runtime_helpers(code)
+    assert "def ensure_windows_dpi_aware(" in expanded
     assert "def click_download_like_target(" in expanded
     assert "def click_text_targets(" in expanded
     assert "def ocr_screen_text_regions(" in expanded
+    assert "ensure_windows_dpi_aware()" in expanded
     assert '"download",' in expanded
     assert '"msi",' in expanded
     assert '"standard",' in expanded
@@ -1414,9 +1866,25 @@ print(result)
     assert '"nightly",' in expanded
     assert '"guide",' in expanded
     assert '"support",' in expanded
-    assert 'click_horizontal_bias="matched_token_right"' in expanded
+    assert 'click_horizontal_bias="center"' in expanded
+    assert "visible_ocr=" in expanded
+    assert '"ko-KR"' in expanded
+    assert '"raw_text": raw_text' in expanded
+    assert '"center_x": left + int(width / 2)' in expanded
+    assert "def _word_box_candidates_for_line(line_index, line_item, line_score)" in expanded
+    assert "def _exact_target_word_match(text)" in expanded
+    assert '"click_left": click_left' in expanded
+    assert '"click_width": click_width' in expanded
+    assert '"candidate_source": "word_bbox"' in expanded
+    assert "exact_word_targets=False" in expanded
+    assert "allow_heuristic_fallback=False" in expanded
+    assert "context_targets=context" in expanded
+    assert "require_context=bool(context)" in expanded
+    assert "skip_click_points=skip_click_points" in expanded
+    assert "context_scope = \"near\" if browser_page_has_search_results" in expanded
+    assert "context_match_scope=context_scope" in expanded
     assert "browser_download_cta_region" in expanded
-    assert "sweep_index >= 2" in expanded
+    assert "heuristic_sweep_threshold = 0 if installer_mode else 2" in expanded
 
 
 def test_expand_runtime_helpers_injects_advance_visible_download_flow_definition() -> None:
@@ -1448,6 +1916,16 @@ subprocess.run(["cmd", "/c", "echo", "ok"], check=False)
 """
     assert _looks_like_duplicate_generation(code, code) is True
     assert _looks_like_duplicate_generation(code, 'print("other")') is False
+
+
+def test_extract_click_points_from_python_collects_unique_numeric_clicks() -> None:
+    code = """import pyautogui
+pyautogui.click(1000, 600)
+pyautogui.doubleClick(x=1000, y=600)
+click(420, 315)
+pyautogui.click(1000, 600)
+"""
+    assert _extract_click_points_from_python(code) == [(1000, 600), (420, 315)]
 
 
 def _synthesized_official_download_recovery_code_for_test(*, user_prompt: str) -> str:
@@ -1500,8 +1978,36 @@ def test_replan_prompt_rewrite_for_gui_first_download_after_browser_open() -> No
     assert "Treat the current screenshot as the primary source of truth" in rewritten
     assert "Continue from the visible browser/download UI with Python GUI automation" in rewritten
     assert "Do not use urllib, requests, regex-based HTML scraping" in rewritten
-    assert "click_download_like_target() or click_text_targets([...])" in rewritten
-    assert "click the visible download control" in rewritten
+    assert "Do not use executor-side OCR/text-click helpers" in rewritten
+    assert "estimate the visible download/install control coordinates" in rewritten
+    assert "This is a download-only step. Do not launch, silently install, or run the installer in this step." in rewritten
+    assert "Do not guess another same-host `.exe` or `.msi` path" in rewritten
+
+
+def test_replan_prompt_rewrite_for_gui_first_download_same_page_retry_avoids_previous_clicks() -> None:
+    prompt = (
+        "Use Python on Windows to open the official vendor page in the browser and download the Windows installer as a `.exe`."
+    )
+    rewritten = _rewrite_user_prompt_for_replan(
+        prompt,
+        active_replan_reasons=["no_visual_change", "repeated_code_execution"],
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": """
+open_url_and_wait("https://vendor.example/download", expected_title_tokens=["vendor"])
+import pyautogui
+pyautogui.click(1000, 600)
+pyautogui.click(1180, 602)
+""",
+            },
+            "stdout_tail": "Opened vendor page and clicked a visible button, but no download appeared.",
+        },
+    )
+    assert "Stay on the currently visible browser tab/page first." in rewritten
+    assert "do not reuse the same coordinates first" in rewritten
+    assert "try the next distinct candidate in the same script before giving up" in rewritten
+    assert "Do not treat the browser toolbar, address bar, tab strip, bookmarks bar" in rewritten
+    assert "Avoid reusing these previous click coordinates first: (1000, 600), (1180, 602)." in rewritten
 
 
 def test_replan_prompt_rewrite_for_truncated_gui_repetition_failure_adds_loop_hint() -> None:
@@ -1519,6 +2025,23 @@ def test_replan_prompt_rewrite_for_truncated_gui_repetition_failure_adds_loop_hi
     )
     assert "Previous attempt appears to have been cut off mid-script" in rewritten
     assert "bounded loop like for _ in range(8)" in rewritten
+
+
+def test_replan_prompt_rewrite_keeps_source_task_hint_for_installer_replan() -> None:
+    prompt = (
+        "Use executable Python only. Do not download anything in this chunk. "
+        "Locate the downloaded installer in Downloads, finish the installation, and end only when "
+        "the installed app process is running. from this task: 메모잇 프로그램을 설치해줘."
+    )
+    rewritten = _rewrite_user_prompt_for_replan(
+        prompt,
+        active_replan_reasons=["execution_error"],
+        last_execution={
+            "stderr_tail": "could not locate installed app executable for launch chunk",
+        },
+    )
+    assert "Source task: 메모잇 프로그램을 설치해줘." in rewritten
+    assert "메모잇" in _prompt_keyword_candidates(rewritten, limit=8)
 
 
 def test_replan_prompt_rewrite_for_optional_gui_module_failure_keeps_install_context() -> None:
@@ -1593,7 +2116,24 @@ def test_dependency_repair_user_prompt_handles_pywin32_distribution_name() -> No
     assert "Do not write `import pywin32`" in prompt
 
 
-def test_retry_token_budget_increases_with_cap() -> None:
-    assert _retry_token_budget(256) == 384
+def test_retry_token_budget_caps_large_budgets() -> None:
+    assert _retry_token_budget(256) == 256
     assert _retry_token_budget(512) == 512
-    assert _retry_token_budget(800) == 800
+    assert _retry_token_budget(800) == 640
+
+
+def test_step_token_budget_caps_gui_first_download_steps() -> None:
+    initial_request = StepRequest(
+        user_prompt="targetapp 프로그램을 설치해줘",
+        execution_style="gui_first",
+        request_kind="task_step",
+    )
+    retry_request = StepRequest(
+        user_prompt="targetapp 프로그램을 설치해줘",
+        execution_style="gui_first",
+        request_kind="task_step",
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+    )
+    assert _step_token_budget(initial_request, 1024) == 640
+    assert _step_token_budget(retry_request, 1024) == 512

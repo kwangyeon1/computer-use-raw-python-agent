@@ -121,6 +121,8 @@ def test_execute_code_step_auto_prefixes_open_url_for_gui_first_download_task(tm
     sent_code = executor.calls[0]["python_code"]
     assert "def open_url_and_wait(" in sent_code
     assert 'open_url_and_wait("https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=en"' in sent_code
+    assert "advance_visible_download_flow(" not in sent_code
+    assert "click_download_like_target(" not in sent_code
     assert 'print("next gui step")' in sent_code
 
 
@@ -153,6 +155,8 @@ def test_execute_code_step_auto_prefixes_open_url_even_when_prompt_mentions_visi
     sent_code = executor.calls[0]["python_code"]
     assert "def open_url_and_wait(" in sent_code
     assert 'open_url_and_wait("https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=en"' in sent_code
+    assert "advance_visible_download_flow(" not in sent_code
+    assert "click_download_like_target(" not in sent_code
     assert 'print("continue download flow")' in sent_code
 
 
@@ -212,6 +216,8 @@ def test_execute_code_step_auto_prefixes_search_url_when_no_prompt_url_exists(tm
     sent_code = executor.calls[0]["python_code"]
     assert "def open_url_and_wait(" in sent_code
     assert 'open_url_and_wait("https://www.google.com/search?q=' in sent_code
+    assert "advance_visible_download_flow(" not in sent_code
+    assert "click_download_like_target(" not in sent_code
     assert 'print("continue download flow")' in sent_code
 
 
@@ -243,9 +249,10 @@ def test_execute_code_step_prefers_exact_prompt_url_over_search_fallback(tmp_pat
     sent_code = executor.calls[0]["python_code"]
     assert 'open_url_and_wait("https://www.kakaocorp.com/page/service/service/KakaoTalk?lang=ko"' in sent_code
     assert 'https://www.google.com/search?q=' not in sent_code
+    assert "advance_visible_download_flow(" not in sent_code
 
 
-def test_execute_code_step_uses_search_result_helper_for_search_url(tmp_path: Path) -> None:
+def test_execute_code_step_prefixes_search_url_without_search_result_ocr_helper(tmp_path: Path) -> None:
     executor = _FakeExecutorClient()
     root = tmp_path / "run"
     root.mkdir()
@@ -269,6 +276,7 @@ print(html[:100])
     )
 
     sent_code = executor.calls[0]["python_code"]
-    assert 'prompt_url = "https://www.google.com/search?q=' in sent_code
-    assert "open_url_and_wait(prompt_url" in sent_code
-    assert "clicked = click_search_result_like_target(" in sent_code
+    assert 'open_url_and_wait("https://www.google.com/search?q=' in sent_code
+    assert "click_search_result_like_target(" not in sent_code
+    assert "advance_visible_download_flow(" not in sent_code
+    assert 'urllib.request.urlopen("https://example.com")' in sent_code

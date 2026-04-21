@@ -107,9 +107,26 @@ def _ensure_daemon_started() -> None:
     if daemon_is_responding():
         return
     if daemon_process_alive():
-        return
+        _force_stop_stale_daemon()
     start_daemon_process()
     wait_for_daemon_ready()
+
+
+def _force_stop_stale_daemon() -> None:
+    state = _state_or_empty()
+    pid = state.get("pid")
+    if not (isinstance(pid, int) and daemon_process_alive()):
+        daemon_state_path().unlink(missing_ok=True)
+        return
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not daemon_process_alive():
+            daemon_state_path().unlink(missing_ok=True)
+            return
+        time.sleep(0.05)
+    os.kill(pid, signal.SIGKILL)
+    daemon_state_path().unlink(missing_ok=True)
 
 
 def _resolve_load_timeout(args: argparse.Namespace, overrides: dict) -> float:

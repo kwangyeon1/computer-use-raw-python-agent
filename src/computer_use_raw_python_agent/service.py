@@ -36,6 +36,18 @@ except ImportError:  # pragma: no cover - direct script execution fallback
     )
 
 
+_FRAMEWORK_OCR_UI_HELPERS_ENABLED = False
+_DEPRECATED_OCR_HELPER_CALLS = (
+    "ocr_screen_text_regions(",
+    "click_text_targets(",
+    "click_download_like_target(",
+    "click_search_result_like_target(",
+    "open_responsive_header_menu(",
+    "advance_visible_download_flow(",
+    "advance_visible_installer_flow(",
+)
+
+
 def _default_model_id() -> str:
     repo_root = Path(__file__).resolve().parents[2]
     return str((repo_root.parent / "models" / "gui-owl-1.5-8b-think-base").resolve())
@@ -73,6 +85,13 @@ def _normalize_python_code(code: str) -> str:
     return "\n".join(line.rstrip() for line in str(code).replace("\r\n", "\n").strip().split("\n")).strip()
 
 
+def _uses_deprecated_ocr_helper(code: str) -> bool:
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    return any(token in normalized for token in _DEPRECATED_OCR_HELPER_CALLS)
+
+
 def _code_fingerprint(code: str) -> str:
     normalized = _normalize_python_code(code)
     return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
@@ -101,6 +120,8 @@ def open_url_and_wait(url, *, expected_title_tokens=None, timeout_s=20.0, poll_i
     import time
     import webbrowser
     from pathlib import Path
+
+    ensure_windows_dpi_aware()
 
     target_url = str(url or "").strip()
     if not target_url:
@@ -275,23 +296,6 @@ def open_url_and_wait(url, *, expected_title_tokens=None, timeout_s=20.0, poll_i
                 continue
         return False
 
-    def _screen_text_matches_expected():
-        if not expected:
-            return False
-        if not _activate_browser_window():
-            return False
-        try:
-            lines = ocr_screen_text_regions(max_lines=80)
-        except Exception:
-            return False
-        combined = " | ".join(
-            str(item.get("text") or "").strip().lower()
-            for item in lines
-            if isinstance(item, dict) and str(item.get("text") or "").strip()
-        )
-        return bool(combined and any(token in combined for token in expected))
-
-    explicit_launch_retry_used = False
     while time.time() < deadline:
         title_ready = _matching_title_visible()
         browser_ready = _browser_running()
@@ -307,13 +311,8 @@ def open_url_and_wait(url, *, expected_title_tokens=None, timeout_s=20.0, poll_i
             if browser_ready and elapsed >= float(settle_time_s) and _activate_browser_window():
                 return True
         elif browser_window_ready and elapsed >= max(float(settle_time_s), 4.0):
-            if _screen_text_matches_expected():
-                return True
-            if not explicit_launch_retry_used and elapsed >= max(float(settle_time_s), 6.0):
-                explicit_launch_retry_used = True
-                if _launch_windows_browser(prefer_explicit=True):
-                    time.sleep(1.0)
-                    continue
+            _activate_browser_window()
+            return True
         time.sleep(float(poll_interval_s))
 
     detail_parts = []
@@ -435,6 +434,67 @@ def wait_for_stable_download(path_or_pattern, *, min_bytes=1_000_000, stable_che
     if last_candidate is not None and last_candidate.exists():
         raise SystemExit(f"download incomplete: {last_candidate} ({last_candidate.stat().st_size} bytes)")
     raise SystemExit(f"download not found for pattern: {raw}")
+""".strip(),
+    "wait_for_recent_download_artifact": """
+def wait_for_recent_download_artifact(*, extra_targets=None, min_bytes=1_000_000, timeout_s=45.0, since_ts=None, download_dir=None):
+    import os
+    import re
+    import time
+    import unicodedata
+    from pathlib import Path
+
+    downloads = Path(os.path.expanduser(str(download_dir))) if download_dir else (Path.home() / "Downloads")
+    normalized_targets = []
+    for value in (extra_targets or []):
+        token = " ".join(unicodedata.normalize("NFKC", str(value or "")).lower().split()).strip()
+        if token and token not in normalized_targets:
+            normalized_targets.append(token)
+    compact_targets = [re.sub(r"[^\\w가-힣]+", "", token, flags=re.UNICODE) for token in normalized_targets if token]
+    deadline = time.time() + max(float(timeout_s), 2.0)
+    minimum_mtime = float(since_ts) if since_ts is not None else (time.time() - max(float(timeout_s), 2.0))
+
+    def _score_candidate(path):
+        lowered = path.name.lower()
+        compact_name = re.sub(r"[^\\w가-힣]+", "", lowered, flags=re.UNICODE)
+        keyword_hit = any(token in lowered for token in normalized_targets) or any(token and token in compact_name for token in compact_targets)
+        suffix_score = 3 if lowered.endswith(".exe") else 2 if lowered.endswith(".msi") else 1
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return (1 if keyword_hit else 0, suffix_score, mtime)
+
+    while time.time() < deadline:
+        candidates = []
+        for pattern in ("*.exe", "*.msi", "*.zip", "*.alz"):
+            try:
+                matches = list(downloads.glob(pattern))
+            except Exception:
+                matches = []
+            for path in matches:
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                if stat.st_mtime < minimum_mtime - 1.0:
+                    continue
+                if stat.st_size <= 0:
+                    continue
+                candidates.append(path)
+        candidates.sort(key=_score_candidate, reverse=True)
+        for candidate in candidates:
+            try:
+                remaining = max(6.0, min(12.0, deadline - time.time()))
+                return wait_for_stable_download(
+                    str(candidate),
+                    min_bytes=min_bytes,
+                    timeout_s=remaining,
+                    download_dir=str(downloads),
+                )
+            except SystemExit:
+                continue
+        time.sleep(1.0)
+    raise SystemExit("recent installer download did not appear")
 """.strip(),
     "read_action_context": """
 def read_action_context(context_path, *, prompt_key=None):
@@ -579,6 +639,8 @@ def browser_page_has_error_state(*, image_path=None, expected_title_tokens=None)
 """.strip(),
     "browser_page_has_search_results": """
 def browser_page_has_search_results(*, image_path=None, expected_title_tokens=None):
+    ensure_windows_dpi_aware()
+
     expected = [str(item).strip().lower() for item in (expected_title_tokens or []) if str(item).strip()]
 
     try:
@@ -612,6 +674,8 @@ def browser_page_has_search_results(*, image_path=None, expected_title_tokens=No
 def page_down_browser_view(*, steps=1, settle_s=0.8):
     import ctypes
     import time
+
+    ensure_windows_dpi_aware()
 
     try:
         import pygetwindow as gw
@@ -816,6 +880,33 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
             continue
     raise SystemExit(f"all official installer candidates failed: {last_error}")
 """.strip(),
+    "ensure_windows_dpi_aware": """
+def ensure_windows_dpi_aware():
+    import os
+
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        shcore = getattr(ctypes.windll, "shcore", None)
+        if shcore is not None and hasattr(shcore, "SetProcessDpiAwareness"):
+            try:
+                shcore.SetProcessDpiAwareness(2)
+                return True
+            except Exception:
+                pass
+        user32 = getattr(ctypes.windll, "user32", None)
+        if user32 is not None and hasattr(user32, "SetProcessDPIAware"):
+            try:
+                user32.SetProcessDPIAware()
+                return True
+            except Exception:
+                pass
+    except Exception:
+        return False
+    return False
+""".strip(),
     "ocr_screen_text_regions": """
 def ocr_screen_text_regions(image_path=None, *, max_lines=40, crop_region=None):
     import base64
@@ -823,13 +914,17 @@ def ocr_screen_text_regions(image_path=None, *, max_lines=40, crop_region=None):
     import os
     import subprocess
     import tempfile
+    import unicodedata
     from pathlib import Path
 
     if os.name != "nt":
         return []
 
+    ensure_windows_dpi_aware()
+
     temp_path = None
     crop_temp_path = None
+    variant_temp_paths = []
     path = Path(image_path) if image_path else None
     crop_left = 0
     crop_top = 0
@@ -862,6 +957,29 @@ def ocr_screen_text_regions(image_path=None, *, max_lines=40, crop_region=None):
                 cropped.save(crop_temp_path, format="PNG")
                 path = Path(crop_temp_path)
 
+        variant_specs = [(Path(path), 1.0, "original")]
+        try:
+            from PIL import Image, ImageOps
+
+            with Image.open(path) as source_image:
+                width, height = source_image.size
+                scale = 1.5 if max(width, height) <= 3200 else 1.0
+                enhanced = ImageOps.autocontrast(source_image.convert("L")).convert("RGB")
+                if scale != 1.0:
+                    resample_filter = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
+                    enhanced = enhanced.resize(
+                        (max(1, int(width * scale)), max(1, int(height * scale))),
+                        resample_filter,
+                    )
+                handle = tempfile.NamedTemporaryFile(prefix="ocr-enhanced-", suffix=".png", delete=False)
+                enhanced_path = handle.name
+                handle.close()
+                enhanced.save(enhanced_path, format="PNG")
+                variant_temp_paths.append(enhanced_path)
+                variant_specs.append((Path(enhanced_path), scale, "enhanced"))
+        except Exception:
+            pass
+
         powershell_script = r'''
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
@@ -880,7 +998,47 @@ function Await([object] $Operation, [type] $ResultType) {
 }
 
 function ToBase64([string] $Value) {
-    return [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($Value ?? "")))
+    if ($null -eq $Value) {
+        $Value = ""
+    }
+    return [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Value))
+}
+
+function LinePayload([object] $Line, [string] $LanguageTag) {
+    $left = 2147483647
+    $top = 2147483647
+    $right = -1
+    $bottom = -1
+    $words = @()
+    foreach ($word in $Line.Words) {
+        $rect = $word.BoundingRect
+        if ($rect.X -lt $left) { $left = [int]$rect.X }
+        if ($rect.Y -lt $top) { $top = [int]$rect.Y }
+        if (($rect.X + $rect.Width) -gt $right) { $right = [int]($rect.X + $rect.Width) }
+        if (($rect.Y + $rect.Height) -gt $bottom) { $bottom = [int]($rect.Y + $rect.Height) }
+        $words += @{
+            text_b64 = (ToBase64 ([string]$word.Text))
+            left = [int]$rect.X
+            top = [int]$rect.Y
+            width = [int]$rect.Width
+            height = [int]$rect.Height
+        }
+    }
+    if ($right -lt $left -or $bottom -lt $top) {
+        $left = 0
+        $top = 0
+        $right = 0
+        $bottom = 0
+    }
+    return @{
+        text_b64 = (ToBase64 ([string]$Line.Text))
+        left = [int]$left
+        top = [int]$top
+        width = [int]([Math]::Max(0, $right - $left))
+        height = [int]([Math]::Max(0, $bottom - $top))
+        language = $LanguageTag
+        words = $words
+    }
 }
 
 $filePath = $env:COMPUTER_USE_OCR_IMAGE_PATH
@@ -894,112 +1052,179 @@ $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, Conte
 $null = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
 $null = [Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType = WindowsRuntime]
 $null = [Windows.Media.Ocr.OcrResult, Windows.Media.Ocr, ContentType = WindowsRuntime]
+$null = [Windows.Globalization.Language, Windows.Globalization, ContentType = WindowsRuntime]
 
 $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($filePath)) ([Windows.Storage.StorageFile])
 $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
 $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
 $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
-if ($null -eq $engine) {
+
+$engineSpecs = @()
+$profileEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+if ($null -ne $profileEngine) {
+    $engineSpecs += @{ tag = "profile"; engine = $profileEngine }
+}
+foreach ($languageTag in @("ko-KR", "en-US")) {
+    try {
+        $language = [Windows.Globalization.Language]::new($languageTag)
+        $languageEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($language)
+        if ($null -ne $languageEngine) {
+            $engineSpecs += @{ tag = $languageTag; engine = $languageEngine }
+        }
+    } catch {
+    }
+}
+if ($engineSpecs.Count -eq 0) {
     throw "Windows OCR engine unavailable"
 }
-$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
 
 $lines = @()
-foreach ($line in $result.Lines) {
-    $left = 2147483647
-    $top = 2147483647
-    $right = -1
-    $bottom = -1
-    foreach ($word in $line.Words) {
-        $rect = $word.BoundingRect
-        if ($rect.X -lt $left) { $left = [int]$rect.X }
-        if ($rect.Y -lt $top) { $top = [int]$rect.Y }
-        if (($rect.X + $rect.Width) -gt $right) { $right = [int]($rect.X + $rect.Width) }
-        if (($rect.Y + $rect.Height) -gt $bottom) { $bottom = [int]($rect.Y + $rect.Height) }
-    }
-    if ($right -lt $left -or $bottom -lt $top) {
-        $left = 0
-        $top = 0
-        $right = 0
-        $bottom = 0
-    }
-    $lines += @{
-        text_b64 = (ToBase64 ([string]$line.Text))
-        left = [int]$left
-        top = [int]$top
-        width = [int]([Math]::Max(0, $right - $left))
-        height = [int]([Math]::Max(0, $bottom - $top))
+$texts = @()
+$seen = @{}
+foreach ($spec in $engineSpecs) {
+    try {
+        $result = Await ($spec.engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+        $texts += ([string]$result.Text)
+        foreach ($line in $result.Lines) {
+            $payload = LinePayload $line ([string]$spec.tag)
+            $key = ([string]$payload.text_b64) + ":" + ([string]$payload.left) + ":" + ([string]$payload.top) + ":" + ([string]$payload.width) + ":" + ([string]$payload.height)
+            if (-not $seen.ContainsKey($key)) {
+                $seen[$key] = $true
+                $lines += $payload
+            }
+        }
+    } catch {
     }
 }
 
 $payload = @{
-    text_b64 = (ToBase64 ([string]$result.Text))
+    text_b64 = (ToBase64 ([string]::Join("`n", $texts)))
     lines = $lines
 }
 $payload | ConvertTo-Json -Depth 6 -Compress
 '''
 
+        merged = []
+        seen_keys = set()
         for executable in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
-            try:
-                env = dict(os.environ)
-                env["COMPUTER_USE_OCR_IMAGE_PATH"] = str(path)
-                completed = subprocess.run(
-                    [
-                        executable,
-                        "-NoProfile",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                        "-Command",
-                        powershell_script,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    errors="replace",
-                    check=False,
-                    env=env,
-                    timeout=20,
-                )
-            except FileNotFoundError:
-                continue
-            if completed.returncode != 0:
-                continue
-            try:
-                payload = json.loads(str(completed.stdout or "").strip() or "{}")
-            except json.JSONDecodeError:
-                continue
-            lines = payload.get("lines")
-            if not isinstance(lines, list):
-                continue
-            normalized = []
-            for item in lines:
-                if not isinstance(item, dict):
-                    continue
-                encoded_text = str(item.get("text_b64") or "").strip()
-                if not encoded_text:
+            executable_found = False
+            for variant_path, scale, variant_name in variant_specs:
+                try:
+                    env = dict(os.environ)
+                    env["COMPUTER_USE_OCR_IMAGE_PATH"] = str(variant_path)
+                    completed = subprocess.run(
+                        [
+                            executable,
+                            "-NoProfile",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-Command",
+                            powershell_script,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        errors="replace",
+                        check=False,
+                        env=env,
+                        timeout=24,
+                    )
+                    executable_found = True
+                except FileNotFoundError:
+                    break
+                if completed.returncode != 0:
                     continue
                 try:
-                    text = base64.b64decode(encoded_text.encode("ascii"), validate=False).decode("utf-8", errors="replace")
-                except Exception:
+                    payload = json.loads(str(completed.stdout or "").strip() or "{}")
+                except json.JSONDecodeError:
                     continue
-                text = " ".join(text.split()).strip()
-                if not text:
+                lines = payload.get("lines")
+                if not isinstance(lines, list):
                     continue
-                normalized.append(
-                    {
-                        "text": text,
-                        "left": int(item.get("left") or 0) + int(crop_left),
-                        "top": int(item.get("top") or 0) + int(crop_top),
-                        "width": int(item.get("width") or 0),
-                        "height": int(item.get("height") or 0),
-                    }
-                )
-            normalized.sort(key=lambda item: (int(item.get("top") or 0), int(item.get("left") or 0)))
-            if max_lines and len(normalized) > int(max_lines):
-                normalized = normalized[: int(max_lines)]
-            return normalized
-        return []
+                for item in lines:
+                    if not isinstance(item, dict):
+                        continue
+                    encoded_text = str(item.get("text_b64") or "").strip()
+                    if not encoded_text:
+                        continue
+                    try:
+                        raw_text = base64.b64decode(encoded_text.encode("ascii"), validate=False).decode("utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    raw_text = raw_text.strip()
+                    text = " ".join(unicodedata.normalize("NFKC", raw_text).split()).strip()
+                    if not text:
+                        continue
+                    raw_left = int(item.get("left") or 0)
+                    raw_top = int(item.get("top") or 0)
+                    raw_width = int(item.get("width") or 0)
+                    raw_height = int(item.get("height") or 0)
+                    left = int(raw_left / max(float(scale), 0.001)) + int(crop_left)
+                    top = int(raw_top / max(float(scale), 0.001)) + int(crop_top)
+                    width = max(0, int(raw_width / max(float(scale), 0.001)))
+                    height = max(0, int(raw_height / max(float(scale), 0.001)))
+                    compact_key = "".join(text.lower().split())
+                    key = (compact_key, left // 8, top // 8, width // 8, height // 8)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    words = []
+                    for word in item.get("words") or []:
+                        if not isinstance(word, dict):
+                            continue
+                        encoded_word = str(word.get("text_b64") or "").strip()
+                        if not encoded_word:
+                            continue
+                        try:
+                            word_raw = base64.b64decode(encoded_word.encode("ascii"), validate=False).decode("utf-8", errors="replace")
+                        except Exception:
+                            continue
+                        word_text = " ".join(unicodedata.normalize("NFKC", word_raw).split()).strip()
+                        if not word_text:
+                            continue
+                        word_left = int(int(word.get("left") or 0) / max(float(scale), 0.001)) + int(crop_left)
+                        word_top = int(int(word.get("top") or 0) / max(float(scale), 0.001)) + int(crop_top)
+                        word_width = max(0, int(int(word.get("width") or 0) / max(float(scale), 0.001)))
+                        word_height = max(0, int(int(word.get("height") or 0) / max(float(scale), 0.001)))
+                        words.append(
+                            {
+                                "text": word_text,
+                                "raw_text": word_raw,
+                                "left": word_left,
+                                "top": word_top,
+                                "width": word_width,
+                                "height": word_height,
+                                "right": word_left + word_width,
+                                "bottom": word_top + word_height,
+                                "center_x": word_left + int(word_width / 2),
+                                "center_y": word_top + int(word_height / 2),
+                            }
+                        )
+                    merged.append(
+                        {
+                            "text": text,
+                            "raw_text": raw_text,
+                            "left": left,
+                            "top": top,
+                            "width": width,
+                            "height": height,
+                            "right": left + width,
+                            "bottom": top + height,
+                            "center_x": left + int(width / 2),
+                            "center_y": top + int(height / 2),
+                            "language": str(item.get("language") or ""),
+                            "ocr_variant": variant_name,
+                            "words": words,
+                        }
+                    )
+            if executable_found:
+                break
+        merged.sort(key=lambda item: (int(item.get("top") or 0), int(item.get("left") or 0)))
+        if max_lines and len(merged) > int(max_lines):
+            merged = merged[: int(max_lines)]
+        return merged
     finally:
+        for variant_temp_path in variant_temp_paths:
+            Path(variant_temp_path).unlink(missing_ok=True)
         if crop_temp_path:
             Path(crop_temp_path).unlink(missing_ok=True)
         if temp_path:
@@ -1011,11 +1236,20 @@ def click_text_targets(
     *,
     avoid_targets=None,
     primary_targets=None,
+    reject_texts=None,
+    context_targets=None,
+    require_context=False,
+    context_radius_px=260,
+    context_match_scope="near",
+    skip_click_points=None,
     min_primary_hits=0,
     window_title_tokens=None,
     restrict_to_browser_window=False,
     crop_region=None,
     click_horizontal_bias="center",
+    min_relative_top_px=0,
+    max_relative_top_px=None,
+    exact_word_targets=False,
     image_path=None,
     timeout_s=10.0,
     poll_interval_s=1.0,
@@ -1027,53 +1261,419 @@ def click_text_targets(
     import ctypes
     import re
     import time
+    import unicodedata
 
-    target_terms = [str(item).strip().lower() for item in (targets or []) if str(item).strip()]
-    avoid_terms = [str(item).strip().lower() for item in (avoid_targets or []) if str(item).strip()]
-    primary_terms = [str(item).strip().lower() for item in (primary_targets or []) if str(item).strip()]
-    window_terms = [str(item).strip().lower() for item in (window_title_tokens or []) if str(item).strip()]
+    ensure_windows_dpi_aware()
+
+    def _normalize_text(value):
+        return " ".join(unicodedata.normalize("NFKC", str(value or "")).lower().split()).strip()
+
+    def _compact_text(value):
+        return re.sub(r"[^\\w가-힣]+", "", _normalize_text(value), flags=re.UNICODE)
+
+    def _expand_terms(raw_terms):
+        expanded = []
+        seen = set()
+
+        def _append(term):
+            normalized = _normalize_text(term)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                expanded.append(normalized)
+
+        for raw in raw_terms:
+            term = _normalize_text(raw)
+            if not term:
+                continue
+            _append(term)
+            compact = _compact_text(term)
+            if compact != term:
+                _append(compact)
+            if term in {"download", "다운로드", "받기", "내려받기", "다운받기"}:
+                for alias in ("download", "downloads", "다운로드", "다운 로드", "다운받기", "다운 받기", "내려받기", "내려 받기", "받기"):
+                    _append(alias)
+            if term in {"install", "installer", "setup", "설치"}:
+                for alias in ("install", "installer", "setup", "setup file", "설치", "설치하기", "설치 파일", "설치파일"):
+                    _append(alias)
+        return expanded
+
+    original_target_terms = [_normalize_text(item) for item in (targets or []) if str(item).strip()]
+    target_terms = _expand_terms(original_target_terms)
+    avoid_terms = _expand_terms(str(item) for item in (avoid_targets or []) if str(item).strip())
+    primary_terms = _expand_terms(str(item) for item in (primary_targets or []) if str(item).strip())
+    reject_terms = [_normalize_text(item) for item in (reject_texts or []) if str(item).strip()]
+    context_terms = _expand_terms(str(item) for item in (context_targets or []) if str(item).strip())
+    window_terms = _expand_terms(str(item) for item in (window_title_tokens or []) if str(item).strip())
+    context_scope = str(context_match_scope or "near").strip().lower()
+    if context_scope not in {"near", "page"}:
+        context_scope = "near"
+    skipped_points = []
+    for point in skip_click_points or []:
+        if isinstance(point, dict):
+            try:
+                skipped_points.append((int(point.get("x") or 0), int(point.get("y") or 0)))
+            except Exception:
+                continue
+        elif isinstance(point, (list, tuple)) and len(point) >= 2:
+            try:
+                skipped_points.append((int(point[0]), int(point[1])))
+            except Exception:
+                continue
+    download_action_tokens = _expand_terms(
+        [
+            "download",
+            "downloads",
+            "다운로드",
+            "다운 로드",
+            "다운받기",
+            "내려받기",
+            "install",
+            "installer",
+            "setup",
+            "standard",
+            "설치",
+            "설치 파일",
+            "설치파일",
+            "받기",
+            "exe",
+            "msi",
+            "zip",
+            "alz",
+            "archive",
+            "package",
+        ]
+    )
     minimum_primary_hits = max(0, int(min_primary_hits or 0))
     if not target_terms:
         raise SystemExit("click_text_targets requires at least one target term")
     if ctypes.sizeof(ctypes.c_void_p) == 0:
         raise SystemExit("ctypes is unavailable")
 
+    def _token_in_text(token, normalized, compact):
+        token_normalized = _normalize_text(token)
+        if not token_normalized:
+            return False
+        if token_normalized in normalized:
+            return True
+        token_compact = _compact_text(token_normalized)
+        return len(token_compact) >= 2 and token_compact in compact
+
+    def _contains_any(normalized, compact, tokens):
+        return any(_token_in_text(token, normalized, compact) for token in tokens)
+
+    installer_mode = str(heuristic_mode or "auto").strip().lower() == "installer"
+    installer_action_terms = _expand_terms(
+        [
+            "ok",
+            "확인",
+            "next",
+            "다음",
+            "install",
+            "설치",
+            "agree",
+            "동의",
+            "accept",
+            "yes",
+            "예",
+            "continue",
+            "계속",
+            "finish",
+            "완료",
+            "마침",
+            "launch",
+            "실행",
+            "start",
+            "시작",
+        ]
+    )
+    installer_instruction_terms = _expand_terms(
+        [
+            "button",
+            "buttons",
+            "click",
+            "press",
+            "wizard",
+            "installer",
+            "install location",
+            "destination folder",
+            "select destination",
+            "folder",
+            "browse",
+            "license",
+            "agreement",
+            "버튼",
+            "눌러",
+            "눌러주세요",
+            "설치 버튼",
+            "설치 위치",
+            "설치 폴더",
+            "대상 폴더",
+            "폴더",
+            "찾아보기",
+            "라이선스",
+            "사용권",
+            "동의합니다",
+            "설치를 시작",
+            "설치하려면",
+        ]
+    )
+
+    def _text_rejected(text):
+        normalized = _normalize_text(text)
+        compact = _compact_text(text)
+        if not normalized or not compact:
+            return False
+        if reject_terms and context_terms and _contains_any(normalized, compact, context_terms):
+            query_markers = ("site:", "site：", "검색", "search")
+            query_term_hits = sum(
+                1
+                for token in ("official", "공식", "download", "다운로드", "windows", "pc", "site")
+                if _token_in_text(token, normalized, compact)
+            )
+            if any(marker in normalized for marker in query_markers) or query_term_hits >= 3:
+                return True
+        for raw_reject in reject_terms:
+            reject = _normalize_text(raw_reject)
+            reject_compact = _compact_text(reject)
+            if len(reject_compact) < 6:
+                continue
+            if compact == reject_compact:
+                return True
+            if compact.startswith(reject_compact):
+                return True
+            # OCR often truncates the search box query. Reject long prefixes of
+            # the intended query so the helper does not click the search field.
+            if reject_compact.startswith(compact) and len(compact) >= max(8, int(len(reject_compact) * 0.58)):
+                return True
+        return False
+
+    def _installer_candidate_allowed(*, text, matched_token="", region=None, top=0, candidate_source="", exact_match=False):
+        if not installer_mode:
+            return True
+        normalized = _normalize_text(text)
+        compact = _compact_text(text)
+        if not normalized or not compact:
+            return False
+        words = [part for part in normalized.split() if part]
+        action_hit = bool(matched_token) and _token_in_text(matched_token, normalized, compact)
+        if not action_hit and not _contains_any(normalized, compact, installer_action_terms):
+            return True
+        text_is_sentence_like = len(normalized) > 24 or len(words) > 4
+        if _contains_any(normalized, compact, installer_instruction_terms) and not exact_match:
+            return False
+        if text_is_sentence_like and not exact_match:
+            return False
+        if candidate_source == "word_bbox" and len(normalized) > 14 and not exact_match:
+            return False
+        if region is not None:
+            region_top = int(region.get("top") or 0)
+            region_bottom = int(region.get("bottom") or region_top)
+            region_height = max(1, region_bottom - region_top)
+            relative_top = int(top) - region_top
+            if relative_top < int(region_height * 0.45) and text_is_sentence_like:
+                return False
+        return True
+
+    def _line_has_context(item):
+        if not context_terms:
+            return False
+        text = str(item.get("text") or item.get("raw_text") or "")
+        normalized = _normalize_text(text)
+        compact = _compact_text(text)
+        return _contains_any(normalized, compact, context_terms)
+
+    def _region_has_context(region):
+        if not context_terms or not isinstance(region, dict):
+            return False
+        title = str(region.get("title") or "")
+        normalized = _normalize_text(title)
+        compact = _compact_text(title)
+        return _contains_any(normalized, compact, context_terms)
+
+    def _line_center(item):
+        left = int(item.get("left") or 0)
+        top = int(item.get("top") or 0)
+        width = max(1, int(item.get("width") or 0))
+        height = max(1, int(item.get("height") or 0))
+        return (
+            int(item.get("center_x") or left + int(width / 2)),
+            int(item.get("center_y") or top + int(height / 2)),
+        )
+
+    def _ranges_overlap(a_left, a_right, b_left, b_right, *, tolerance=80):
+        return max(int(a_left), int(b_left)) <= min(int(a_right), int(b_right)) + int(tolerance)
+
+    def _point_skipped(x, y):
+        for skipped_x, skipped_y in skipped_points:
+            if abs(int(x) - skipped_x) <= 18 and abs(int(y) - skipped_y) <= 18:
+                return True
+        return False
+
     def _best_token_match(text):
-        lowered = text.lower()
+        lowered = _normalize_text(text)
+        compact = _compact_text(text)
         best = None
         for token in target_terms:
             if not token:
                 continue
             start = lowered.find(token)
-            if start < 0:
+            if start < 0 and _compact_text(token) in compact:
+                start = 0
+                end = max(1, len(lowered))
+            elif start >= 0:
+                end = start + len(token)
+            else:
                 continue
-            end = start + len(token)
-            candidate = (token in primary_terms, end - start, start, end, token)
+            file_token_priority = 0
+            if token in {"exe", "msi", "zip", "alz"} and f".{token}" in lowered:
+                file_token_priority = 2
+            elif token in {"download", "downloads", "다운로드", "다운 로드", "다운받기", "내려받기", "받기"}:
+                file_token_priority = 1
+            candidate = (file_token_priority, token in primary_terms, end - start, start, end, token)
             if best is None or candidate > best:
                 best = candidate
         return best
 
+    def _exact_target_word_match(text):
+        lowered = _normalize_text(text)
+        compact = _compact_text(text)
+        if not lowered or not compact:
+            return False
+        for token in target_terms:
+            token_normalized = _normalize_text(token)
+            token_compact = _compact_text(token_normalized)
+            if not token_normalized or not token_compact:
+                continue
+            if lowered == token_normalized or compact == token_compact:
+                return True
+        return False
+
+    def _word_box_candidates_for_line(line_index, line_item, line_score):
+        if not isinstance(line_item, dict):
+            return []
+        line_left = int(line_item.get("left") or 0)
+        line_top = int(line_item.get("top") or 0)
+        line_width = max(1, int(line_item.get("width") or 0))
+        line_height = max(1, int(line_item.get("height") or 0))
+        line_center_x = line_left + int(line_width / 2)
+        line_center_y = line_top + int(line_height / 2)
+        candidates = []
+        start_index = max(0, int(line_index) - 2)
+        end_index = min(len(lines), int(line_index) + 3)
+        for neighbor_index in range(start_index, end_index):
+            neighbor = lines[neighbor_index]
+            if not isinstance(neighbor, dict):
+                continue
+            neighbor_left = int(neighbor.get("left") or 0)
+            neighbor_top = int(neighbor.get("top") or 0)
+            neighbor_width = max(1, int(neighbor.get("width") or 0))
+            neighbor_height = max(1, int(neighbor.get("height") or 0))
+            neighbor_center_x = neighbor_left + int(neighbor_width / 2)
+            neighbor_center_y = neighbor_top + int(neighbor_height / 2)
+            close_to_source = (
+                abs(neighbor_center_y - line_center_y) <= max(90, line_height * 4)
+                or abs(neighbor_index - int(line_index)) <= 1
+            )
+            if not close_to_source:
+                continue
+            for word in neighbor.get("words") or []:
+                if not isinstance(word, dict):
+                    continue
+                word_text = str(word.get("text") or word.get("raw_text") or "").strip()
+                if not word_text:
+                    continue
+                word_normalized = _normalize_text(word_text)
+                word_compact = _compact_text(word_text)
+                if not word_normalized or _text_rejected(word_text):
+                    continue
+                if any(_token_in_text(token, word_normalized, word_compact) for token in avoid_terms):
+                    continue
+                word_match = _best_token_match(word_text)
+                if word_match is None:
+                    continue
+                if bool(exact_word_targets) and not _exact_target_word_match(word_text):
+                    continue
+                matched_token = word_match[5]
+                primary_hit = matched_token in primary_terms or _contains_any(word_normalized, word_compact, primary_terms)
+                action_hit = matched_token in download_action_tokens or _contains_any(word_normalized, word_compact, download_action_tokens)
+                if primary_terms and not primary_hit and not action_hit:
+                    continue
+                exact_match = _exact_target_word_match(word_text)
+                if not _installer_candidate_allowed(
+                    text=str(neighbor.get("text") or neighbor.get("raw_text") or word_text),
+                    matched_token=matched_token,
+                    region=crop_region,
+                    top=neighbor_top,
+                    candidate_source="word_bbox",
+                    exact_match=exact_match,
+                ):
+                    continue
+                word_left = int(word.get("left") or 0)
+                word_top = int(word.get("top") or 0)
+                word_width = max(1, int(word.get("width") or 0))
+                word_height = max(1, int(word.get("height") or 0))
+                word_x = word_left + int(word_width / 2)
+                word_y = word_top + int(word_height / 2)
+                if _point_skipped(word_x, word_y):
+                    continue
+                distance_penalty = min(30, int((abs(word_y - line_center_y) + abs(word_x - line_center_x) * 0.15) / 18))
+                word_score = int(line_score)
+                word_score += 45 if neighbor_index == int(line_index) else 20
+                word_score += 35 if primary_hit else 0
+                word_score += 30 if action_hit else 0
+                word_score += int(word_match[0]) * 25
+                word_score += min(24, max(0, int(word_width / 10)))
+                word_score -= distance_penalty
+                candidates.append(
+                    {
+                        "text": str(neighbor.get("text") or word_text),
+                        "raw_text": str(neighbor.get("raw_text") or neighbor.get("text") or word_text),
+                        "left": neighbor_left,
+                        "top": neighbor_top,
+                        "width": neighbor_width,
+                        "height": neighbor_height,
+                        "click_left": word_left,
+                        "click_top": word_top,
+                        "click_width": word_width,
+                        "click_height": word_height,
+                        "x": word_x,
+                        "y": word_y,
+                        "score": word_score,
+                        "matched_token": matched_token,
+                        "matched_word": word_text,
+                        "candidate_source": "word_bbox",
+                        "source_line_index": int(line_index),
+                        "word_line_index": int(neighbor_index),
+                        "right": neighbor_left + neighbor_width,
+                        "bottom": neighbor_top + neighbor_height,
+                    }
+                )
+        return candidates
+
     def _score_text(text):
-        lowered = text.lower()
+        lowered = _normalize_text(text)
+        compact = _compact_text(text)
         score = 0
         primary_hits = 0
         best_match = _best_token_match(text)
-        matched_token = best_match[4] if best_match is not None else ""
-        matched_start = best_match[2] if best_match is not None else -1
+        matched_token = best_match[5] if best_match is not None else ""
+        matched_start = best_match[3] if best_match is not None else -1
+        if _text_rejected(text):
+            return -1
         for idx, token in enumerate(target_terms):
-            if token in lowered:
+            if _token_in_text(token, lowered, compact):
                 score += max(40 - idx, 10)
         if primary_terms:
-            primary_hits = sum(1 for token in primary_terms if token in lowered)
+            primary_hits = sum(1 for token in primary_terms if _token_in_text(token, lowered, compact))
             if primary_hits < minimum_primary_hits:
                 return -1
             score += primary_hits * 15
         for token in avoid_terms:
-            if token and token in lowered:
+            if token and _token_in_text(token, lowered, compact):
                 score -= 80
-        if any(token in lowered for token in ("download", "다운로드", "install", "installer", "setup", "standard", "설치", "msi", "zip", "alz", "archive", "package")):
+        if _contains_any(lowered, compact, download_action_tokens):
             score += 25
-        if any(token in lowered for token in ("windows", "pc", "exe", "msi", "zip", "alz", "64-bit", "32-bit", "x64", "x86", "next", "확인", "동의")):
+        if _contains_any(lowered, compact, ("windows", "pc", "exe", "msi", "zip", "alz", "64-bit", "32-bit", "x64", "x86", "next", "확인", "동의")):
             score += 10
         terminal_markers = (
             ".venv",
@@ -1102,7 +1702,7 @@ def click_text_targets(
             score -= 45
         if lowered.startswith(("http://", "https://", "www.")):
             score -= 55
-        if re.fullmatch(r"[a-z0-9.-]+\.(com|net|org|co|io|app|dev|kr|tv|me|gg|ai|info)", lowered):
+        if re.fullmatch(r"[a-z0-9.-]+\\.(com|net|org|co|io|app|dev|kr|tv|me|gg|ai|info)", lowered):
             score -= 55
         elif "." in lowered and " " not in lowered and not lowered.endswith((".exe", ".msi", ".zip", ".alz")):
             score -= 35
@@ -1113,7 +1713,7 @@ def click_text_targets(
             score += 12
         if len(text) > 48 or len(words) > 6:
             score -= 40
-        if len(words) > 4 and any(token in lowered for token in ("download", "다운로드", "install", "installer", "setup", "설치")):
+        if len(words) > 4 and _contains_any(lowered, compact, ("download", "다운로드", "install", "installer", "setup", "설치")):
             score -= 25
         if lowered.startswith(("q ", "search ", "검색 ")) and len(words) > 2:
             score -= 45
@@ -1122,7 +1722,7 @@ def click_text_targets(
             match_ratio = matched_start / char_count
             if matched_token in primary_terms:
                 score += 18
-            if matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi", "zip", "alz", "archive", "package"}:
+            if matched_token in download_action_tokens:
                 score += 16
             if match_ratio >= 0.55:
                 score += 18
@@ -1317,12 +1917,12 @@ def click_text_targets(
             label = "browser_search_result_region"
         elif mode == "installer":
             click_points = (
-                (0.92, 0.90),
-                (0.88, 0.90),
+                (0.78, 0.90),
+                (0.72, 0.90),
                 (0.84, 0.90),
-                (0.92, 0.82),
-                (0.80, 0.82),
-                (0.76, 0.90),
+                (0.78, 0.82),
+                (0.66, 0.90),
+                (0.90, 0.90),
             )
             label = "installer_primary_action_region"
         elif mode == "menu":
@@ -1365,6 +1965,30 @@ def click_text_targets(
     deadline = time.time() + max(float(timeout_s), float(poll_interval_s))
     best_candidate = None
     sweep_index = 0
+    scroll_retry_count = 0
+    last_ocr_debug = []
+
+    def _format_ocr_debug(items, *, limit=18):
+        formatted = []
+        for item in list(items or [])[: int(limit)]:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("raw_text") or item.get("text") or "").strip()
+            if not text:
+                continue
+            formatted.append(
+                {
+                    "text": text,
+                    "left": int(item.get("left") or 0),
+                    "top": int(item.get("top") or 0),
+                    "width": int(item.get("width") or 0),
+                    "height": int(item.get("height") or 0),
+                    "language": str(item.get("language") or ""),
+                    "variant": str(item.get("ocr_variant") or ""),
+                }
+            )
+        return formatted
+
     while time.time() < deadline:
         if restrict_to_browser_window:
             _activate_browser_window()
@@ -1376,10 +2000,49 @@ def click_text_targets(
             max_lines=200,
             crop_region=active_region if active_region is not None else None,
         )
+        last_ocr_debug = _format_ocr_debug(lines)
+        context_lines = [item for item in lines if isinstance(item, dict) and _line_has_context(item)]
+        context_visible_on_page = bool(context_lines) or _region_has_context(active_region)
+
+        def _candidate_has_context(item):
+            if not require_context or not context_terms:
+                return True
+            if _line_has_context(item):
+                return True
+            if context_scope == "page":
+                return context_visible_on_page
+            if not context_lines:
+                return False
+            left = int(item.get("left") or 0)
+            top = int(item.get("top") or 0)
+            width = max(1, int(item.get("width") or 0))
+            height = max(1, int(item.get("height") or 0))
+            right = left + width
+            bottom = top + height
+            center_x, center_y = _line_center(item)
+            radius = max(80, int(context_radius_px or 0))
+            for context_item in context_lines:
+                context_left = int(context_item.get("left") or 0)
+                context_top = int(context_item.get("top") or 0)
+                context_width = max(1, int(context_item.get("width") or 0))
+                context_height = max(1, int(context_item.get("height") or 0))
+                context_right = context_left + context_width
+                context_bottom = context_top + context_height
+                context_x, context_y = _line_center(context_item)
+                close_y = abs(center_y - context_y) <= radius or (
+                    context_bottom <= top and (top - context_bottom) <= radius
+                ) or (
+                    bottom <= context_top and (context_top - bottom) <= radius
+                )
+                if close_y and _ranges_overlap(left, right, context_left, context_right, tolerance=160):
+                    return True
+                if abs(center_x - context_x) <= radius and abs(center_y - context_y) <= radius:
+                    return True
+            return False
 
         def _collect_candidates(region):
             collected = []
-            for item in lines:
+            for line_index, item in enumerate(lines):
                 text = str(item.get("text") or "").strip()
                 if not text:
                     continue
@@ -1390,12 +2053,18 @@ def click_text_targets(
                 top = int(item.get("top") or 0)
                 width = max(1, int(item.get("width") or 0))
                 height = max(1, int(item.get("height") or 0))
-                center_x = int(left + width / 2)
-                center_y = int(top + height / 2)
+                center_x = int(item.get("center_x") or int(left + width / 2))
+                center_y = int(item.get("center_y") or int(top + height / 2))
                 best_match = _best_token_match(text)
-                matched_token = best_match[4] if best_match is not None else ""
-                matched_start = best_match[2] if best_match is not None else 0
-                matched_end = best_match[3] if best_match is not None else 0
+                matched_token = best_match[5] if best_match is not None else ""
+                matched_start = best_match[3] if best_match is not None else 0
+                matched_end = best_match[4] if best_match is not None else 0
+                click_left = left
+                click_top = top
+                click_width = width
+                click_height = height
+                if not _candidate_has_context(item):
+                    continue
                 if click_horizontal_bias == "left_text":
                     center_x = int(left + min(max(width * 0.22, 40), 140))
                 elif click_horizontal_bias in {"matched_token", "matched_token_right"} and best_match is not None:
@@ -1413,12 +2082,16 @@ def click_text_targets(
                     score += 25
                     browser_height = max(1, int(region["bottom"]) - int(region["top"]))
                     relative_top = top - int(region["top"])
+                    if int(min_relative_top_px or 0) > 0 and relative_top < int(min_relative_top_px or 0):
+                        continue
+                    if max_relative_top_px is not None and relative_top > int(max_relative_top_px):
+                        continue
                     if not prefer_bottom:
                         if relative_top <= min(260, browser_height // 3):
                             score += 18
                         elif relative_top >= int(browser_height * 0.55):
                             score -= 35
-                    elif relative_top <= min(220, browser_height // 3) and matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi", "zip", "alz", "archive", "package"}:
+                    elif relative_top <= min(220, browser_height // 3) and matched_token in download_action_tokens:
                         score += 24
                 if width > 520:
                     score -= 45
@@ -1430,11 +2103,29 @@ def click_text_targets(
                     score += 12
                 if top < 220 and width > 320:
                     score -= 20
-                if matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi", "zip", "alz", "archive", "package"} and width > 280:
+                if matched_token in download_action_tokens and width > 280:
                     score += 28
-                if matched_token in {"download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi", "zip", "alz", "archive", "package"} and top < 220 and width > 320:
+                if matched_token in download_action_tokens and top < 220 and width > 320:
                     score += 20
                 if score <= 0:
+                    continue
+                exact_match = _exact_target_word_match(text)
+                if not _installer_candidate_allowed(
+                    text=text,
+                    matched_token=matched_token,
+                    region=region,
+                    top=top,
+                    candidate_source="line_bbox",
+                    exact_match=exact_match,
+                ):
+                    continue
+                word_candidates = _word_box_candidates_for_line(line_index, item, score)
+                if word_candidates:
+                    collected.extend(word_candidates)
+                    continue
+                if bool(exact_word_targets):
+                    continue
+                if _point_skipped(center_x, center_y):
                     continue
                 collected.append(
                     {
@@ -1443,16 +2134,27 @@ def click_text_targets(
                         "top": top,
                         "width": width,
                         "height": height,
+                        "click_left": click_left,
+                        "click_top": click_top,
+                        "click_width": click_width,
+                        "click_height": click_height,
                         "x": center_x,
                         "y": center_y,
                         "score": score,
                         "matched_token": matched_token,
+                        "raw_text": str(item.get("raw_text") or text),
+                        "matched_word": "",
+                        "candidate_source": "line_bbox",
+                        "source_line_index": int(line_index),
+                        "right": left + width,
+                        "bottom": top + height,
                     }
                 )
             return collected
 
         candidates = _collect_candidates(active_region)
-        if not candidates and active_region is not None:
+        bounded_relative_region = bool(int(min_relative_top_px or 0) > 0 or max_relative_top_px is not None)
+        if not candidates and active_region is not None and not bounded_relative_region:
             candidates = _collect_candidates(None)
         if candidates:
             candidates.sort(
@@ -1466,14 +2168,34 @@ def click_text_targets(
             best_candidate = candidates[0]
             center_x = int(best_candidate["x"])
             center_y = int(best_candidate["y"])
+            click_left = int(best_candidate.get("click_left", best_candidate["left"]))
+            click_top = int(best_candidate.get("click_top", best_candidate["top"]))
+            click_width = int(best_candidate.get("click_width", best_candidate["width"]))
+            click_height = int(best_candidate.get("click_height", best_candidate["height"]))
+            if click_horizontal_bias == "center":
+                center_x = click_left + int(click_width * 0.50)
+                center_y = click_top + int(click_height * 0.50)
             _click_point(center_x, center_y)
             return {
                 "text": best_candidate["text"],
+                "raw_text": best_candidate.get("raw_text", best_candidate["text"]),
                 "x": center_x,
                 "y": center_y,
+                "left": int(best_candidate["left"]),
+                "top": int(best_candidate["top"]),
+                "width": int(best_candidate["width"]),
+                "height": int(best_candidate["height"]),
+                "click_left": click_left,
+                "click_top": click_top,
+                "click_width": click_width,
+                "click_height": click_height,
+                "matched_token": best_candidate.get("matched_token", ""),
+                "matched_word": best_candidate.get("matched_word", ""),
+                "candidate_source": best_candidate.get("candidate_source", ""),
                 "score": best_candidate["score"],
             }
-        if allow_heuristic_fallback and active_region is not None and sweep_index >= 2:
+        heuristic_sweep_threshold = 0 if installer_mode else 2
+        if allow_heuristic_fallback and active_region is not None and sweep_index >= heuristic_sweep_threshold:
             heuristic_candidate = _heuristic_browser_click(active_region, attempt_index=sweep_index)
             if heuristic_candidate is not None:
                 _click_point(int(heuristic_candidate["x"]), int(heuristic_candidate["y"]))
@@ -1482,15 +2204,19 @@ def click_text_targets(
                 time.sleep(max(0.8, float(poll_interval_s)))
                 continue
         sweep_index += 1
-        if restrict_to_browser_window and crop_region is None and sweep_index % 2 == 0:
-            _page_down()
+        if restrict_to_browser_window and crop_region is None:
+            if (not allow_heuristic_fallback or prefer_bottom) and scroll_retry_count < 3:
+                _page_down()
+                scroll_retry_count += 1
+            elif sweep_index % 2 == 0:
+                _page_down()
         time.sleep(float(poll_interval_s))
     if best_candidate is not None:
         return best_candidate
-    raise SystemExit(f"could not find visible text target for {target_terms!r}")
+    raise SystemExit(f"could not find visible text target for {original_target_terms!r}; visible_ocr={last_ocr_debug!r}")
 """.strip(),
     "click_download_like_target": """
-def click_download_like_target(*, extra_targets=None, avoid_targets=None, image_path=None, timeout_s=10.0):
+def click_download_like_target(*, extra_targets=None, avoid_targets=None, image_path=None, timeout_s=10.0, skip_click_points=None):
     targets = [
         "official",
         "공식",
@@ -1569,12 +2295,91 @@ def click_download_like_target(*, extra_targets=None, avoid_targets=None, image_
         targets.extend(str(item).strip().lower() for item in extra_targets if str(item).strip())
     if avoid_targets:
         avoid.extend(str(item).strip().lower() for item in avoid_targets if str(item).strip())
+    context = [str(item).strip().lower() for item in (extra_targets or []) if str(item).strip()]
+    context_scope = "near"
+    if context:
+        try:
+            context_scope = "near" if browser_page_has_search_results(image_path=image_path, expected_title_tokens=context) else "page"
+        except Exception:
+            context_scope = "near"
     return click_text_targets(
         targets,
         avoid_targets=avoid,
         primary_targets=["download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi", "zip", "alz", "archive", "package"],
+        context_targets=context,
+        require_context=bool(context),
+        context_match_scope=context_scope,
+        context_radius_px=360,
+        skip_click_points=skip_click_points,
         min_primary_hits=1,
         window_title_tokens=[*targets],
+        restrict_to_browser_window=True,
+        click_horizontal_bias="center",
+        image_path=image_path,
+        timeout_s=timeout_s,
+        poll_interval_s=1.0,
+        prefer_bottom=True,
+        double_click=False,
+        allow_heuristic_fallback=False,
+        heuristic_mode="download",
+    )
+""".strip(),
+    "click_download_related_fallback": """
+def click_download_related_fallback(*, extra_targets=None, image_path=None, timeout_s=8.0, skip_click_points=None):
+    targets = [
+        "download",
+        "downloads",
+        "다운로드",
+        "다운 로드",
+        "다운받기",
+        "다운 받기",
+        "내려받기",
+        "내려 받기",
+        "받기",
+        "install",
+        "installer",
+        "setup",
+        "설치",
+        "설치하기",
+        "설치 파일",
+        "설치파일",
+        "exe",
+        "msi",
+        "zip",
+        "alz",
+        "64-bit",
+        "32-bit",
+        "x64",
+        "x86",
+    ]
+    avoid = [
+        "android",
+        "iphone",
+        "ios",
+        "mac",
+        "macos",
+        "linux",
+        "portable",
+        "source",
+        "nightly",
+        "alpha",
+        "beta",
+        "sdk",
+        "server",
+        "blog",
+        "forum",
+        "커뮤니티",
+        "광고",
+        "ad",
+        "ads",
+    ]
+    window_terms = [*targets, *(str(item).strip().lower() for item in (extra_targets or []) if str(item).strip()), "chrome", "edge", "firefox", "brave", "opera"]
+    return click_text_targets(
+        targets,
+        avoid_targets=avoid,
+        primary_targets=["download", "다운로드", "다운 로드", "다운받기", "내려받기", "받기", "install", "installer", "setup", "설치", "exe", "msi", "zip", "alz"],
+        min_primary_hits=1,
+        window_title_tokens=window_terms,
         restrict_to_browser_window=True,
         click_horizontal_bias="matched_token_right",
         image_path=image_path,
@@ -1582,12 +2387,15 @@ def click_download_like_target(*, extra_targets=None, avoid_targets=None, image_
         poll_interval_s=1.0,
         prefer_bottom=True,
         double_click=False,
-        allow_heuristic_fallback=True,
+        skip_click_points=skip_click_points,
+        allow_heuristic_fallback=False,
         heuristic_mode="download",
     )
 """.strip(),
     "click_search_result_like_target": """
 def click_search_result_like_target(*, extra_targets=None, avoid_targets=None, image_path=None, timeout_s=10.0):
+    ensure_windows_dpi_aware()
+
     targets = [
         "official",
         "공식",
@@ -1622,25 +2430,37 @@ def click_search_result_like_target(*, extra_targets=None, avoid_targets=None, i
         targets.extend(str(item).strip().lower() for item in extra_targets if str(item).strip())
     if avoid_targets:
         avoid.extend(str(item).strip().lower() for item in avoid_targets if str(item).strip())
+    context = [str(item).strip().lower() for item in (extra_targets or []) if str(item).strip()]
+    query_reject_texts = []
+    if context:
+        query_reject_texts.append(" ".join([*context, "official", "windows", "download"]))
+        query_reject_texts.append(" ".join([*context, "official", "windows", "down"]))
+    primary = [*context, "official", "공식", "download", "다운로드", "windows", "pc"] if context else ["official", "공식", "download", "다운로드", "windows", "pc"]
     return click_text_targets(
         targets,
         avoid_targets=avoid,
-        primary_targets=["official", "공식", "download", "다운로드", "windows", "pc"],
+        primary_targets=primary,
+        reject_texts=query_reject_texts,
+        context_targets=context,
+        require_context=bool(context),
+        context_match_scope="near",
+        context_radius_px=420,
         min_primary_hits=1,
         window_title_tokens=[*targets],
         restrict_to_browser_window=True,
         click_horizontal_bias="left_text",
+        min_relative_top_px=210,
         image_path=image_path,
         timeout_s=timeout_s,
         poll_interval_s=1.0,
         prefer_bottom=False,
         double_click=True,
-        allow_heuristic_fallback=True,
+        allow_heuristic_fallback=False,
         heuristic_mode="search",
     )
 """.strip(),
     "open_responsive_header_menu": """
-def open_responsive_header_menu(*, extra_targets=None, image_path=None, timeout_s=6.0):
+def open_responsive_header_menu(*, extra_targets=None, image_path=None, timeout_s=6.0, skip_click_points=None):
     targets = [
         "menu",
         "메뉴",
@@ -1651,15 +2471,17 @@ def open_responsive_header_menu(*, extra_targets=None, image_path=None, timeout_
         "전체메뉴",
         "all menu",
     ]
-    if extra_targets:
-        targets.extend(str(item).strip().lower() for item in extra_targets if str(item).strip())
+    context = [str(item).strip().lower() for item in (extra_targets or []) if str(item).strip()]
     return click_text_targets(
         targets,
         primary_targets=["menu", "메뉴", "more", "더보기", "전체메뉴"],
-        min_primary_hits=0,
-        window_title_tokens=[*targets, "chrome", "edge", "firefox", "brave", "opera"],
+        context_targets=context,
+        require_context=False,
+        min_primary_hits=1,
+        window_title_tokens=[*targets, *context, "chrome", "edge", "firefox", "brave", "opera"],
         restrict_to_browser_window=True,
         click_horizontal_bias="matched_token_right",
+        skip_click_points=skip_click_points,
         image_path=image_path,
         timeout_s=timeout_s,
         poll_interval_s=1.0,
@@ -1674,32 +2496,53 @@ def dismiss_browser_overlay(*, image_path=None, timeout_s=4.0):
     import ctypes
     import time
 
-    overlay_terms = [
+    ensure_windows_dpi_aware()
+
+    overlay_context_terms = [
         "translate",
         "번역",
         "language",
         "언어",
+        "cookie",
+        "쿠키",
+        "notification",
+        "알림",
+        "permission",
+        "권한",
+        "popup",
+        "팝업",
+        "privacy",
+        "개인정보",
+    ]
+    overlay_action_terms = [
         "not now",
         "나중에",
         "close",
         "닫기",
         "cancel",
         "취소",
-        "popup",
-        "팝업",
-        "more",
-        "더보기",
+        "dismiss",
+        "거부",
+        "확인",
+        "ok",
     ]
+    overlay_terms = [*overlay_context_terms, *overlay_action_terms]
 
     lines = ocr_screen_text_regions(image_path=image_path, max_lines=120)
     combined = " | ".join(str(item.get("text") or "") for item in lines).lower()
-    overlay_detected = any(term in combined for term in overlay_terms)
+    overlay_context_detected = any(term in combined for term in overlay_context_terms)
+    overlay_action_detected = any(term in combined for term in overlay_action_terms)
+    overlay_detected = overlay_context_detected and overlay_action_detected
 
     if overlay_detected:
         try:
             clicked = click_text_targets(
-                overlay_terms,
-                primary_targets=["not now", "나중에", "close", "닫기", "cancel", "취소", "more", "더보기"],
+                overlay_action_terms,
+                primary_targets=["not now", "나중에", "close", "닫기", "cancel", "취소", "dismiss", "거부", "확인", "ok"],
+                context_targets=overlay_context_terms,
+                require_context=True,
+                context_match_scope="near",
+                context_radius_px=360,
                 min_primary_hits=1,
                 window_title_tokens=["chrome", "edge", "firefox", "brave", "opera"],
                 restrict_to_browser_window=True,
@@ -1715,6 +2558,14 @@ def dismiss_browser_overlay(*, image_path=None, timeout_s=4.0):
             return {"dismissed": True, "clicked": clicked, "mode": "text"}
         except SystemExit:
             pass
+
+    if not overlay_detected:
+        return {
+            "dismissed": False,
+            "clicked": None,
+            "mode": "none",
+            "overlay_detected": False,
+        }
 
     try:
         import pygetwindow as gw
@@ -1749,54 +2600,144 @@ def dismiss_browser_overlay(*, image_path=None, timeout_s=4.0):
 """.strip(),
     "advance_visible_download_flow": """
 def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeout_s=18.0, search_first=False, search_url=None):
-    import ctypes
     import time
-
-    def _tab_enter(tab_presses, *, final_enter=True):
-        user32 = ctypes.windll.user32
-        vk_tab = 0x09
-        vk_enter = 0x0D
-        for _ in range(max(1, int(tab_presses))):
-            user32.keybd_event(vk_tab, 0, 0, 0)
-            time.sleep(0.05)
-            user32.keybd_event(vk_tab, 0, 0x0002, 0)
-            time.sleep(0.25)
-        if final_enter:
-            user32.keybd_event(vk_enter, 0, 0, 0)
-            time.sleep(0.05)
-            user32.keybd_event(vk_enter, 0, 0x0002, 0)
-            time.sleep(1.0)
 
     attempts = []
     combined_visible_text = ""
     lines = []
+    flow_started_at = time.time()
     total_timeout = max(float(timeout_s), 6.0)
+    flow_deadline = flow_started_at + total_timeout
     search_timeout = min(12.0, max(6.0, total_timeout * 0.55))
     download_timeout = min(12.0, max(6.0, total_timeout * 0.55))
+
+    def _remaining_time():
+        return max(0.0, flow_deadline - time.time())
+
+    def _budget_exhausted(min_remaining=0.8):
+        return _remaining_time() <= float(min_remaining)
+
+    def _budgeted_timeout(cap, *, minimum=1.2):
+        remaining = _remaining_time()
+        if remaining <= 0:
+            return 0.0
+        if remaining < float(minimum):
+            return remaining
+        return min(float(cap), remaining)
+
+    def _sleep_budgeted(seconds):
+        remaining = _remaining_time()
+        if remaining <= 0:
+            return
+        time.sleep(min(float(seconds), remaining))
+
+    def _raise_if_budget_exhausted(stage):
+        if _budget_exhausted():
+            attempts.append({"stage": stage, "error": "visible download flow time budget exhausted"})
+            raise SystemExit("visible download flow time budget exhausted")
+
+    def _recent_download_activity(since_ts):
+        import os
+        from pathlib import Path
+
+        downloads = Path.home() / "Downloads"
+        if not downloads.exists():
+            return None
+        patterns = ("*.crdownload", "*.part", "*.partial", "*.tmp", "*.exe", "*.msi", "*.zip", "*.alz")
+        newest = None
+        newest_mtime = 0.0
+        for pattern in patterns:
+            try:
+                matches = list(downloads.rglob(pattern))
+            except Exception:
+                matches = []
+            for path in matches:
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                if stat.st_mtime < float(since_ts) - 5.0:
+                    continue
+                if stat.st_size <= 0:
+                    continue
+                if stat.st_mtime >= newest_mtime:
+                    newest = path
+                    newest_mtime = stat.st_mtime
+        if newest is None:
+            return None
+        return {"path": str(newest), "bytes": newest.stat().st_size, "mtime": newest_mtime}
+
+    def _record_recent_download_activity(stage):
+        activity = _recent_download_activity(flow_started_at)
+        if activity:
+            attempts.append({"stage": stage, "activity": activity})
+            return True
+        return False
+
+    def _current_browser_url():
+        import ctypes
+        import subprocess
+
+        if not hasattr(ctypes, "windll"):
+            return None
+        user32 = ctypes.windll.user32
+        vk_control = 0x11
+        vk_l = 0x4C
+        vk_c = 0x43
+        try:
+            user32.keybd_event(vk_control, 0, 0, 0)
+            user32.keybd_event(vk_l, 0, 0, 0)
+            time.sleep(0.05)
+            user32.keybd_event(vk_l, 0, 0x0002, 0)
+            user32.keybd_event(vk_control, 0, 0x0002, 0)
+            time.sleep(0.15)
+            user32.keybd_event(vk_control, 0, 0, 0)
+            user32.keybd_event(vk_c, 0, 0, 0)
+            time.sleep(0.05)
+            user32.keybd_event(vk_c, 0, 0x0002, 0)
+            user32.keybd_event(vk_control, 0, 0x0002, 0)
+            time.sleep(0.15)
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                check=False,
+                timeout=5,
+            )
+            url = str(completed.stdout or "").strip().splitlines()[0].strip() if completed.stdout else ""
+            if url.startswith(("http://", "https://")):
+                return url
+        except Exception:
+            return None
+        return None
     if search_first:
         if search_url and not browser_page_has_search_results(image_path=image_path, expected_title_tokens=extra_targets):
             try:
+                _raise_if_budget_exhausted("search_page_open_budget")
                 open_url_and_wait(
                     search_url,
                     expected_title_tokens=extra_targets,
-                    timeout_s=max(10.0, search_timeout),
+                    timeout_s=max(1.0, _budgeted_timeout(max(10.0, search_timeout), minimum=1.5)),
                 )
                 attempts.append({"stage": "search_page_open", "opened": search_url})
-                time.sleep(3.5)
+                _sleep_budgeted(3.5)
             except SystemExit as exc:
                 attempts.append({"stage": "search_page_open", "error": str(exc), "opened": search_url})
         try:
+            _raise_if_budget_exhausted("search_result_budget")
             clicked = click_search_result_like_target(
                 extra_targets=extra_targets,
                 image_path=image_path,
-                timeout_s=search_timeout,
+                timeout_s=max(1.0, _budgeted_timeout(search_timeout, minimum=1.5)),
             )
             attempts.append({"stage": "search_result", "clicked": clicked})
-            time.sleep(4.0)
+            _sleep_budgeted(4.0)
         except SystemExit as exc:
             attempts.append({"stage": "search_result", "error": str(exc)})
             if extra_targets:
                 try:
+                    _raise_if_budget_exhausted("search_result_fallback_budget")
                     clicked = click_text_targets(
                         [*extra_targets, "official", "공식", "download", "다운로드", "windows", "pc"],
                         primary_targets=[*extra_targets],
@@ -1804,27 +2745,30 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
                         window_title_tokens=[*extra_targets, "chrome", "edge", "firefox"],
                         restrict_to_browser_window=True,
                         click_horizontal_bias="left_text",
+                        context_targets=list(extra_targets or []),
+                        require_context=bool(extra_targets),
+                        context_radius_px=420,
                         image_path=image_path,
-                        timeout_s=search_timeout,
+                        timeout_s=max(1.0, _budgeted_timeout(search_timeout, minimum=1.5)),
                         poll_interval_s=1.0,
+                        min_relative_top_px=210,
                         prefer_bottom=False,
                         double_click=True,
+                        allow_heuristic_fallback=False,
                     )
                     attempts.append({"stage": "search_result_fallback", "clicked": clicked})
-                    time.sleep(4.0)
+                    _sleep_budgeted(4.0)
                 except SystemExit as fallback_exc:
                     attempts.append({"stage": "search_result_fallback", "error": str(fallback_exc)})
-            _tab_enter(4, final_enter=True)
-            attempts.append({"stage": "search_result_keyboard_fallback", "action": "tab_enter"})
-            time.sleep(4.0)
     try:
+        _raise_if_budget_exhausted("dismiss_browser_overlay_budget")
         overlay = dismiss_browser_overlay(
             image_path=image_path,
-            timeout_s=min(4.0, download_timeout),
+            timeout_s=max(1.0, _budgeted_timeout(min(4.0, download_timeout), minimum=1.0)),
         )
         attempts.append({"stage": "dismiss_browser_overlay", "result": overlay})
         if overlay.get("dismissed"):
-            time.sleep(1.2)
+            _sleep_budgeted(1.2)
     except SystemExit as overlay_exc:
         attempts.append({"stage": "dismiss_browser_overlay", "error": str(overlay_exc)})
     try:
@@ -1833,6 +2777,28 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
     except Exception:
         combined_visible_text = ""
         lines = []
+    try:
+        search_results_visible = browser_page_has_search_results(
+            image_path=image_path,
+            expected_title_tokens=extra_targets,
+        )
+    except Exception:
+        search_results_visible = False
+    download_context_scope = "near" if search_results_visible else "page"
+    normalized_visible_text = combined_visible_text.lower()
+
+    def _clear_download_page_visible():
+        if search_results_visible:
+            return False
+        compact_visible = "".join(normalized_visible_text.split())
+        context = [str(item).strip().lower() for item in (extra_targets or []) if str(item).strip()]
+        target_visible = not context or any(token in normalized_visible_text or "".join(token.split()) in compact_visible for token in context)
+        if not target_visible:
+            return False
+        installer_filename_visible = any(token in normalized_visible_text for token in (".exe", ".msi", ".zip", ".alz", "setup_", "setup-", "installer"))
+        korean_installer_visible = "설치파일" in compact_visible or "설치파일" in normalized_visible_text
+        download_word_visible = any(token in normalized_visible_text for token in ("download", "다운로드", "다운 로드", "다운받기", "내려받기", "받기"))
+        return bool((installer_filename_visible or korean_installer_visible) and download_word_visible or (installer_filename_visible and korean_installer_visible))
     download_cues_present = any(
         token in combined_visible_text
         for token in (
@@ -1892,13 +2858,24 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
         )
     )
     should_try_menu_first = (menu_cues_present or diversion_cues_present) and not download_cues_present
+    menu_clicked_points = []
+
+    def _remember_menu_clicked_point(clicked_result):
+        try:
+            menu_clicked_points.append({"x": int(clicked_result.get("x") or 0), "y": int(clicked_result.get("y") or 0)})
+        except Exception:
+            pass
+
     if should_try_menu_first:
         try:
+            _raise_if_budget_exhausted("responsive_header_menu_prefetch_budget")
             menu_click = open_responsive_header_menu(
                 extra_targets=extra_targets,
                 image_path=image_path,
-                timeout_s=min(6.0, download_timeout),
+                timeout_s=max(1.0, _budgeted_timeout(min(6.0, download_timeout), minimum=1.2)),
+                skip_click_points=menu_clicked_points,
             )
+            _remember_menu_clicked_point(menu_click)
             attempts.append(
                 {
                     "stage": "responsive_header_menu_prefetch",
@@ -1907,7 +2884,7 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
                     "diversion_cues_present": diversion_cues_present,
                 }
             )
-            time.sleep(2.0)
+            _sleep_budgeted(2.0)
         except SystemExit as menu_prefetch_exc:
             attempts.append(
                 {
@@ -1918,103 +2895,226 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
                 }
             )
     try:
-        clicked = click_text_targets(
-            [
-                *(list(extra_targets or [])),
-                "official",
-                "공식",
-                "download",
-                "다운로드",
-                "설치",
-                "install",
-                "installer",
-                "setup",
-                "standard",
-                "standard installer",
-                "받기",
-                "pc",
-                "windows",
-                "exe",
-                "msi",
-                "zip",
-                "alz",
-                "archive",
-                "package",
-                "64-bit",
-                "32-bit",
-                "x64",
-                "x86",
-            ],
-            avoid_targets=[
-                "android",
-                "iphone",
-                "ios",
-                "mac",
-                "macos",
-                "linux",
-                "portable",
-                "no installer",
-                "source",
-                "nightly",
-                "nightly builds",
-                "alpha",
-                "beta",
-                "sdk",
-                "server",
-                "blog",
-                "블로그",
-                "forum",
-                "커뮤니티",
-            ],
-            primary_targets=["download", "다운로드", "install", "installer", "setup", "standard", "설치", "받기", "exe", "msi", "zip", "alz", "archive", "package"],
-            min_primary_hits=1,
-            window_title_tokens=[*(list(extra_targets or [])), "chrome", "edge", "firefox", "brave", "opera", "official", "공식", "download", "다운로드"],
-            restrict_to_browser_window=True,
-            click_horizontal_bias="matched_token_right",
-            image_path=image_path,
-            timeout_s=max(4.0, min(download_timeout, 8.0)),
-            poll_interval_s=1.0,
-            prefer_bottom=True,
-            double_click=False,
-            allow_heuristic_fallback=False,
-            heuristic_mode="download",
-        )
-        attempts.append({"stage": "download_control_text", "clicked": clicked})
+        download_targets = [
+            *(list(extra_targets or [])),
+            "official",
+            "공식",
+            "download",
+            "다운로드",
+            "설치",
+            "install",
+            "installer",
+            "setup",
+            "standard",
+            "standard installer",
+            "받기",
+            "pc",
+            "windows",
+            "exe",
+            "msi",
+            "zip",
+            "alz",
+            "archive",
+            "package",
+            "64-bit",
+            "32-bit",
+            "x64",
+            "x86",
+        ]
+        download_avoid = [
+            "android",
+            "iphone",
+            "ios",
+            "mac",
+            "macos",
+            "linux",
+            "portable",
+            "no installer",
+            "source",
+            "nightly",
+            "nightly builds",
+            "alpha",
+            "beta",
+            "sdk",
+            "server",
+            "blog",
+            "블로그",
+            "forum",
+            "커뮤니티",
+        ]
+        download_action_primary = ["download", "다운로드", "다운 로드", "다운받기", "내려받기", "받기", "install", "installer", "setup", "standard", "설치"]
+        download_file_primary = ["exe", "msi", "zip", "alz", "archive", "package"]
+        download_primary = [*download_action_primary, *download_file_primary]
+        download_action_targets = [
+            *(list(extra_targets or [])),
+            "official",
+            "공식",
+            "download",
+            "다운로드",
+            "다운 로드",
+            "다운받기",
+            "내려받기",
+            "받기",
+            "설치",
+            "install",
+            "installer",
+            "setup",
+            "standard",
+            "standard installer",
+            "pc",
+            "windows",
+        ]
+
+        clicked_points = []
+
+        def _remember_clicked_point(clicked_result):
+            try:
+                clicked_points.append({"x": int(clicked_result.get("x") or 0), "y": int(clicked_result.get("y") or 0)})
+            except Exception:
+                pass
+
+        def _click_download_candidate(stage, *, targets=None, primary_targets=None, candidate_index=1):
+            _raise_if_budget_exhausted(f"{stage}_budget")
+            clicked_result = click_text_targets(
+                targets or download_targets,
+                avoid_targets=download_avoid,
+                primary_targets=primary_targets or download_primary,
+                context_targets=list(extra_targets or []),
+                require_context=bool(extra_targets),
+                context_match_scope=download_context_scope,
+                context_radius_px=360,
+                skip_click_points=clicked_points,
+                min_primary_hits=1,
+                window_title_tokens=[*(list(extra_targets or [])), "chrome", "edge", "firefox", "brave", "opera", "official", "공식", "download", "다운로드"],
+                restrict_to_browser_window=True,
+                click_horizontal_bias="center",
+                image_path=image_path,
+                timeout_s=max(1.0, _budgeted_timeout(max(2.0, min(download_timeout, 4.0)), minimum=1.0)),
+                poll_interval_s=1.0,
+                prefer_bottom=True,
+                double_click=False,
+                allow_heuristic_fallback=False,
+                heuristic_mode="download",
+            )
+            _remember_clicked_point(clicked_result)
+            attempts.append({"stage": stage, "clicked": clicked_result, "candidate_index": int(candidate_index)})
+            _sleep_budgeted(1.2)
+            return _record_recent_download_activity(f"{stage}_download_activity")
+
+        def _try_download_candidates(stage, *, targets=None, primary_targets=None, max_candidates=4):
+            for candidate_index in range(1, int(max_candidates) + 1):
+                if _budget_exhausted():
+                    attempts.append({"stage": stage, "error": "candidate retry budget exhausted", "candidate_index": candidate_index})
+                    return False
+                candidate_stage = stage if candidate_index == 1 else f"{stage}_candidate_{candidate_index:02d}"
+                try:
+                    if _click_download_candidate(
+                        candidate_stage,
+                        targets=targets,
+                        primary_targets=primary_targets,
+                        candidate_index=candidate_index,
+                    ):
+                        return True
+                except SystemExit as candidate_exc:
+                    attempts.append({"stage": candidate_stage, "error": str(candidate_exc), "candidate_index": candidate_index})
+                    return False
+            return False
+
+        def _try_menu_candidates_then_download(stage, *, max_menu_candidates=4, download_candidates_per_menu=2):
+            for menu_candidate_index in range(1, int(max_menu_candidates) + 1):
+                if _budget_exhausted():
+                    attempts.append({"stage": stage, "error": "menu retry budget exhausted", "candidate_index": menu_candidate_index})
+                    return False
+                menu_stage = stage if menu_candidate_index == 1 else f"{stage}_candidate_{menu_candidate_index:02d}"
+                try:
+                    menu_click = open_responsive_header_menu(
+                        extra_targets=extra_targets,
+                        image_path=image_path,
+                        timeout_s=max(1.0, _budgeted_timeout(min(4.0, download_timeout), minimum=1.0)),
+                        skip_click_points=menu_clicked_points,
+                    )
+                    _remember_menu_clicked_point(menu_click)
+                    attempts.append({"stage": menu_stage, "clicked": menu_click, "candidate_index": menu_candidate_index})
+                    _sleep_budgeted(1.0)
+                except SystemExit as menu_exc:
+                    attempts.append({"stage": menu_stage, "error": str(menu_exc), "candidate_index": menu_candidate_index})
+                    return False
+                if _try_download_candidates(
+                    f"{menu_stage}_download_control",
+                    targets=download_action_targets,
+                    primary_targets=download_action_primary,
+                    max_candidates=download_candidates_per_menu,
+                ):
+                    return True
+            return False
+
+        if _try_download_candidates("download_action_text", targets=download_action_targets, primary_targets=download_action_primary):
+            return {"attempts": attempts}
+        if _try_download_candidates("download_control_text"):
+            return {"attempts": attempts}
+        if _try_menu_candidates_then_download("responsive_header_menu_retry"):
+            return {"attempts": attempts}
+        if not _clear_download_page_visible():
+            attempts.append({"stage": "download_related_window_fallback_skipped", "reason": "clear_download_page_required"})
+            raise SystemExit("download related fallback skipped: clear download page required")
+        fallback_url = _current_browser_url()
+        fallback_clicked = False
+        fallback_points = []
+        for candidate_index in range(1, 5):
+            if fallback_clicked and fallback_url and candidate_index > 1:
+                try:
+                    open_url_and_wait(
+                        fallback_url,
+                        expected_title_tokens=extra_targets,
+                        timeout_s=max(1.0, _budgeted_timeout(6.0, minimum=1.2)),
+                        settle_time_s=1.2,
+                    )
+                    attempts.append({"stage": "download_related_window_fallback_page_open", "opened": fallback_url, "candidate_index": candidate_index})
+                    _sleep_budgeted(1.0)
+                except SystemExit as fallback_open_exc:
+                    attempts.append({"stage": "download_related_window_fallback_page_open", "error": str(fallback_open_exc), "candidate_index": candidate_index})
+            try:
+                clicked = click_download_related_fallback(
+                    extra_targets=extra_targets,
+                    image_path=image_path,
+                    timeout_s=max(1.0, _budgeted_timeout(min(5.0, download_timeout), minimum=1.0)),
+                    skip_click_points=fallback_points,
+                )
+                try:
+                    fallback_points.append({"x": int(clicked.get("x") or 0), "y": int(clicked.get("y") or 0)})
+                except Exception:
+                    pass
+                fallback_clicked = True
+                attempts.append({"stage": "download_related_window_fallback", "clicked": clicked, "candidate_index": candidate_index})
+                _sleep_budgeted(1.2)
+                if _record_recent_download_activity("download_related_window_fallback_download_activity"):
+                    return {"attempts": attempts}
+            except SystemExit as related_fallback_exc:
+                attempts.append({"stage": "download_related_window_fallback", "error": str(related_fallback_exc), "candidate_index": candidate_index})
+                break
+        if fallback_clicked:
+            return {"attempts": attempts}
+        raise SystemExit("download related fallback found no clickable candidates")
     except SystemExit as exc:
         attempts.append({"stage": "download_control_text", "error": str(exc)})
         try:
+            _raise_if_budget_exhausted("download_control_scroll_budget")
+            page_down_browser_view(steps=1, settle_s=1.0)
+            attempts.append({"stage": "download_control_scroll", "action": "page_down"})
             clicked = click_download_like_target(
                 extra_targets=extra_targets,
                 image_path=image_path,
-                timeout_s=min(8.0, download_timeout),
+                timeout_s=max(1.0, _budgeted_timeout(min(5.0, download_timeout), minimum=1.0)),
             )
-            attempts.append({"stage": "download_control_heuristic", "clicked": clicked, "after_menu": False})
+            attempts.append({"stage": "download_control_scroll_retry", "clicked": clicked, "after_menu": False})
             return {"attempts": attempts}
-        except SystemExit as heuristic_exc:
-            attempts.append({"stage": "download_control_heuristic", "error": str(heuristic_exc), "after_menu": False})
+        except SystemExit as scroll_retry_exc:
+            attempts.append({"stage": "download_control_scroll_retry", "error": str(scroll_retry_exc), "after_menu": False})
         menu_opened = False
-        try:
-            menu_click = open_responsive_header_menu(
-                extra_targets=extra_targets,
-                image_path=image_path,
-                timeout_s=min(6.0, download_timeout),
-            )
-            attempts.append({"stage": "responsive_header_menu", "clicked": menu_click})
-            menu_opened = True
-            time.sleep(2.0)
-        except SystemExit as menu_exc:
-            attempts.append({"stage": "responsive_header_menu", "error": str(menu_exc)})
-        try:
-            clicked = click_download_like_target(
-                extra_targets=extra_targets,
-                image_path=image_path,
-                timeout_s=download_timeout,
-            )
-            attempts.append({"stage": "download_control", "clicked": clicked, "after_menu": menu_opened})
-        except SystemExit as final_exc:
-            attempts.append({"stage": "download_control", "error": str(final_exc), "after_menu": menu_opened})
-            _tab_enter(6, final_enter=True)
-            attempts.append({"stage": "download_keyboard_fallback", "action": "tab_enter"})
+        if _try_menu_candidates_then_download("responsive_header_menu"):
+            return {"attempts": attempts}
+        menu_opened = bool(menu_clicked_points)
+        attempts.append({"stage": "download_control", "error": "no remaining menu/download candidates produced download activity", "after_menu": menu_opened})
     return {"attempts": attempts}
 """.strip(),
     "advance_visible_installer_flow": """
@@ -2024,6 +3124,7 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
     import time
 
     attempts = []
+    bm_click = 0x00F5
 
     def _press(vk):
         user32 = ctypes.windll.user32
@@ -2078,6 +3179,10 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
         except Exception as exc:
             attempts.append({"stage": "installer_window_target", "error": f"pygetwindow unavailable: {exc}"})
             return None
+        try:
+            import psutil
+        except Exception:
+            psutil = None
 
         target_window_keywords = _normalize_tokens(extra_targets)
         generic_window_terms = (
@@ -2115,6 +3220,30 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
             "vscode",
             "explorer",
         )
+
+        def _window_process_metadata(hwnd):
+            if not hwnd:
+                return {"pid": 0, "name": "", "exe": "", "create_time": 0.0}
+            user32 = ctypes.windll.user32
+            pid = ctypes.c_ulong()
+            try:
+                user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
+            except Exception:
+                return {"pid": 0, "name": "", "exe": "", "create_time": 0.0}
+            process_id = int(pid.value or 0)
+            if process_id <= 0 or psutil is None:
+                return {"pid": process_id, "name": "", "exe": "", "create_time": 0.0}
+            try:
+                process = psutil.Process(process_id)
+                return {
+                    "pid": process_id,
+                    "name": str(process.name() or "").lower(),
+                    "exe": str(process.exe() or "").lower(),
+                    "create_time": float(process.create_time() or 0.0),
+                }
+            except Exception:
+                return {"pid": process_id, "name": "", "exe": "", "create_time": 0.0}
+
         candidates = []
         active_window = None
         try:
@@ -2128,12 +3257,22 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
             height = int(getattr(window, "height", 0) or 0)
             left = int(getattr(window, "left", 0) or 0)
             top = int(getattr(window, "top", 0) or 0)
+            hwnd = int(getattr(window, "_hWnd", 0) or getattr(window, "hWnd", 0) or 0)
             if width < 220 or height < 120:
                 continue
             if left + width < 0 or top + height < 0:
                 continue
             if any(token in lowered for token in excluded_terms):
                 continue
+            process_meta = _window_process_metadata(hwnd)
+            process_haystack = " ".join(
+                value
+                for value in (
+                    str(process_meta.get("name") or "").lower(),
+                    str(process_meta.get("exe") or "").lower(),
+                )
+                if value
+            )
             score = 0
             generic_title_hit = any(token in lowered for token in generic_window_terms)
             if generic_title_hit:
@@ -2143,6 +3282,13 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
                 if token in lowered:
                     title_keyword_hits += 1
                     score += 90
+            process_keyword_hits = 0
+            for token in target_window_keywords:
+                if token and token in process_haystack:
+                    process_keyword_hits += 1
+                    score += 75
+            if any(token in process_haystack for token in ("setup", "installer", "install")):
+                score += 18
             if not generic_title_hit and title_keyword_hits <= 0:
                 continue
             if active_window is not None and window is active_window:
@@ -2153,9 +3299,21 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
                 score += 8
             if score <= 0:
                 continue
-            candidates.append((score, title_keyword_hits, window))
-        candidates.sort(key=lambda item: (item[1], item[0]), reverse=True)
-        for _, _, window in candidates:
+            candidates.append(
+                (
+                    title_keyword_hits,
+                    process_keyword_hits,
+                    int(active_window is not None and window is active_window),
+                    float(process_meta.get("create_time") or 0.0),
+                    score,
+                    window,
+                    hwnd,
+                    title,
+                    process_meta,
+                )
+            )
+        candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4]), reverse=True)
+        for _, _, _, _, _, window, hwnd, title, process_meta in candidates:
             try:
                 if hasattr(window, "isMinimized") and window.isMinimized:
                     window.restore()
@@ -2168,7 +3326,10 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
                     "right": int(getattr(window, "left", 0) or 0) + int(getattr(window, "width", 0) or 0),
                     "bottom": int(getattr(window, "top", 0) or 0) + int(getattr(window, "height", 0) or 0),
                     "title": str(getattr(window, "title", "") or ""),
-                    "hwnd": int(getattr(window, "_hWnd", 0) or getattr(window, "hWnd", 0) or 0),
+                    "hwnd": hwnd,
+                    "pid": int(process_meta.get("pid") or 0),
+                    "process_name": str(process_meta.get("name") or ""),
+                    "process_exe": str(process_meta.get("exe") or ""),
                 }
             except Exception as exc:
                 attempts.append({"stage": "installer_window_activate", "error": str(exc), "title": title})
@@ -2191,6 +3352,7 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
         "계속",
         "finish",
         "완료",
+        "마침",
         "close",
         "닫기",
         "launch",
@@ -2337,6 +3499,39 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
         )
         return any(marker in combined for marker in positive_markers) and not any(marker in combined for marker in negative_markers)
 
+    def _install_action_prompt_visible(region):
+        combined = _read_ocr_text(region)
+        if not combined:
+            combined = _read_ocr_text(None)
+        if not combined:
+            return False
+        positive_markers = (
+            "install button",
+            "press install",
+            "click install",
+            "ready to install",
+            "install location",
+            "destination folder",
+            "select destination location",
+            "browse",
+            "find another folder",
+            "설치 버튼",
+            "설치 위치 선택",
+            "설치 폴더",
+            "설치를 시작",
+            "설치하려면",
+            "버튼을 눌러",
+            "찾아보기",
+        )
+        negative_markers = (
+            "cancel setup",
+            "cancel installation",
+            "취소하시겠습니까",
+            "설치 취소",
+            "종료하시겠습니까",
+        )
+        return any(marker in combined for marker in positive_markers) and not any(marker in combined for marker in negative_markers)
+
     def _license_accept_prompt_visible(region):
         combined = _read_ocr_text(region)
         if not combined:
@@ -2434,6 +3629,178 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
             return False
         return bool(matched)
 
+    def _normalize_ui_text(value):
+        return " ".join(str(value or "").strip().lower().split())
+
+    def _compact_ui_text(value):
+        return re.sub(r"[^0-9a-zA-Z가-힣]+", "", _normalize_ui_text(value))
+
+    def _enumerate_child_controls(region):
+        if region is None:
+            return []
+        hwnd = int(region.get("hwnd", 0) or 0)
+        if not hwnd:
+            return []
+        user32 = ctypes.windll.user32
+        controls = []
+        enum_proc_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _enum_child(child_hwnd, _lparam):
+            class_buffer = ctypes.create_unicode_buffer(128)
+            text_buffer = ctypes.create_unicode_buffer(512)
+            rect = ctypes.wintypes.RECT()
+            try:
+                user32.GetClassNameW(child_hwnd, class_buffer, len(class_buffer))
+                user32.GetWindowTextW(child_hwnd, text_buffer, len(text_buffer))
+                user32.GetWindowRect(child_hwnd, ctypes.byref(rect))
+            except Exception:
+                return True
+            controls.append(
+                {
+                    "hwnd": int(child_hwnd),
+                    "class_name": str(class_buffer.value or ""),
+                    "text": str(text_buffer.value or ""),
+                    "left": int(rect.left),
+                    "top": int(rect.top),
+                    "right": int(rect.right),
+                    "bottom": int(rect.bottom),
+                    "width": max(0, int(rect.right) - int(rect.left)),
+                    "height": max(0, int(rect.bottom) - int(rect.top)),
+                    "enabled": bool(user32.IsWindowEnabled(child_hwnd)),
+                    "visible": bool(user32.IsWindowVisible(child_hwnd)),
+                }
+            )
+            return True
+
+        callback = enum_proc_type(_enum_child)
+        try:
+            user32.EnumChildWindows(hwnd, callback, 0)
+        except Exception:
+            return []
+        return controls
+
+    def _click_primary_action_child_button(region):
+        if region is None:
+            return None
+        region_left = int(region.get("left", 0) or 0)
+        region_top = int(region.get("top", 0) or 0)
+        region_right = int(region.get("right", region_left) or region_left)
+        region_bottom = int(region.get("bottom", region_top) or region_top)
+        region_width = max(1, region_right - region_left)
+        region_height = max(1, region_bottom - region_top)
+        positive_terms = (
+            "ok",
+            "확인",
+            "next",
+            "다음",
+            "install",
+            "설치",
+            "agree",
+            "동의",
+            "accept",
+            "yes",
+            "예",
+            "continue",
+            "계속",
+            "finish",
+            "완료",
+            "마침",
+            "launch",
+            "실행",
+            "start",
+            "시작",
+        )
+        avoid_terms_local = (
+            "cancel",
+            "취소",
+            "back",
+            "이전",
+            "no",
+            "아니오",
+            "browse",
+            "찾아보기",
+            "folder",
+            "설치 위치",
+            "설치 폴더",
+            "close",
+            "닫기",
+        )
+        candidates = []
+        for control in _enumerate_child_controls(region):
+            if str(control.get("class_name") or "").lower() != "button":
+                continue
+            if not control.get("enabled") or not control.get("visible"):
+                continue
+            text = str(control.get("text") or "").strip()
+            if not text:
+                continue
+            normalized = _normalize_ui_text(text)
+            compact = _compact_ui_text(text)
+            if any(term in normalized or _compact_ui_text(term) in compact for term in avoid_terms_local):
+                continue
+            positive_hits = sum(
+                1
+                for term in positive_terms
+                if term in normalized or _compact_ui_text(term) in compact
+            )
+            if positive_hits <= 0:
+                continue
+            width = int(control.get("width") or 0)
+            height = int(control.get("height") or 0)
+            top = int(control.get("top") or 0)
+            relative_top = top - region_top
+            score = positive_hits * 120
+            if len(normalized) <= 8:
+                score += 60
+            elif len(normalized) <= 14:
+                score += 25
+            if width >= 70 and width <= 220 and height >= 22 and height <= 60:
+                score += 45
+            if relative_top >= int(region_height * 0.72):
+                score += 80
+            elif relative_top >= int(region_height * 0.60):
+                score += 40
+            else:
+                score -= 35
+            if width > int(region_width * 0.35):
+                score -= 120
+            candidates.append((score, control))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        best_score, best = candidates[0]
+        if best_score <= 0:
+            return None
+        user32 = ctypes.windll.user32
+        center_x = int(best["left"]) + int(max(1, int(best["width"])) / 2)
+        center_y = int(best["top"]) + int(max(1, int(best["height"])) / 2)
+        try:
+            user32.SetForegroundWindow(int(region.get("hwnd") or 0))
+        except Exception:
+            pass
+        try:
+            user32.SetCursorPos(center_x, center_y)
+            time.sleep(0.08)
+        except Exception:
+            pass
+        try:
+            user32.SendMessageW(int(best["hwnd"]), bm_click, 0, 0)
+        except Exception:
+            try:
+                user32.mouse_event(0x0002, 0, 0, 0, 0)
+                time.sleep(0.05)
+                user32.mouse_event(0x0004, 0, 0, 0, 0)
+            except Exception:
+                return None
+        return {
+            "text": text,
+            "hwnd": int(best["hwnd"]),
+            "x": center_x,
+            "y": center_y,
+            "score": int(best_score),
+            "source": "child_button",
+        }
+
     stage_timeout = max(5.0, min(float(timeout_s), 8.0))
     progress_made = False
     for attempt_index in range(5):
@@ -2501,6 +3868,70 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
             except Exception as exc:
                 attempts.append({"stage": "installer_license_accept_keys", "error": str(exc), "attempt": attempt_index})
         try:
+            child_button = _click_primary_action_child_button(installer_region)
+        except Exception as exc:
+            child_button = None
+            attempts.append({"stage": "installer_child_button_click", "error": str(exc), "attempt": attempt_index})
+        if child_button is not None:
+            attempts.append({"stage": "installer_child_button_click", "clicked": child_button, "attempt": attempt_index})
+            progress_made = True
+            time.sleep(1.2)
+            continue
+        guided_install_prompt = _install_action_prompt_visible(installer_region)
+        if guided_install_prompt:
+            guided_install_used = False
+            for key_sequence in (
+                ("alt+i",),
+                ("alt+n",),
+                ("enter",),
+                ("tab", "enter"),
+                ("tab", "tab", "enter"),
+            ):
+                try:
+                    for key_name in key_sequence:
+                        if key_name == "tab":
+                            _press(0x09)
+                        elif key_name == "enter":
+                            _press(0x0D)
+                        elif key_name == "alt+i":
+                            _press_alt(0x49)
+                        elif key_name == "alt+n":
+                            _press_alt(0x4E)
+                        time.sleep(0.25)
+                    attempts.append({"stage": "installer_keyboard_primary_guided_install", "keys": list(key_sequence), "attempt": attempt_index})
+                    guided_install_used = True
+                    progress_made = True
+                    time.sleep(1.4)
+                    break
+                except Exception as exc:
+                    attempts.append({"stage": "installer_keyboard_primary_guided_install", "keys": list(key_sequence), "error": str(exc), "attempt": attempt_index})
+                    continue
+            if attempt_index >= 1:
+                try:
+                    clicked = click_text_targets(
+                        ["install", "설치", "next", "다음", "continue", "계속", "finish", "완료", "마침", "start", "시작"],
+                        avoid_targets=avoid_terms,
+                        primary_targets=["install", "설치", "next", "다음", "continue", "계속", "finish", "완료", "마침", "start", "시작"],
+                        min_primary_hits=1,
+                        click_horizontal_bias="matched_token_right",
+                        image_path=None,
+                        crop_region=installer_region,
+                        timeout_s=min(stage_timeout, 3.0),
+                        poll_interval_s=0.8,
+                        prefer_bottom=True,
+                        double_click=False,
+                        allow_heuristic_fallback=True,
+                        heuristic_mode="installer",
+                    )
+                    attempts.append({"stage": "installer_guided_action_click", "clicked": clicked, "attempt": attempt_index})
+                    progress_made = True
+                    time.sleep(1.4)
+                    continue
+                except SystemExit as exc:
+                    attempts.append({"stage": "installer_guided_action_click", "error": str(exc), "attempt": attempt_index})
+            if guided_install_used:
+                continue
+        try:
             clicked = click_text_targets(
                 target_terms,
                 avoid_targets=avoid_terms,
@@ -2520,6 +3951,7 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
                     "계속",
                     "finish",
                     "완료",
+                    "마침",
                     "launch",
                     "실행",
                     "start",
@@ -2596,6 +4028,7 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
                     "계속",
                     "finish",
                     "완료",
+                    "마침",
                     "launch",
                     "실행",
                     "start",
@@ -2640,6 +4073,7 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
                     "계속",
                     "finish",
                     "완료",
+                    "마침",
                     "launch",
                     "실행",
                     "start",
@@ -2759,7 +4193,10 @@ def _should_auto_open_prompt_url(request: StepRequest | None, code: str) -> bool
         return False
     if _has_visible_gui_continuation_cues(request):
         return False
-    prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url(request.user_prompt)
+    prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url_for_request(
+        request,
+        extra_targets=_visible_flow_extra_targets(request, limit=2),
+    )
     if not prompt_url:
         return False
     normalized = _normalize_python_code(code).lower()
@@ -2780,6 +4217,8 @@ def _should_auto_open_prompt_url(request: StepRequest | None, code: str) -> bool
 
 
 def _should_auto_click_download_control(request: StepRequest | None, code: str) -> bool:
+    if not _FRAMEWORK_OCR_UI_HELPERS_ENABLED:
+        return False
     if request is None:
         return False
     if str(request.execution_style or "python_first").lower() != "gui_first":
@@ -2809,6 +4248,8 @@ def _should_auto_click_download_control(request: StepRequest | None, code: str) 
 
 
 def _should_replace_with_gui_first_browser_click(request: StepRequest | None, code: str) -> bool:
+    if not _FRAMEWORK_OCR_UI_HELPERS_ENABLED:
+        return False
     if request is None:
         return False
     if str(request.execution_style or "python_first").lower() != "gui_first":
@@ -2817,7 +4258,10 @@ def _should_replace_with_gui_first_browser_click(request: StepRequest | None, co
         return False
     if _looks_like_existing_installer_launch_task(request.user_prompt):
         return False
-    prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url(request.user_prompt)
+    prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url_for_request(
+        request,
+        extra_targets=_visible_flow_extra_targets(request, limit=2),
+    )
     if not prompt_url:
         return False
     normalized = _normalize_python_code(code).lower()
@@ -2853,6 +4297,117 @@ def _should_replace_with_gui_first_browser_click(request: StepRequest | None, co
         "re.findall(",
     )
     return any(token in normalized for token in bypass_tokens)
+
+
+def _looks_like_blind_screen_percentage_click(code: str) -> bool:
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    if "pyautogui." not in normalized:
+        return False
+    if "pyautogui.size()" not in normalized and "screen_w" not in normalized and "screen_h" not in normalized:
+        return False
+    if not re.search(
+        r"int\(\s*(?:screen_[a-z_]+|pyautogui\.size\(\)\s*\[\s*[01]\s*\])\s*\*\s*0\.\d+",
+        normalized,
+    ):
+        return False
+    click_like_tokens = (
+        "pyautogui.click(",
+        "pyautogui.doubleclick(",
+        "pyautogui.moveto(",
+        "pyautogui.dragto(",
+    )
+    return any(token in normalized for token in click_like_tokens)
+
+
+def _looks_like_risky_pygetwindow_usage(code: str) -> bool:
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    shadowed_active_window = (
+        "import pygetwindow as gw" in normalized
+        and "gw = gw.getactivewindow(" in normalized
+    )
+    return shadowed_active_window or "get_all_windows(" in normalized
+
+
+def _looks_like_single_coordinate_click_retry(code: str) -> bool:
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    click_patterns = re.findall(r"pyautogui\.(?:click|doubleclick)\([^)\n]+\)", normalized)
+    if len(click_patterns) != 1:
+        return False
+    if any(
+        token in normalized
+        for token in (
+            "advance_visible_download_flow(",
+            "click_download_like_target(",
+            "click_search_result_like_target(",
+            "click_text_targets(",
+            "wait_for_stable_download(",
+            "locateonscreen(",
+        )
+    ):
+        return False
+    return True
+
+
+def _looks_like_browser_save_shortcut_download_flow(code: str) -> bool:
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    browser_shortcut_tokens = (
+        "pyautogui.hotkey('ctrl', 't')",
+        'pyautogui.hotkey("ctrl", "t")',
+        "pyautogui.hotkey('ctrl', 'l')",
+        'pyautogui.hotkey("ctrl", "l")',
+        "pyautogui.write('https://",
+        'pyautogui.write("https://',
+        "pyautogui.write('http://",
+        'pyautogui.write("http://',
+    )
+    if not any(token in normalized for token in browser_shortcut_tokens):
+        return False
+    followup_tokens = (
+        "pyautogui.hotkey('ctrl', 's')",
+        'pyautogui.hotkey("ctrl", "s")',
+        "pyautogui.click(",
+        "pyautogui.doubleclick(",
+    )
+    return any(token in normalized for token in followup_tokens)
+
+
+def _should_replace_with_visible_download_recovery(request: StepRequest | None, code: str) -> bool:
+    if request is None:
+        return False
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    if not _looks_like_download_or_install_task(request.user_prompt):
+        return False
+    if _looks_like_existing_installer_launch_task(request.user_prompt):
+        return False
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    if any(
+        token in normalized
+        for token in (
+            "advance_visible_download_flow(",
+            "click_download_like_target(",
+            "click_search_result_like_target(",
+            "click_text_targets(",
+        )
+    ):
+        return False
+    if _looks_like_browser_save_shortcut_download_flow(normalized):
+        return True
+    if not _has_visible_gui_continuation_cues(request):
+        return False
+    if _looks_like_blind_screen_percentage_click(normalized) or _looks_like_risky_pygetwindow_usage(normalized):
+        return True
+    return bool(request.replan_requested) and _looks_like_single_coordinate_click_retry(normalized)
 
 
 def _extract_prompt_download_glob(user_prompt: str) -> str | None:
@@ -3055,11 +4610,16 @@ def _synthesized_visible_download_completion_code(
         launch_marker_path=_extract_prompt_launch_marker_path(request.user_prompt),
     )
     context_prompt_key, context_prompt_excerpt = _context_prompt_key_for_request(request)
-    prompt_open_fallback_url = _fallback_browser_search_url(request.user_prompt) if prompt_url else None
+    prompt_open_fallback_url = (
+        _fallback_browser_search_url_for_request(request, prompt_url=prompt_url, extra_targets=extra_targets)
+        if prompt_url
+        else None
+    )
     if not prompt_url:
-        fallback_search_url = _fallback_browser_search_url(request.user_prompt)
+        fallback_search_url = _fallback_browser_search_url_for_request(request, extra_targets=extra_targets)
     lines: list[str] = []
     lines.append("import fnmatch")
+    lines.append("import time")
     lines.append("from pathlib import Path")
     lines.append(f"search_first = {repr(bool(initial_search_first))}")
     lines.append(f"CONTEXT_PATH = {context_path_expr}")
@@ -3095,6 +4655,7 @@ def _synthesized_visible_download_completion_code(
     lines.extend(
         [
             "try:",
+            "    download_started_at = time.time()",
             "    flow = advance_visible_download_flow("
             f"extra_targets={json.dumps(extra_targets, ensure_ascii=False)}, "
             "search_first=search_first, "
@@ -3180,6 +4741,29 @@ def _synthesized_visible_download_completion_code(
                 "        )",
             ]
         )
+    else:
+        short_wait_timeout = max(12.0, min(float(wait_timeout_s) * 0.35, 20.0))
+        lines.extend(
+            [
+                "    installer = wait_for_recent_download_artifact(",
+                f"        extra_targets={json.dumps(extra_targets, ensure_ascii=False)},",
+                "        min_bytes=1_000_000,",
+                f"        timeout_s={float(short_wait_timeout):.1f},",
+                "        since_ts=download_started_at,",
+                "    )",
+                '    print(f"download ready: {installer}")',
+                "    write_action_context(",
+                "        CONTEXT_PATH,",
+                "        prompt_key=CONTEXT_PROMPT_KEY,",
+                "        prompt_excerpt=CONTEXT_PROMPT_EXCERPT,",
+                '        phase=\"downloaded\",',
+                "        installer_path=str(installer),",
+                "        target_keywords="
+                f"{json.dumps(extra_targets, ensure_ascii=False)},",
+                "        source_url=(prompt_url or fallback_search_url),",
+                "    )",
+            ]
+        )
     if exit_on_success:
         lines.extend(
             [
@@ -3198,12 +4782,35 @@ def _synthesized_visible_download_completion_code(
     return "\n".join(lines)
 
 
+def _synthesized_framework_visible_download_recovery_code(request: StepRequest) -> str:
+    prompt_url = None
+    if not _has_visible_gui_continuation_cues(request):
+        prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url_for_request(
+            request,
+            extra_targets=_visible_flow_extra_targets(request, limit=2),
+        )
+    return _synthesized_visible_download_completion_code(
+        request,
+        prompt_url=prompt_url,
+        timeout_s=24.0,
+        wait_timeout_s=55.0,
+        exit_on_success=True,
+        continue_on_failure=False,
+    )
+
+
 def _prepare_python_code_for_execution(request: StepRequest | None, code: str) -> str:
     normalized = _normalize_python_code(code)
     if not normalized:
         return normalized
+    if _should_replace_with_visible_download_recovery(request, normalized):
+        normalized = _synthesized_framework_visible_download_recovery_code(request)
+        return _expand_runtime_helpers(normalized)
     if _should_replace_with_gui_first_browser_click(request, normalized):
-        prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url(request.user_prompt)
+        prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url_for_request(
+            request,
+            extra_targets=_visible_flow_extra_targets(request, limit=2),
+        )
         if prompt_url:
             normalized = _synthesized_visible_download_completion_code(
                 request,
@@ -3215,10 +4822,13 @@ def _prepare_python_code_for_execution(request: StepRequest | None, code: str) -
             )
             return _expand_runtime_helpers(normalized)
     if _should_auto_open_prompt_url(request, normalized):
-        prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url(request.user_prompt)
+        keyword_tokens = _visible_flow_extra_targets(request, limit=2)
+        prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url_for_request(
+            request,
+            extra_targets=keyword_tokens,
+        )
         if not prompt_url:
             return _expand_runtime_helpers(normalized)
-        keyword_tokens = _visible_flow_extra_targets(request, limit=2)
         prelude = f'open_url_and_wait({json.dumps(prompt_url, ensure_ascii=False)}, expected_title_tokens={json.dumps(keyword_tokens, ensure_ascii=False)})'
         normalized = f"{prelude}\n\n{normalized}"
     if _should_auto_click_download_control(request, normalized):
@@ -3251,7 +4861,10 @@ def _synthesized_visible_ui_click_recovery_code(request: StepRequest | None, *, 
                 prompt_url = candidate
                 break
     if not prompt_url:
-        prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url(request.user_prompt)
+        prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url_for_request(
+            request,
+            extra_targets=_visible_flow_extra_targets(request, limit=2),
+        )
     return _synthesized_visible_download_completion_code(
         request,
         prompt_url=prompt_url,
@@ -3816,6 +5429,39 @@ def _context_installed_executable() -> Path | None:
         return None
     return candidate
 
+def _installer_process_running() -> bool:
+    installer_name = installer.name.lower()
+    installer_stem = installer.stem.lower()
+    try:
+        import psutil
+    except Exception:
+        psutil = None
+    if psutil is not None:
+        try:
+            for process in psutil.process_iter(["name", "exe"]):
+                info = process.info or {{}}
+                name = str(info.get("name") or "").lower()
+                exe = str(info.get("exe") or "").lower()
+                if not name and not exe:
+                    continue
+                if installer_name == name or installer_name in exe:
+                    return True
+                if installer_stem and (installer_stem in name or installer_stem in exe):
+                    return True
+                if FILENAME_TARGET_KEYWORDS and any(keyword in " ".join((name, exe)) for keyword in FILENAME_TARGET_KEYWORDS):
+                    if any(token in " ".join((name, exe)) for token in ("setup", "installer", "install")):
+                        return True
+        except Exception:
+            pass
+    listing = _process_listing()
+    if not listing:
+        return False
+    if installer_name and installer_name in listing:
+        return True
+    if installer_stem and installer_stem in listing:
+        return True
+    return False
+
 def _launch_installer(reason: str) -> None:
     try:
         if installer.suffix.lower() == ".msi":
@@ -3876,8 +5522,20 @@ if context_existing is not None:
     print(f"already installed from context: {{context_existing}}")
     sys.exit(0)
 
-launched_installer = False
-if not VISIBLE_INSTALLER:
+launched_installer = _installer_process_running()
+if launched_installer:
+    print(f"reusing running installer: {{installer}}")
+    write_action_context(
+        CONTEXT_PATH,
+        prompt_key=CONTEXT_PROMPT_KEY,
+        prompt_excerpt=CONTEXT_PROMPT_EXCERPT,
+        phase="installer_started",
+        installer_path=str(installer),
+        archive_path=(str(archive_installer) if archive_installer is not None else None),
+        expected_installer_glob=str(EXPECTED_INSTALLER_GLOB or ""),
+        target_keywords=EXTRA_TARGETS,
+    )
+elif not VISIBLE_INSTALLER:
     _launch_installer("no visible installer UI")
     launched_installer = True
 
@@ -4486,6 +6144,11 @@ def write_launch_marker(exe_path: Path) -> None:
     with open(LAUNCH_MARKER_PATH, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
 
+def write_install_marker(exe_path: Path) -> None:
+    payload = {{"installed_exe": str(exe_path)}}
+    with open(INSTALL_MARKER_PATH, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
 _clear_invalid_marker(INSTALL_MARKER_PATH, field="installed_exe")
 _clear_invalid_marker(LAUNCH_MARKER_PATH, field="launched_exe")
 _prune_context_launch_state()
@@ -4500,6 +6163,7 @@ deadline = time.time() + max({float(timeout_s):.1f}, 12.0)
 while time.time() < deadline:
     if _process_running(exe_path):
         _focus_window()
+        write_install_marker(exe_path)
         write_launch_marker(exe_path)
         write_action_context(
             CONTEXT_PATH,
@@ -4628,6 +6292,8 @@ def _has_installer_launch_action(code: str) -> bool:
     )
     for line in normalized.splitlines():
         stripped = line.strip()
+        if ("http://" in stripped or "https://" in stripped) and "msiexec" not in stripped:
+            continue
         if any(token in stripped for token in launch_tokens) and any(token in stripped for token in installer_tokens):
             return True
     return False
@@ -4810,8 +6476,12 @@ def _history_for_invalid_python_retry_with_prompt(
     duplicate_generation: bool = False,
     prompt_url_violation: bool = False,
     gui_first_visible_ui_violation: bool = False,
+    guessed_artifact_url_generation: bool = False,
+    gui_first_download_chunk_network_bypass: bool = False,
+    gui_first_download_chunk_install_mix: bool = False,
     gui_first_silent_install_shortcut: bool = False,
     store_detour_generation: bool = False,
+    deprecated_ocr_helper_generation: bool = False,
 ) -> list[str]:
     retry_history = _history_for_invalid_python_retry(
         history,
@@ -4839,6 +6509,40 @@ def _history_for_invalid_python_retry_with_prompt(
         retry_history.append(
             "system_hint=when gui_first is active and the screenshot/observation already grounds a browser page, download control, or installer window, do not use urllib/requests/html scraping, regex link extraction, or webbrowser.open in place of that visible UI progression"
         )
+    if guessed_artifact_url_generation:
+        retry_history.append(
+            "system_hint=the previous generation guessed a direct installer artifact URL from an official page prompt without first using the current page UI or discovering that artifact from official page HTML; do not guess another same-host .exe/.msi path"
+        )
+        retry_history.append(
+            "system_hint=if the official page is already open or visible, stay on that page first and use screenshot-grounded page-content clicks before any new direct artifact fetch"
+        )
+        retry_history.append(
+            "system_hint=if you must fetch in Python, first fetch the exact official page URL from the prompt and discover the installer link from that page; a raw guessed artifact URL is invalid"
+        )
+    if gui_first_download_chunk_network_bypass:
+        retry_history.append(
+            "system_hint=this retry is for a gui_first download chunk; the previous generation used urllib/requests/HTML parsing instead of visible UI progression, so return screenshot-grounded Python GUI automation first"
+        )
+        retry_history.append(
+            "system_hint=do not use urllib, requests, httpx, BeautifulSoup, href parsing, or regex HTML link extraction in this retry unless you also drive the visible browser UI and that UI path clearly fails"
+        )
+        retry_history.append(
+            "system_hint=if no browser is open yet, open the official page in a real browser and click/navigate visible page-content controls with Python; do not download by reading the page with urllib"
+        )
+    if gui_first_download_chunk_install_mix:
+        retry_history.append(
+            "system_hint=this retry is for a download-only gui_first chunk; do not launch, silently install, or run the downloaded installer in this step"
+        )
+        retry_history.append(
+            "system_hint=end this step only when the installer file exists on disk with a plausible size; installation belongs to a later chunk"
+        )
+    if deprecated_ocr_helper_generation:
+        retry_history.append(
+            "system_hint=the previous generation used deprecated executor-side OCR/text-click helpers; do not call ocr_screen_text_regions(), click_text_targets(), click_download_like_target(), click_search_result_like_target(), open_responsive_header_menu(), advance_visible_download_flow(), or advance_visible_installer_flow()"
+        )
+        retry_history.append(
+            "system_hint=use the screenshot already provided to the model to choose visible coordinates, then drive the UI with pyautogui, ctypes mouse events, keyboard shortcuts, or window/process inspection"
+        )
     if gui_first_silent_install_shortcut:
         retry_history.append(
             "system_hint=the previous generation used a silent installer shortcut for a gui_first install chunk; on this retry do not start with /SILENT, /VERYSILENT, /SP-, or /NORESTART"
@@ -4857,9 +6561,14 @@ def _history_for_invalid_python_retry_with_prompt(
         retry_history.append(
             "system_hint=this is an install-and-launch chunk with an existing installer file; do not emit any download helper, URL fetch, HTML parsing, or release discovery logic"
         )
-        retry_history.append(
-            "system_hint=return one straight-line top-level script that finds the installer in Downloads, tries silent install switches, locates the installed app exe, launches it, and verifies the process"
-        )
+        if gui_first_silent_install_shortcut:
+            retry_history.append(
+                "system_hint=return one straight-line top-level script that finds the installer in Downloads, launches it normally or advances the visible installer UI, locates the installed app exe, launches it, and verifies the process"
+            )
+        else:
+            retry_history.append(
+                "system_hint=return one straight-line top-level script that finds the installer in Downloads, tries silent install switches, locates the installed app exe, launches it, and verifies the process"
+            )
         retry_history.append(
             "system_hint=if no installed app exe already exists, the script must either launch the installer or actively drive an already-visible installer window; a search-only script is invalid"
         )
@@ -4872,9 +6581,10 @@ def _history_for_invalid_python_retry_with_prompt(
         retry_history.append(
             "system_hint=if you need to advance the wizard repeatedly, prefer a loop such as for _ in range(8): pyautogui.press('enter'); time.sleep(1)"
         )
-        retry_history.append(
-            "system_hint=prefer common Windows silent installer switches such as /VERYSILENT, /SILENT, /SP-, and /NORESTART before any GUI automation"
-        )
+        if not gui_first_silent_install_shortcut:
+            retry_history.append(
+                "system_hint=prefer common Windows silent installer switches such as /VERYSILENT, /SILENT, /SP-, and /NORESTART before any GUI automation"
+            )
     return retry_history
 
 
@@ -4995,7 +6705,22 @@ def _history_for_web_search(history: list[str], *, limit: int = 4) -> list[str]:
 
 def _retry_token_budget(max_new_tokens: int) -> int:
     base = int(max_new_tokens)
-    return max(base, min(512, base + 128))
+    return max(192, min(base, 640))
+
+
+def _step_token_budget(request: StepRequest, max_new_tokens: int) -> int:
+    base = int(max_new_tokens)
+    if base <= 0:
+        return 192
+    if request.request_kind != "task_step":
+        return base
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return base
+    if not _looks_like_download_or_install_task(request.user_prompt):
+        return base
+    if request.replan_requested or bool(request.replan_reasons):
+        return max(192, min(base, 512))
+    return max(192, min(base, 640))
 
 
 def _state_visual_hash(state: dict[str, Any]) -> str | None:
@@ -5258,9 +6983,49 @@ def _looks_like_truncated_gui_repetition_failure(last_execution: dict[str, Any])
     return "nameerror" in stderr_tail and "name 'py' is not defined" in stderr_tail
 
 
-def _last_execution_opened_browser_for_gui_flow(last_execution: dict[str, Any]) -> bool:
+def _last_execution_python_code(last_execution: dict[str, Any]) -> str:
     payload_metadata = dict(last_execution.get("payload_metadata") or {})
-    executed_python_code = str(payload_metadata.get("executed_python_code") or "").lower()
+    candidates = (
+        payload_metadata.get("executed_python_code"),
+        last_execution.get("executed_python_code"),
+        last_execution.get("python_code"),
+    )
+    for candidate in candidates:
+        normalized = _normalize_python_code(str(candidate or ""))
+        if normalized:
+            return normalized
+    return ""
+
+
+def _extract_click_points_from_python(code: str) -> list[tuple[int, int]]:
+    normalized = _normalize_python_code(code)
+    if not normalized:
+        return []
+    patterns = (
+        r"(?:pyautogui\.)?(?:doubleclick|doubleClick|click)\(\s*(?:x\s*=\s*)?(-?\d+(?:\.\d+)?)\s*,\s*(?:y\s*=\s*)?(-?\d+(?:\.\d+)?)",
+        r"(?:pyautogui\.)?(?:doubleclick|doubleClick|click)\(\s*(?:button\s*=\s*['\"][^'\"]+['\"]\s*,\s*)?(?:x\s*=\s*)?(-?\d+(?:\.\d+)?)\s*,\s*(?:y\s*=\s*)?(-?\d+(?:\.\d+)?)",
+        r"(?:pyautogui\.)?(?:doubleclick|doubleClick|click)\(\s*x\s*=\s*(-?\d+(?:\.\d+)?)\s*,\s*y\s*=\s*(-?\d+(?:\.\d+)?)",
+    )
+    results: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, normalized):
+            try:
+                point = (int(round(float(match.group(1)))), int(round(float(match.group(2)))))
+            except (TypeError, ValueError):
+                continue
+            if point not in seen:
+                seen.add(point)
+                results.append(point)
+    return results
+
+
+def _last_execution_click_points(last_execution: dict[str, Any]) -> list[tuple[int, int]]:
+    return _extract_click_points_from_python(_last_execution_python_code(last_execution))
+
+
+def _last_execution_opened_browser_for_gui_flow(last_execution: dict[str, Any]) -> bool:
+    executed_python_code = _last_execution_python_code(last_execution).lower()
     if not executed_python_code:
         return False
     browser_open_tokens = (
@@ -5284,12 +7049,32 @@ def _rewrite_user_prompt_for_replan(
     if not prompt or not unique_reasons:
         return prompt
 
+    prior_click_points = _last_execution_click_points(last_execution)
+    same_page_retry = any(
+        reason in {
+            "no_visual_change",
+            "partial_progress_opened_page_only",
+            "repeated_code_execution",
+            "same_page_click_retry_required",
+        }
+        for reason in unique_reasons
+    )
     download_replan = (
         _looks_like_download_or_install_task(prompt)
         and not _looks_like_existing_installer_launch_task(prompt)
         and _last_execution_opened_browser_for_gui_flow(last_execution)
         and any(
-            reason in {"execution_error", "download_url_404", "installer_url_not_found"}
+            reason in {
+                "execution_error",
+                "download_url_404",
+                "download_url_403",
+                "installer_url_not_found",
+                "guessed_artifact_url_404",
+                "no_visual_change",
+                "partial_progress_opened_page_only",
+                "repeated_code_execution",
+                "same_page_click_retry_required",
+            }
             for reason in unique_reasons
         )
     )
@@ -5300,10 +7085,40 @@ def _rewrite_user_prompt_for_replan(
             "The previous attempt already opened the relevant browser page. Treat the current screenshot as the primary source of truth for the next action.",
             "Continue from the visible browser/download UI with Python GUI automation before trying any new network fetch or HTML parsing logic.",
             "Do not use urllib, requests, regex-based HTML scraping, or fresh direct-download discovery in this step unless the current screenshot clearly shows that the browser path is impossible.",
-            "Prefer OCR-grounded helpers such as click_download_like_target() or click_text_targets([...]) if a download-like or installer-like control is visible on screen.",
-            "Use Python GUI actions to focus the browser, activate the visible official page, click the visible download control, and then wait for the download artifact to stabilize in Downloads.",
+            "Do not use executor-side OCR/text-click helpers such as ocr_screen_text_regions(), click_text_targets(), click_download_like_target(), or open_responsive_header_menu().",
+            "Use the screenshot to estimate the visible download/install control coordinates, then use Python GUI actions to focus the browser, click or keyboard-navigate that control, and wait for the download artifact to stabilize in Downloads.",
             "If the browser is already on an official vendor page or search result page, keep following that visible path instead of restarting from scratch.",
         ]
+        if _looks_like_download_artifact_only_chunk(prompt):
+            override_lines.append(
+                "This is a download-only step. Do not launch, silently install, or run the installer in this step."
+            )
+            override_lines.append(
+                "End this step only when the installer file exists in Downloads with a plausible non-trivial size."
+            )
+        if same_page_retry:
+            override_lines.append(
+                "Stay on the currently visible browser tab/page first. Do not open a new site, new search, or guessed direct URL unless the current page is clearly irrelevant, blocked, or broken."
+            )
+            override_lines.append(
+                "If the previous click did not cause visible progress, do not reuse the same coordinates first."
+            )
+            override_lines.append(
+                "Choose a different visible download/install candidate in the page content area. If the first alternate candidate still does not visibly progress, try the next distinct candidate in the same script before giving up."
+            )
+            override_lines.append(
+                "Do not treat the browser toolbar, address bar, tab strip, bookmarks bar, or blank page margins as download candidates."
+            )
+        if "download_url_404" in unique_reasons or "guessed_artifact_url_404" in unique_reasons:
+            override_lines.append(
+                "The previous direct installer URL was wrong. Do not guess another same-host `.exe` or `.msi` path from the vendor domain."
+            )
+            override_lines.append(
+                "Either keep using the visible current page with GUI automation, or if the browser path is clearly impossible, fetch the exact official page URL first and discover the installer link from that page HTML."
+            )
+        if prior_click_points:
+            formatted_points = ", ".join(f"({x}, {y})" for x, y in prior_click_points[:8])
+            override_lines.append(f"Avoid reusing these previous click coordinates first: {formatted_points}.")
         stdout_tail = str(last_execution.get("stdout_tail") or "").strip()
         stderr_tail = str(last_execution.get("stderr_tail") or "").strip()
         if stdout_tail:
@@ -5324,6 +7139,18 @@ def _rewrite_user_prompt_for_replan(
         or "execution_error" in unique_reasons
         or optional_gui_dependency_failure
     )
+    source_task_hint = ""
+    for pattern in (
+        r"from this task:\s*(.+?)(?:[.,]\s|\n|$)",
+        r"source task:\s*(.+?)(?:[.,]\s|\n|$)",
+        r"source_task\"\s*:\s*\"(.+?)\"",
+    ):
+        match = re.search(pattern, prompt, flags=re.IGNORECASE)
+        if not match:
+            continue
+        source_task_hint = re.sub(r"\s+", " ", str(match.group(1) or "")).strip().strip(".,")
+        if source_task_hint:
+            break
     override_lines = [
         "REPLAN OVERRIDE FOR THIS STEP:",
         "Return executable Python only.",
@@ -5331,6 +7158,8 @@ def _rewrite_user_prompt_for_replan(
     if "repeated_code_execution" in unique_reasons:
         override_lines.append("Produce a materially different script from the previous attempt.")
     if install_replan:
+        if source_task_hint:
+            override_lines.append(f"Source task: {source_task_hint}.")
         override_lines.append("Do not repeat the same silent installer launch-and-scan script.")
         override_lines.append("Do not retry `/VERYSILENT` or `/SILENT` first on this step.")
         override_lines.append(
@@ -5471,6 +7300,111 @@ def _looks_like_opened_page_only_step(python_code: str) -> bool:
 def _contains_installer_artifact_suffix(text: str) -> bool:
     lowered = str(text or "").lower()
     return any(suffix in lowered for suffix in (".exe", ".msi", ".zip", ".alz"))
+
+
+def _url_looks_like_installer_artifact(url: str | None) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(str(url or ""))
+    except ValueError:
+        return False
+    path = str(parsed.path or "").lower()
+    return any(path.endswith(suffix) for suffix in (".exe", ".msi", ".zip", ".alz"))
+
+
+def _looks_like_download_artifact_only_chunk(user_prompt: str) -> bool:
+    if not _looks_like_download_or_install_task(user_prompt):
+        return False
+    if _looks_like_existing_installer_launch_task(user_prompt):
+        return False
+    lowered = str(user_prompt or "").lower()
+    install_markers = (
+        "installed app process",
+        "launch the installed app",
+        "launch the installed executable",
+        "finish the installation",
+        "complete the installer wizard",
+        "launch it once",
+        "run it, finish the installation",
+        "설치를 완료",
+        "설치 마법사",
+        "설치 후 실행",
+    )
+    if any(marker in lowered for marker in install_markers):
+        return False
+    success_target_markers = (
+        "current chunk success target",
+        "success target",
+        "present in downloads",
+        "nontrivial file size",
+        "plausible size",
+        "file size",
+        "downloads 폴더",
+        "downloads 안에",
+        "다운로드 폴더",
+    )
+    download_markers = (
+        "download the official",
+        "download the windows installer",
+        "download the installer",
+        "installer only",
+        "only as a `.exe`",
+        "only as a `.msi`",
+        "save the installer into",
+        "save the installer",
+        "download the installer only",
+        "download only",
+        "installer is present",
+        "다운로드",
+        "설치파일",
+        "설치 파일",
+        "저장",
+    )
+    return any(marker in lowered for marker in success_target_markers) or any(marker in lowered for marker in download_markers)
+
+
+def _looks_like_guessed_artifact_url_generation(*, user_prompt: str, python_code: str) -> bool:
+    if not _looks_like_download_or_install_task(user_prompt):
+        return False
+    prompt_urls = _extract_prompt_urls(user_prompt)
+    if not prompt_urls:
+        return False
+    prompt_artifact_urls = {url.lower() for url in prompt_urls if _url_looks_like_installer_artifact(url)}
+    page_prompt_urls = [
+        url
+        for url in prompt_urls
+        if not _url_looks_like_installer_artifact(url)
+        and not _url_looks_like_search_results(url)
+    ]
+    if not page_prompt_urls:
+        return False
+    normalized = _normalize_python_code(python_code)
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    code_urls = _extract_prompt_urls(normalized)
+    artifact_code_urls = [
+        url
+        for url in code_urls
+        if _url_looks_like_installer_artifact(url)
+        and url.lower() not in prompt_artifact_urls
+    ]
+    if not artifact_code_urls:
+        return False
+    discovery_tokens = (
+        ".read().decode(",
+        "html =",
+        "html_text",
+        "beautifulsoup",
+        "href=",
+        "re.findall(",
+        "findall(",
+        "urljoin(",
+        "link in",
+        "links",
+    )
+    if any(page_url.lower() in lowered for page_url in page_prompt_urls) and any(token in lowered for token in discovery_tokens):
+        return False
+    return True
 
 
 def _looks_like_reported_failure(last_execution: dict[str, Any]) -> bool:
@@ -5735,12 +7669,69 @@ def _url_looks_like_search_results(url: str | None) -> bool:
     return "q=" in query and any(token in host for token in ("bing", "google", "duckduckgo", "yahoo", "naver", "daum", "search"))
 
 
-def _fallback_browser_search_url(text: str) -> str | None:
-    keywords = _prompt_keyword_candidates(text, limit=4)
-    if not keywords:
-        return None
+def _fallback_browser_search_url_from_parts(keywords: list[str], urls: list[str]) -> str | None:
+    cleaned_keywords: list[str] = []
+    generic = {
+        "network",
+        "parsing",
+        "logic",
+        "not",
+        "official",
+        "windows",
+        "download",
+        "downloads",
+        "install",
+        "installer",
+        "setup",
+        "current",
+        "visible",
+        "browser",
+        "urllib",
+        "requests",
+        "regex",
+        "direct",
+        "discovery",
+        "path",
+        "page",
+        "step",
+        "python",
+        "chunk",
+    }
+
+    def _append_keyword(value: str) -> None:
+        for keyword in _prompt_keyword_candidates(str(value or ""), limit=4):
+            if keyword in generic or keyword in cleaned_keywords:
+                continue
+            cleaned_keywords.append(keyword)
+            if len(cleaned_keywords) >= 4:
+                return
+
+    for raw_keyword in keywords:
+        _append_keyword(raw_keyword)
+        if len(cleaned_keywords) >= 4:
+            break
+
+    search_keywords: list[str] = []
+    for keyword in cleaned_keywords:
+        alpha_prefix = re.sub(r"\d{2,}$", "", keyword)
+        if (
+            alpha_prefix
+            and alpha_prefix != keyword
+            and len(alpha_prefix) >= 3
+            and alpha_prefix not in generic
+        ):
+            if alpha_prefix not in search_keywords:
+                search_keywords.append(alpha_prefix)
+            continue
+        if keyword not in search_keywords:
+            search_keywords.append(keyword)
+    cleaned_keywords = search_keywords[:4]
+
     search_domains: list[str] = []
-    for url in _extract_prompt_urls(text):
+    search_engine_domains = {"google.com", "bing.com", "duckduckgo.com", "yahoo.com", "naver.com", "daum.net"}
+    for url in urls:
+        if _url_looks_like_search_results(url):
+            continue
         parsed = urllib.parse.urlparse(str(url or "").strip())
         host = str(parsed.netloc or "").strip().lower().split(":", 1)[0]
         if not host:
@@ -5749,9 +7740,13 @@ def _fallback_browser_search_url(text: str) -> str | None:
         if len(parts) < 2:
             continue
         registrable = ".".join(parts[-2:])
+        if registrable in search_engine_domains:
+            continue
         if registrable not in search_domains:
             search_domains.append(registrable)
         lead = parts[-2]
+        if lead and lead not in generic and lead not in cleaned_keywords and len(cleaned_keywords) < 4:
+            cleaned_keywords.append(lead)
         tld = parts[-1]
         if (
             lead
@@ -5766,11 +7761,13 @@ def _fallback_browser_search_url(text: str) -> str | None:
                 search_domains.append(sibling)
         if len(search_domains) >= 2:
             break
-    joined = " ".join(keywords)
+    if not cleaned_keywords:
+        return None
+    joined = " ".join(cleaned_keywords)
     if re.search(r"[\uac00-\ud7a3]", joined):
-        query_terms = [*keywords, "공식", "다운로드", "pc", "windows"]
+        query_terms = [*cleaned_keywords, "공식", "다운로드", "pc", "windows"]
     else:
-        query_terms = [*keywords, "official", "windows", "download"]
+        query_terms = [*cleaned_keywords, "official", "windows", "download"]
     if search_domains:
         if len(search_domains) == 1:
             query_terms.append(f"site:{search_domains[0]}")
@@ -5778,6 +7775,63 @@ def _fallback_browser_search_url(text: str) -> str | None:
             query_terms.append("(" + " OR ".join(f"site:{domain}" for domain in search_domains[:2]) + ")")
     query = urllib.parse.quote(" ".join(query_terms))
     return f"https://www.google.com/search?q={query}"
+
+
+def _fallback_browser_search_url(text: str) -> str | None:
+    return _fallback_browser_search_url_from_parts(
+        _prompt_keyword_candidates(text, limit=4),
+        _extract_prompt_urls(text),
+    )
+
+
+def _expected_title_tokens_from_code(code: str) -> list[str]:
+    tokens: list[str] = []
+    for title_match in re.finditer(r"expected_title_tokens\s*=\s*\[(.*?)\]", str(code or ""), flags=re.S):
+        for token_match in re.findall(r'"([^"]+)"|\'([^\']+)\'', str(title_match.group(1) or "")):
+            token = next((value for value in token_match if value), "")
+            if token and token not in tokens:
+                tokens.append(token)
+    return tokens
+
+
+def _fallback_browser_search_url_for_request(
+    request: StepRequest,
+    *,
+    prompt_url: str | None = None,
+    extra_targets: list[str] | None = None,
+) -> str | None:
+    last_execution_payload = dict(request.last_execution.get("payload_metadata") or {})
+    last_execution_code = str(last_execution_payload.get("executed_python_code") or "")
+    source_keywords: list[str] = []
+    source_urls: list[str] = []
+
+    for keyword in extra_targets or []:
+        cleaned = str(keyword or "").strip()
+        if cleaned and cleaned not in source_keywords:
+            source_keywords.append(cleaned)
+
+    explicit_installer = _extract_prompt_download_glob(request.user_prompt or "")
+    if explicit_installer:
+        source_keywords.extend(_installer_filename_keywords(explicit_installer, limit=4))
+
+    for pattern in (
+        r"from this task:\s*(.+?)(?:\.\s|\n|$)",
+        r"source task:\s*(.+?)(?:\.\s|\n|$)",
+        r"source_task\"\s*:\s*\"(.+?)\"",
+    ):
+        for match in re.finditer(pattern, str(request.user_prompt or ""), flags=re.IGNORECASE):
+            source_keywords.extend(_prompt_keyword_candidates(match.group(1), limit=4))
+
+    source_keywords.extend(_expected_title_tokens_from_code(last_execution_code))
+
+    if prompt_url:
+        source_urls.append(prompt_url)
+    source_urls.extend(_extract_prompt_urls(request.user_prompt or ""))
+    source_urls.extend(_extract_prompt_urls(last_execution_code))
+
+    if not source_keywords and not source_urls and not request.replan_requested:
+        return _fallback_browser_search_url(request.user_prompt)
+    return _fallback_browser_search_url_from_parts(source_keywords, source_urls)
 
 
 def _last_execution_opened_search_results(last_execution: dict[str, Any]) -> bool:
@@ -5862,6 +7916,99 @@ def _generated_code_ignores_prompt_urls(
             if prompt_hosts and code_hosts and code_hosts.issubset(prompt_hosts):
                 return False
     return not any(url.lower() in normalized_code for url in prompt_urls)
+
+
+def _looks_like_gui_first_download_chunk_install_mix(request: StepRequest, code: str) -> bool:
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    if not _looks_like_download_artifact_only_chunk(request.user_prompt):
+        return False
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    if _has_installer_launch_action(code):
+        return True
+    artifact_vars = {
+        match.group(1).lower()
+        for match in re.finditer(
+            r"^\s*([a-zA-Z_]\w*)\s*=.*(?:\.exe|\.msi|installer|setup)",
+            normalized,
+            flags=re.M,
+        )
+    }
+    if not artifact_vars:
+        return False
+    launch_tokens = ("subprocess.run(", "subprocess.popen(", "os.startfile(", "startfile(")
+    for line in normalized.splitlines():
+        stripped = line.strip()
+        if any(token in stripped for token in launch_tokens) and any(var in stripped for var in artifact_vars):
+            return True
+    return False
+
+
+def _looks_like_gui_first_download_chunk_network_bypass(request: StepRequest, code: str) -> bool:
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    if not _looks_like_download_artifact_only_chunk(request.user_prompt):
+        return False
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    gui_action_tokens = (
+        "pyautogui.",
+        "pygetwindow",
+        "getwindowswithtitle(",
+        ".activate(",
+        ".restore(",
+        ".maximize(",
+        "locateonscreen(",
+        "click(",
+        "doubleclick(",
+        "press(",
+        "hotkey(",
+        "typewrite(",
+        "sendkeys",
+    )
+    if any(token in normalized for token in gui_action_tokens):
+        return False
+    network_bypass_tokens = (
+        "urllib.request",
+        "urlopen(",
+        "requests.",
+        "httpx.",
+        "beautifulsoup",
+        "href=",
+        "html =",
+        "html_text",
+        "re.findall(",
+        "findall(",
+        "download_url",
+    )
+    return any(token in normalized for token in network_bypass_tokens)
+
+
+def _should_soft_allow_gui_first_download_bypass_for_auto_open(
+    request: StepRequest,
+    code: str,
+    *,
+    guessed_artifact_url_generation: bool = False,
+    gui_first_download_chunk_network_bypass: bool = False,
+) -> bool:
+    if not (guessed_artifact_url_generation or gui_first_download_chunk_network_bypass):
+        return False
+    if gui_first_download_chunk_network_bypass:
+        return False
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    if not _looks_like_download_artifact_only_chunk(request.user_prompt):
+        return False
+    if _has_visible_gui_continuation_cues(request):
+        return False
+    if not _is_compilable_python_code(code):
+        return False
+    if _looks_like_non_executing_task_script(code):
+        return False
+    return _should_auto_open_prompt_url(request, code)
 
 
 def _looks_like_download_chunk_completed(*, user_prompt: str, last_execution: dict[str, Any]) -> bool:
@@ -5951,6 +8098,15 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         "pattern",
         "passed",
         "kind",
+        "network",
+        "parsing",
+        "logic",
+        "regex",
+        "regex-based",
+        "direct-download",
+        "discovery",
+        "impossible",
+        "grounded",
         "cont",
         "또는",
         "이을",
@@ -6100,6 +8256,23 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         "available",
         "proves",
         "stalled",
+        "inspect",
+        "desktop",
+        "uac",
+        "license",
+        "destination",
+        "completion",
+        "advance",
+        "script",
+        "repeat",
+        "launch-and-scan",
+        "verysilent",
+        "silent",
+        "pyautogui",
+        "pygetwindow",
+        "ctypes",
+        "psutil",
+        "click",
     }
     korean_particle_suffixes = (
         "으로는",
@@ -6231,6 +8404,15 @@ def _installer_filename_keywords(value: str, *, limit: int = 4) -> list[str]:
         if len(cleaned) < min_len:
             continue
         result.append(cleaned)
+        alpha_prefix = re.sub(r"\d+$", "", cleaned)
+        if (
+            alpha_prefix
+            and alpha_prefix != cleaned
+            and len(alpha_prefix) >= min_len
+            and alpha_prefix not in generic
+            and alpha_prefix not in result
+        ):
+            result.append(alpha_prefix)
         if len(result) >= limit:
             break
     return result
@@ -6253,6 +8435,7 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
         "visible",
         "current",
         "page",
+        "site",
         "official",
         "opened",
         "relevant",
@@ -6324,13 +8507,37 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
         "displayname",
         "root",
         "targetapp",
+        "inspect",
+        "desktop",
+        "uac",
+        "license",
+        "destination",
+        "completion",
+        "advance",
+        "script",
+        "repeat",
+        "launch-and-scan",
+        "verysilent",
+        "silent",
     }
+    merged: list[str] = []
+
+    def _append_keyword(keyword: str) -> bool:
+        cleaned = str(keyword or "").strip().lower()
+        if not cleaned or cleaned in generic_workflow_keywords or cleaned in merged:
+            return False
+        merged.append(cleaned)
+        return len(merged) >= limit
+
     explicit_installer = _extract_prompt_download_glob(request.user_prompt or "")
     if explicit_installer:
-        explicit_keywords = _installer_filename_keywords(explicit_installer, limit=limit)
-        if explicit_keywords:
-            return explicit_keywords[:limit]
-    merged: list[str] = []
+        for explicit_keyword in _installer_filename_keywords(explicit_installer, limit=limit):
+            explicit_cleaned = str(explicit_keyword or "").strip().lower()
+            if not explicit_cleaned or explicit_cleaned in merged:
+                continue
+            merged.append(explicit_cleaned)
+            if len(merged) >= limit:
+                return merged[:limit]
     last_execution_payload = dict(request.last_execution.get("payload_metadata") or {})
     last_execution_code = str(last_execution_payload.get("executed_python_code") or "")
     last_execution_title_tokens: list[str] = []
@@ -6376,19 +8583,22 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
         _select_prompt_browser_url(last_execution_code) or "",
     ):
         for keyword in _prompt_keyword_candidates(str(source_text or ""), limit=limit):
-            if keyword in generic_workflow_keywords or keyword in merged:
-                continue
-            merged.append(keyword)
-            if len(merged) >= limit:
+            if _append_keyword(keyword):
                 return merged
-    if merged:
+    if merged and (
+        request.replan_requested
+        or str(request.user_prompt or "").lstrip().lower().startswith("replan override")
+        or quoted_task_segments
+        or (explicit_installer and not _extract_prompt_urls(request.user_prompt or "") and not task_segments)
+    ):
         return merged[:limit]
+    prompt_without_urls = re.sub(r"https?://\S+", " ", str(request.user_prompt or ""))
+    for keyword in _prompt_keyword_candidates(prompt_without_urls, limit=max(limit * 4, 12)):
+        if _append_keyword(keyword):
+            return merged
     prompt_keywords = _prompt_keyword_candidates(str(request.user_prompt or ""), limit=max(limit * 4, 12))
     for keyword in prompt_keywords:
-        if keyword in generic_workflow_keywords or keyword in merged:
-            continue
-        merged.append(keyword)
-        if len(merged) >= limit:
+        if _append_keyword(keyword):
             return merged
     for source_text in (
         request.observation_text,
@@ -6396,9 +8606,7 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
         request.last_execution.get("stderr_tail"),
     ):
         for keyword in _prompt_keyword_candidates(str(source_text or ""), limit=limit):
-            if keyword not in merged:
-                merged.append(keyword)
-            if len(merged) >= limit:
+            if _append_keyword(keyword):
                 return merged
     return merged
 
@@ -6806,7 +9014,7 @@ def _should_use_framework_official_download_recovery(request: StepRequest) -> bo
 def _should_use_framework_visible_download_flow(request: StepRequest) -> bool:
     if str(request.execution_style or "python_first").lower() != "gui_first":
         return False
-    if not _looks_like_download_or_install_task(request.user_prompt):
+    if not _looks_like_download_artifact_only_chunk(request.user_prompt):
         return False
     if _looks_like_existing_installer_launch_task(request.user_prompt):
         return False
@@ -6873,7 +9081,10 @@ def generate_step_response(
         last_execution_code = str(payload_metadata.get("executed_python_code") or "")
         prompt_url = _select_prompt_browser_url(request.user_prompt) or _select_prompt_browser_url(last_execution_code)
         if not prompt_url and not _has_visible_gui_continuation_cues(request):
-            prompt_url = _fallback_browser_search_url(request.user_prompt)
+            prompt_url = _fallback_browser_search_url_for_request(
+                request,
+                extra_targets=_visible_flow_extra_targets(request, limit=2),
+            )
         code = _synthesized_visible_download_completion_code(
             request,
             prompt_url=prompt_url,
@@ -6909,7 +9120,7 @@ def generate_step_response(
         image_path=request.screenshot_path,
         image_bytes=image_bytes,
         use_blank_image=not bool(request.screenshot_path or image_bytes) and not _looks_like_download_or_install_task(request.user_prompt),
-        max_new_tokens=max_new_tokens,
+        max_new_tokens=_step_token_budget(request, max_new_tokens),
         generation_context=generation_context,
     )
     return StepResponse(
@@ -6970,12 +9181,21 @@ def _extract_last_execution(exec_result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _sanitize_observation_text_for_model(text: Any) -> str | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    if not _FRAMEWORK_OCR_UI_HELPERS_ENABLED and raw.lower().startswith("ocr visible text"):
+        return None
+    return raw
+
+
 def _extract_state(exec_result: dict[str, Any]) -> dict[str, Any]:
     return {
         "screenshot_path": exec_result.get("screenshot_path"),
         "screenshot_base64": exec_result.get("screenshot_base64"),
         "screenshot_media_type": exec_result.get("screenshot_media_type"),
-        "observation_text": exec_result.get("observation_text"),
+        "observation_text": _sanitize_observation_text_for_model(exec_result.get("observation_text")),
     }
 
 
@@ -7326,6 +9546,7 @@ def run_agent_control_loop(
 
     state = executor_client.observe()
     _write_json(root / "observe-000.json", state)
+    state = {**state, "observation_text": _sanitize_observation_text_for_model(state.get("observation_text"))}
 
     last_execution: dict[str, Any] = {}
     history: list[str] = []
@@ -7473,8 +9694,27 @@ def run_agent_control_loop(
             active_replan_reasons=active_replan_reasons,
         )
         gui_first_visible_ui_violation = _looks_like_gui_first_visible_ui_bypass(request, response.python_code)
+        guessed_artifact_url_generation = _looks_like_guessed_artifact_url_generation(
+            user_prompt=user_prompt,
+            python_code=response.python_code,
+        )
+        gui_first_download_chunk_network_bypass = _looks_like_gui_first_download_chunk_network_bypass(
+            request,
+            response.python_code,
+        )
+        gui_first_download_chunk_install_mix = _looks_like_gui_first_download_chunk_install_mix(request, response.python_code)
+        soft_allowed_gui_first_download_bypass = _should_soft_allow_gui_first_download_bypass_for_auto_open(
+            request,
+            response.python_code,
+            guessed_artifact_url_generation=guessed_artifact_url_generation,
+            gui_first_download_chunk_network_bypass=gui_first_download_chunk_network_bypass,
+        )
         gui_first_silent_install_shortcut = _looks_like_gui_first_silent_install_shortcut(request, response.python_code)
         store_detour_generation = _looks_like_store_detour_generation(request, response.python_code)
+        deprecated_ocr_helper_generation = (
+            _uses_deprecated_ocr_helper(response.python_code)
+            and not str(response.model_id or "").startswith("framework:")
+        )
         invalid_generation = (
             not _is_compilable_python_code(response.python_code)
             or _looks_like_non_executing_task_script(response.python_code)
@@ -7482,8 +9722,12 @@ def run_agent_control_loop(
             or duplicate_generation
             or prompt_url_violation
             or gui_first_visible_ui_violation
+            or (guessed_artifact_url_generation and not soft_allowed_gui_first_download_bypass)
+            or (gui_first_download_chunk_network_bypass and not soft_allowed_gui_first_download_bypass)
+            or gui_first_download_chunk_install_mix
             or gui_first_silent_install_shortcut
             or store_detour_generation
+            or deprecated_ocr_helper_generation
         )
         if invalid_generation:
             invalid_attempt_path = root / "responses" / f"step-{step_index:03d}.invalid-attempt-00.response.json"
@@ -7499,12 +9743,20 @@ def run_agent_control_loop(
                 response.notes.append("prompt_url_violation_detected")
             if gui_first_visible_ui_violation:
                 response.notes.append("gui_first_visible_ui_violation_detected")
+            if guessed_artifact_url_generation:
+                response.notes.append("guessed_artifact_url_generation_detected")
+            if gui_first_download_chunk_network_bypass:
+                response.notes.append("gui_first_download_chunk_network_bypass_detected")
+            if gui_first_download_chunk_install_mix:
+                response.notes.append("gui_first_download_chunk_install_mix_detected")
             if gui_first_silent_install_shortcut:
                 response.notes.append("gui_first_silent_install_shortcut_detected")
             if store_detour_generation:
                 response.notes.append("store_detour_generation_detected")
+            if deprecated_ocr_helper_generation:
+                response.notes.append("deprecated_ocr_helper_generation_detected")
             _write_json(invalid_attempt_path, response.to_dict())
-            if gui_first_silent_install_shortcut:
+            if _should_use_framework_visible_installer_recovery(request) and gui_first_silent_install_shortcut:
                 recovery_code = _synthesized_visible_installer_recovery_code(request)
                 retry_response = StepResponse(
                     python_code=recovery_code,
@@ -7522,7 +9774,25 @@ def run_agent_control_loop(
                 _write_json(retry_response_path, retry_response.to_dict())
                 response = retry_response
                 normalized_code = _normalize_python_code(response.python_code)
-            elif gui_first_visible_ui_violation and _has_visible_gui_continuation_cues(request):
+            elif gui_first_download_chunk_network_bypass and str(request.execution_style or "python_first").lower() == "gui_first":
+                recovery_code = _synthesized_framework_visible_download_recovery_code(request)
+                retry_response = StepResponse(
+                    python_code=recovery_code,
+                    raw_text=recovery_code,
+                    model_id="framework:visible-download-recovery",
+                    step_index=step_index,
+                    done=False,
+                    notes=[
+                        "retry_due_to_gui_first_download_chunk_network_bypass",
+                        "framework_visible_download_recovery_used",
+                    ],
+                )
+                invalid_generation_retries_used += 1
+                retry_response_path = root / "responses" / f"step-{step_index:03d}.framework-visible-download-00.response.json"
+                _write_json(retry_response_path, retry_response.to_dict())
+                response = retry_response
+                normalized_code = _normalize_python_code(response.python_code)
+            elif _FRAMEWORK_OCR_UI_HELPERS_ENABLED and gui_first_visible_ui_violation and _has_visible_gui_continuation_cues(request):
                 retry_response = StepResponse(
                     python_code=_synthesized_visible_ui_click_recovery_code(request),
                     raw_text=_synthesized_visible_ui_click_recovery_code(request),
@@ -7578,8 +9848,12 @@ def run_agent_control_loop(
                         duplicate_generation=duplicate_generation,
                         prompt_url_violation=prompt_url_violation,
                         gui_first_visible_ui_violation=gui_first_visible_ui_violation,
+                        guessed_artifact_url_generation=guessed_artifact_url_generation,
+                        gui_first_download_chunk_network_bypass=gui_first_download_chunk_network_bypass,
+                        gui_first_download_chunk_install_mix=gui_first_download_chunk_install_mix,
                         gui_first_silent_install_shortcut=gui_first_silent_install_shortcut,
                         store_detour_generation=store_detour_generation,
+                        deprecated_ocr_helper_generation=deprecated_ocr_helper_generation,
                     ),
                     last_execution=last_execution,
                     step_index=step_index,
@@ -7610,8 +9884,30 @@ def run_agent_control_loop(
                     active_replan_reasons=active_replan_reasons,
                 )
                 retry_gui_first_visible_ui_violation = _looks_like_gui_first_visible_ui_bypass(request, retry_response.python_code)
+                retry_guessed_artifact_url_generation = _looks_like_guessed_artifact_url_generation(
+                    user_prompt=user_prompt,
+                    python_code=retry_response.python_code,
+                )
+                retry_gui_first_download_chunk_network_bypass = _looks_like_gui_first_download_chunk_network_bypass(
+                    request,
+                    retry_response.python_code,
+                )
+                retry_gui_first_download_chunk_install_mix = _looks_like_gui_first_download_chunk_install_mix(
+                    request,
+                    retry_response.python_code,
+                )
+                retry_soft_allowed_gui_first_download_bypass = _should_soft_allow_gui_first_download_bypass_for_auto_open(
+                    request,
+                    retry_response.python_code,
+                    guessed_artifact_url_generation=retry_guessed_artifact_url_generation,
+                    gui_first_download_chunk_network_bypass=retry_gui_first_download_chunk_network_bypass,
+                )
                 retry_gui_first_silent_install_shortcut = _looks_like_gui_first_silent_install_shortcut(request, retry_response.python_code)
                 retry_store_detour_generation = _looks_like_store_detour_generation(request, retry_response.python_code)
+                retry_deprecated_ocr_helper_generation = (
+                    _uses_deprecated_ocr_helper(retry_response.python_code)
+                    and not str(retry_response.model_id or "").startswith("framework:")
+                )
                 retry_invalid_generation = (
                     not _is_compilable_python_code(retry_response.python_code)
                     or _looks_like_non_executing_task_script(retry_response.python_code)
@@ -7619,8 +9915,12 @@ def run_agent_control_loop(
                     or retry_duplicate_generation
                     or retry_prompt_url_violation
                     or retry_gui_first_visible_ui_violation
+                    or (retry_guessed_artifact_url_generation and not retry_soft_allowed_gui_first_download_bypass)
+                    or (retry_gui_first_download_chunk_network_bypass and not retry_soft_allowed_gui_first_download_bypass)
+                    or retry_gui_first_download_chunk_install_mix
                     or retry_gui_first_silent_install_shortcut
                     or retry_store_detour_generation
+                    or retry_deprecated_ocr_helper_generation
                 )
                 if retry_invalid_generation:
                     if not _is_compilable_python_code(retry_response.python_code):
@@ -7635,18 +9935,30 @@ def run_agent_control_loop(
                         retry_response.notes.append("stopped_due_to_prompt_url_violation")
                     if retry_gui_first_visible_ui_violation:
                         retry_response.notes.append("stopped_due_to_gui_first_visible_ui_violation")
+                    if retry_guessed_artifact_url_generation:
+                        retry_response.notes.append("stopped_due_to_guessed_artifact_url_generation")
+                    if retry_gui_first_download_chunk_network_bypass:
+                        retry_response.notes.append("stopped_due_to_gui_first_download_chunk_network_bypass")
+                    if retry_gui_first_download_chunk_install_mix:
+                        retry_response.notes.append("stopped_due_to_gui_first_download_chunk_install_mix")
                     if retry_gui_first_silent_install_shortcut:
                         retry_response.notes.append("stopped_due_to_gui_first_silent_install_shortcut")
                     if retry_store_detour_generation:
                         retry_response.notes.append("stopped_due_to_store_detour_generation")
+                    if retry_deprecated_ocr_helper_generation:
+                        retry_response.notes.append("stopped_due_to_deprecated_ocr_helper_generation")
                     final_response = retry_response.to_dict()
                     _write_json(retry_response_path, retry_response.to_dict())
                     _write_json(response_path, retry_response.to_dict())
                     stopped_reason = "invalid_python_generation"
                     history.append(f"step-{step_index:03d}_stopped=invalid_python_generation")
                     break
+                if retry_soft_allowed_gui_first_download_bypass:
+                    retry_response.notes.append("gui_first_download_bypass_allowed_with_auto_open_prelude")
                 response = retry_response
                 normalized_code = retry_normalized_code
+        if soft_allowed_gui_first_download_bypass and not invalid_generation:
+            response.notes.append("gui_first_download_bypass_allowed_with_auto_open_prelude")
 
         response.notes.append(f"code_fingerprint={_code_fingerprint(response.python_code)}")
         final_response = response.to_dict()
@@ -7739,12 +10051,26 @@ def run_agent_control_loop(
                 replan_reasons.append("execution_error")
         if _looks_like_direct_download_url_404(last_execution, response.python_code):
             replan_reasons.append("download_url_404")
+            if _looks_like_guessed_artifact_url_generation(user_prompt=user_prompt, python_code=response.python_code):
+                replan_reasons.append("guessed_artifact_url_404")
         if _looks_like_direct_download_url_403(last_execution, response.python_code):
             replan_reasons.append("download_url_403")
         if _looks_like_installer_url_discovery_failure(last_execution, response.python_code):
             replan_reasons.append("installer_url_not_found")
         if previous_visual_hash and current_visual_hash and previous_visual_hash == current_visual_hash:
             replan_reasons.append("no_visual_change")
+        if (
+            str(execution_style or "python_first").lower() == "gui_first"
+            and _looks_like_download_or_install_task(user_prompt)
+            and not _looks_like_existing_installer_launch_task(user_prompt)
+            and _last_execution_opened_browser_for_gui_flow(last_execution)
+            and (
+                "download_url_404" in replan_reasons
+                or "download_url_403" in replan_reasons
+                or "no_visual_change" in replan_reasons
+            )
+        ):
+            replan_reasons.append("same_page_click_retry_required")
         previous_executed_code = normalized_code or previous_executed_code
         previous_visual_hash = current_visual_hash
 

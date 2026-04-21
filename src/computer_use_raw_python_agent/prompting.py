@@ -33,10 +33,6 @@ Avoid docstrings and explanatory comments unless absolutely necessary.
 Do not stop after imports, variable setup, or print statements; perform the task in the same script.
 Prefer helper functions when possible:
 - open_url_and_wait
-- ocr_screen_text_regions
-- click_text_targets
-- click_download_like_target
-- open_responsive_header_menu
 - focus_window
 - press_key
 - press_hotkey
@@ -50,6 +46,8 @@ Prefer helper functions when possible:
 If helper functions are not sufficient, direct library usage is allowed.
 Always generate code that can run as a standalone script.
 When using keyboard automation, pay attention to the currently focused window and the active input locale / IME (for example Korean vs English) before typing.
+For visible UI work, rely on the screenshot provided to the local model. Do not call executor-side OCR/text-click helpers such as `ocr_screen_text_regions`, `click_text_targets`, `click_download_like_target`, or `open_responsive_header_menu`; those helpers are deprecated for new generations.
+When a visible button or link needs to be clicked, estimate its coordinates from the screenshot and use Python GUI automation such as pyautogui, ctypes mouse events, or keyboard navigation. If a coordinate click does not visibly progress, choose a different candidate in the next step instead of using OCR helper fallbacks.
 
 State-inspection discipline:
 - If the current UI state is uncertain, prefer gathering state programmatically before clicking blind coordinates.
@@ -131,6 +129,9 @@ If replan_requested is true:
 - Generate a materially different next step.
 - Use the latest screenshot and last_execution as the primary basis for the new strategy.
 - Do not repeat the same mechanism unless the screen state clearly changed and justifies it.
+- For gui_first browser/download replans, if the relevant page is still visible, keep using that same page/tab before opening a new site, search, or guessed direct URL.
+- If a previous coordinate click did not visibly progress, do not reuse that same point first. Prefer a few distinct candidate clicks from the current page content area and check for visible progress or a download artifact after each candidate.
+- Do not treat the browser toolbar, address bar, tab strip, bookmarks bar, or blank page margins as download/install click targets.
 
 If web_search_context is present:
 - Treat it as read-only external information gathered from web search.
@@ -150,14 +151,17 @@ GUI_FIRST_EXECUTION_APPEND = """
 Execution style: gui_first
 - Continue returning executable Python only, but prefer browser/UI-driven progression when relevant UI is already visible.
 - When a browser page, search results page, vendor page, installer wizard, UAC prompt, or completion dialog is already on screen, prefer advancing that visible state before bypassing it with a fresh direct download or silent install attempt.
-- When a visible page likely contains a download or installer control, prefer OCR-grounded helpers such as `click_download_like_target()` or `click_text_targets([...])` before switching to HTTP fetching or HTML parsing.
-- If the visible page appears to use a collapsed or responsive navigation header and the download control is not yet visible, prefer opening that visible menu with `open_responsive_header_menu()` before falling back to fresh network discovery.
+- When a visible page likely contains a download or installer control, use the model-visible screenshot to choose coordinates or keyboard actions. Do not call OCR/text-click helpers.
+- If the visible page appears to use a collapsed or responsive navigation header and the download control is not yet visible, use screenshot-grounded GUI automation to open the menu or navigate it.
 - For download/install tasks, it is acceptable to navigate search results, click visible official download controls, use browser download UI, and drive installer dialogs like a user when that is the most grounded next action from the screenshot.
 - If the current screenshot or prompt indicates a grounded browser/download/installer UI path, do not switch to new urllib/requests HTML scraping, regex-based direct artifact discovery, or fresh silent-install shortcuts in the same step unless the latest execution clearly shows that visible UI path failed or stalled.
 - For install-launch chunks where the installer `.exe` is already present, do not start by retrying `/VERYSILENT`, `/SILENT`, `/SP-`, or `/NORESTART` unless the latest execution already proved a normal visible installer flow is impossible.
 - For gui_first install chunks, prefer this order: inspect visible installer/UAC/completion UI, advance that UI with Python GUI automation, then verify install paths or launch the installed app.
 - Use direct Python HTTP download, silent switches, or filesystem-only shortcuts only when there is no useful visible UI state or the visible UI path has clearly stalled.
 - Prefer continuing from the current browser/app/installer state instead of restarting the task from scratch.
+- On a gui_first retry where the page is already open, keep the same tab/page and try different visible page-content candidates before opening a fresh URL or search.
+- If one coordinate click fails to cause visible progress, try the next distinct candidate in the page content area instead of reusing the same point immediately.
+- Avoid toolbar/address/tab/bookmark areas when choosing browser click coordinates.
 """
 
 REASONING_ENABLED_APPEND = """
