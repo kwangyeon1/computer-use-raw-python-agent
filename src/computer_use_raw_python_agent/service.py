@@ -36,7 +36,9 @@ except ImportError:  # pragma: no cover - direct script execution fallback
     )
 
 
-_FRAMEWORK_OCR_UI_HELPERS_ENABLED = False
+# Keep framework OCR/text-click helpers enabled for gui_first recovery flows.
+# Executor-side automatic observation_text OCR injection is controlled separately.
+_FRAMEWORK_OCR_UI_HELPERS_ENABLED = True
 _DEPRECATED_OCR_HELPER_CALLS = (
     "ocr_screen_text_regions(",
     "click_text_targets(",
@@ -964,7 +966,8 @@ def ocr_screen_text_regions(image_path=None, *, max_lines=40, crop_region=None):
             with Image.open(path) as source_image:
                 width, height = source_image.size
                 scale = 1.5 if max(width, height) <= 3200 else 1.0
-                enhanced = ImageOps.autocontrast(source_image.convert("L")).convert("RGB")
+                gray = ImageOps.autocontrast(source_image.convert("L"))
+                enhanced = gray.convert("RGB")
                 if scale != 1.0:
                     resample_filter = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
                     enhanced = enhanced.resize(
@@ -977,6 +980,20 @@ def ocr_screen_text_regions(image_path=None, *, max_lines=40, crop_region=None):
                 enhanced.save(enhanced_path, format="PNG")
                 variant_temp_paths.append(enhanced_path)
                 variant_specs.append((Path(enhanced_path), scale, "enhanced"))
+                # Bright text on colored CTA buttons is often missed by Windows OCR.
+                # A high-threshold variant keeps those button labels available as candidates.
+                button_text = gray.point(lambda px: 255 if px >= 175 else 0).convert("RGB")
+                if scale != 1.0:
+                    button_text = button_text.resize(
+                        (max(1, int(width * scale)), max(1, int(height * scale))),
+                        resample_filter,
+                    )
+                handle = tempfile.NamedTemporaryFile(prefix="ocr-button-text-", suffix=".png", delete=False)
+                button_text_path = handle.name
+                handle.close()
+                button_text.save(button_text_path, format="PNG")
+                variant_temp_paths.append(button_text_path)
+                variant_specs.append((Path(button_text_path), scale, "button_text"))
         except Exception:
             pass
 
@@ -1255,7 +1272,7 @@ def click_text_targets(
     poll_interval_s=1.0,
     prefer_bottom=True,
     double_click=False,
-    allow_heuristic_fallback=True,
+    allow_heuristic_fallback=False,
     heuristic_mode="auto",
 ):
     import ctypes
@@ -1360,6 +1377,30 @@ def click_text_targets(
 
     def _contains_any(normalized, compact, tokens):
         return any(_token_in_text(token, normalized, compact) for token in tokens)
+
+    def _has_context_target(normalized, compact):
+        return bool(context_terms) and _contains_any(normalized, compact, context_terms)
+
+    def _has_download_cta_action(normalized, compact):
+        cta_terms = (
+            "download",
+            "downloads",
+            "다운로드",
+            "다운 로드",
+            "다운받기",
+            "다운 받기",
+            "내려받기",
+            "내려 받기",
+            "받기",
+            "install",
+            "설치하기",
+        )
+        return _contains_any(normalized, compact, cta_terms)
+
+    def _looks_like_static_file_label(normalized, compact):
+        file_marker = any(token in normalized for token in (".exe", ".msi", ".zip", ".alz", "setup_", "setup-", "installer"))
+        korean_file_label = "설치파일" in compact or "설치파일" in normalized
+        return bool((file_marker or korean_file_label) and not _has_download_cta_action(normalized, compact))
 
     installer_mode = str(heuristic_mode or "auto").strip().lower() == "installer"
     installer_action_terms = _expand_terms(
@@ -1673,6 +1714,11 @@ def click_text_targets(
                 score -= 80
         if _contains_any(lowered, compact, download_action_tokens):
             score += 25
+        target_and_cta = _has_context_target(lowered, compact) and _has_download_cta_action(lowered, compact)
+        if target_and_cta:
+            score += 95
+        elif _has_context_target(lowered, compact) and _looks_like_static_file_label(lowered, compact):
+            score -= 70
         if _contains_any(lowered, compact, ("windows", "pc", "exe", "msi", "zip", "alz", "64-bit", "32-bit", "x64", "x86", "next", "확인", "동의")):
             score += 10
         terminal_markers = (
@@ -1892,75 +1938,6 @@ def click_text_targets(
             except Exception:
                 continue
         return False
-
-    def _heuristic_browser_click(region, *, attempt_index):
-        if region is None:
-            return None
-        left = int(region["left"])
-        top = int(region["top"])
-        right = int(region["right"])
-        bottom = int(region["bottom"])
-        width = max(1, right - left)
-        height = max(1, bottom - top)
-        browser_toolbar = min(max(int(height * 0.045), 52), 92)
-        page_header_top = top + browser_toolbar + 12
-        content_top = min(bottom - 80, page_header_top + 36)
-        content_height = max(120, bottom - content_top - 30)
-        mode = str(heuristic_mode or "auto").strip().lower()
-        if mode not in {"auto", "search", "download", "menu", "installer"}:
-            mode = "auto"
-        if mode == "auto":
-            mode = "download" if prefer_bottom else "search"
-        if mode == "search":
-            x_fracs = (0.18, 0.22, 0.27)
-            y_fracs = (0.10, 0.20, 0.32)
-            label = "browser_search_result_region"
-        elif mode == "installer":
-            click_points = (
-                (0.78, 0.90),
-                (0.72, 0.90),
-                (0.84, 0.90),
-                (0.78, 0.82),
-                (0.66, 0.90),
-                (0.90, 0.90),
-            )
-            label = "installer_primary_action_region"
-        elif mode == "menu":
-            x_fracs = (0.965, 0.935, 0.905, 0.875)
-            header_offsets = (18, 22, 28, 36)
-            label = "browser_header_menu_region"
-        else:
-            x_fracs = (0.66, 0.72, 0.78, 0.84, 0.60, 0.90)
-            header_offsets = (56, 72, 90, 112, 136, 162)
-            label = "browser_download_cta_region"
-        if mode == "installer":
-            cycle_len = len(click_points)
-        else:
-            cycle_len = len(y_fracs) if mode == "search" else len(x_fracs)
-        idx = max(0, int(attempt_index)) % max(1, cycle_len)
-        if mode == "installer":
-            frac_x, frac_y = click_points[idx]
-            x = left + int(width * frac_x)
-            y = top + int(height * frac_y)
-        else:
-            x = left + int(width * x_fracs[min(idx, len(x_fracs) - 1)])
-        if mode == "search":
-            y = content_top + int(content_height * y_fracs[idx])
-        elif mode == "installer":
-            y = max(top + 28, min(bottom - 28, y))
-        else:
-            y = page_header_top + header_offsets[min(idx, len(header_offsets) - 1)]
-        x = max(left + 40, min(right - 40, x))
-        if mode == "search":
-            y = max(content_top + 20, min(bottom - 40, y))
-        elif mode != "installer":
-            y = max(top + browser_toolbar + 10, min(bottom - 40, y))
-        return {
-            "text": f"[heuristic:{label}]",
-            "x": int(x),
-            "y": int(y),
-            "score": 1,
-        }
 
     deadline = time.time() + max(float(timeout_s), float(poll_interval_s))
     best_candidate = None
@@ -2194,18 +2171,9 @@ def click_text_targets(
                 "candidate_source": best_candidate.get("candidate_source", ""),
                 "score": best_candidate["score"],
             }
-        heuristic_sweep_threshold = 0 if installer_mode else 2
-        if allow_heuristic_fallback and active_region is not None and sweep_index >= heuristic_sweep_threshold:
-            heuristic_candidate = _heuristic_browser_click(active_region, attempt_index=sweep_index)
-            if heuristic_candidate is not None:
-                _click_point(int(heuristic_candidate["x"]), int(heuristic_candidate["y"]))
-                best_candidate = heuristic_candidate
-                sweep_index += 1
-                time.sleep(max(0.8, float(poll_interval_s)))
-                continue
         sweep_index += 1
         if restrict_to_browser_window and crop_region is None:
-            if (not allow_heuristic_fallback or prefer_bottom) and scroll_retry_count < 3:
+            if scroll_retry_count < 3:
                 _page_down()
                 scroll_retry_count += 1
             elif sweep_index % 2 == 0:
@@ -2242,6 +2210,8 @@ def click_download_like_target(*, extra_targets=None, avoid_targets=None, image_
         "x64",
         "x86",
     ]
+    if extra_targets:
+        targets.extend(str(item).strip().lower() for item in extra_targets if str(item).strip())
     avoid = [
         "android",
         "iphone",
@@ -2321,7 +2291,6 @@ def click_download_like_target(*, extra_targets=None, avoid_targets=None, image_
         prefer_bottom=True,
         double_click=False,
         allow_heuristic_fallback=False,
-        heuristic_mode="download",
     )
 """.strip(),
     "click_download_related_fallback": """
@@ -2352,6 +2321,8 @@ def click_download_related_fallback(*, extra_targets=None, image_path=None, time
         "x64",
         "x86",
     ]
+    if extra_targets:
+        targets.extend(str(item).strip().lower() for item in extra_targets if str(item).strip())
     avoid = [
         "android",
         "iphone",
@@ -2374,10 +2345,15 @@ def click_download_related_fallback(*, extra_targets=None, image_path=None, time
         "ads",
     ]
     window_terms = [*targets, *(str(item).strip().lower() for item in (extra_targets or []) if str(item).strip()), "chrome", "edge", "firefox", "brave", "opera"]
+    context = [str(item).strip().lower() for item in (extra_targets or []) if str(item).strip()]
     return click_text_targets(
         targets,
         avoid_targets=avoid,
         primary_targets=["download", "다운로드", "다운 로드", "다운받기", "내려받기", "받기", "install", "installer", "setup", "설치", "exe", "msi", "zip", "alz"],
+        context_targets=context,
+        require_context=bool(context),
+        context_match_scope="page",
+        context_radius_px=420,
         min_primary_hits=1,
         window_title_tokens=window_terms,
         restrict_to_browser_window=True,
@@ -2389,7 +2365,6 @@ def click_download_related_fallback(*, extra_targets=None, image_path=None, time
         double_click=False,
         skip_click_points=skip_click_points,
         allow_heuristic_fallback=False,
-        heuristic_mode="download",
     )
 """.strip(),
     "click_search_result_like_target": """
@@ -2456,7 +2431,6 @@ def click_search_result_like_target(*, extra_targets=None, avoid_targets=None, i
         prefer_bottom=False,
         double_click=True,
         allow_heuristic_fallback=False,
-        heuristic_mode="search",
     )
 """.strip(),
     "open_responsive_header_menu": """
@@ -2487,8 +2461,7 @@ def open_responsive_header_menu(*, extra_targets=None, image_path=None, timeout_
         poll_interval_s=1.0,
         prefer_bottom=False,
         double_click=False,
-        allow_heuristic_fallback=True,
-        heuristic_mode="menu",
+        allow_heuristic_fallback=False,
     )
 """.strip(),
     "dismiss_browser_overlay": """
@@ -2599,7 +2572,7 @@ def dismiss_browser_overlay(*, image_path=None, timeout_s=4.0):
         raise SystemExit(f"overlay dismiss failed: {exc}")
 """.strip(),
     "advance_visible_download_flow": """
-def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeout_s=18.0, search_first=False, search_url=None):
+def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeout_s=36.0, search_first=False, search_url=None):
     import time
 
     attempts = []
@@ -2608,8 +2581,8 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
     flow_started_at = time.time()
     total_timeout = max(float(timeout_s), 6.0)
     flow_deadline = flow_started_at + total_timeout
-    search_timeout = min(12.0, max(6.0, total_timeout * 0.55))
-    download_timeout = min(12.0, max(6.0, total_timeout * 0.55))
+    search_timeout = min(20.0, max(8.0, total_timeout * 0.55))
+    download_timeout = min(28.0, max(10.0, total_timeout * 0.70))
 
     def _remaining_time():
         return max(0.0, flow_deadline - time.time())
@@ -2989,12 +2962,11 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
                 restrict_to_browser_window=True,
                 click_horizontal_bias="center",
                 image_path=image_path,
-                timeout_s=max(1.0, _budgeted_timeout(max(2.0, min(download_timeout, 4.0)), minimum=1.0)),
+                timeout_s=max(1.0, _budgeted_timeout(max(4.0, min(download_timeout, 8.0)), minimum=1.0)),
                 poll_interval_s=1.0,
                 prefer_bottom=True,
                 double_click=False,
                 allow_heuristic_fallback=False,
-                heuristic_mode="download",
             )
             _remember_clicked_point(clicked_result)
             attempts.append({"stage": stage, "clicked": clicked_result, "candidate_index": int(candidate_index)})
@@ -3052,32 +3024,61 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
             return {"attempts": attempts}
         if _try_download_candidates("download_control_text"):
             return {"attempts": attempts}
+        fallback_url = _current_browser_url()
         if _try_menu_candidates_then_download("responsive_header_menu_retry"):
             return {"attempts": attempts}
-        if not _clear_download_page_visible():
-            attempts.append({"stage": "download_related_window_fallback_skipped", "reason": "clear_download_page_required"})
-            raise SystemExit("download related fallback skipped: clear download page required")
-        fallback_url = _current_browser_url()
+        clear_download_page = _clear_download_page_visible()
+        compact_visible_text = "".join(normalized_visible_text.split())
+        context = [str(item).strip().lower() for item in (extra_targets or []) if str(item).strip()]
+        fallback_url_lower = str(fallback_url or "").lower()
+        search_url_markers = ("google.", "bing.com/search", "search.naver.com", "duckduckgo.com", "yahoo.com/search")
+        same_page_context_visible = bool(
+            context
+            and (
+                any(token in normalized_visible_text or "".join(token.split()) in compact_visible_text for token in context)
+                or any(token in fallback_url_lower for token in context)
+            )
+        )
+        same_page_fallback_allowed = bool(
+            fallback_url
+            and not search_results_visible
+            and not any(marker in fallback_url_lower for marker in search_url_markers)
+            and (clear_download_page or same_page_context_visible)
+        )
+        if not same_page_fallback_allowed:
+            attempts.append(
+                {
+                    "stage": "download_related_window_fallback_skipped",
+                    "reason": "clear_download_page_or_target_context_required",
+                    "clear_download_page": clear_download_page,
+                    "same_page_context_visible": same_page_context_visible,
+                    "url": fallback_url,
+                }
+            )
+            raise SystemExit("download related fallback skipped: clear download page or target context required")
         fallback_clicked = False
         fallback_points = []
-        for candidate_index in range(1, 5):
-            if fallback_clicked and fallback_url and candidate_index > 1:
+        max_same_page_fallback_candidates = 16
+        for candidate_index in range(1, max_same_page_fallback_candidates + 1):
+            if candidate_index > 1:
                 try:
                     open_url_and_wait(
                         fallback_url,
                         expected_title_tokens=extra_targets,
-                        timeout_s=max(1.0, _budgeted_timeout(6.0, minimum=1.2)),
+                        timeout_s=max(1.0, _budgeted_timeout(8.0, minimum=1.2)),
                         settle_time_s=1.2,
                     )
                     attempts.append({"stage": "download_related_window_fallback_page_open", "opened": fallback_url, "candidate_index": candidate_index})
                     _sleep_budgeted(1.0)
                 except SystemExit as fallback_open_exc:
                     attempts.append({"stage": "download_related_window_fallback_page_open", "error": str(fallback_open_exc), "candidate_index": candidate_index})
+                    if not fallback_clicked:
+                        raise
             try:
                 clicked = click_download_related_fallback(
                     extra_targets=extra_targets,
                     image_path=image_path,
-                    timeout_s=max(1.0, _budgeted_timeout(min(5.0, download_timeout), minimum=1.0)),
+                    timeout_s=max(1.0, _budgeted_timeout(min(8.0, download_timeout), minimum=1.0)),
                     skip_click_points=fallback_points,
                 )
                 try:
@@ -3920,7 +3921,7 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
                         poll_interval_s=0.8,
                         prefer_bottom=True,
                         double_click=False,
-                        allow_heuristic_fallback=True,
+                        allow_heuristic_fallback=False,
                         heuristic_mode="installer",
                     )
                     attempts.append({"stage": "installer_guided_action_click", "clicked": clicked, "attempt": attempt_index})
@@ -4089,7 +4090,7 @@ def advance_visible_installer_flow(*, extra_targets=None, image_path=None, timeo
                 poll_interval_s=1.0,
                 prefer_bottom=False,
                 double_click=False,
-                allow_heuristic_fallback=True,
+                allow_heuristic_fallback=False,
                 heuristic_mode="installer",
             )
             attempts.append({"stage": "installer_text_click", "clicked": clicked, "attempt": attempt_index})
@@ -4595,7 +4596,7 @@ def _synthesized_visible_download_completion_code(
     request: StepRequest,
     *,
     prompt_url: str | None = None,
-    timeout_s: float = 18.0,
+    timeout_s: float = 36.0,
     wait_timeout_s: float = 45.0,
     exit_on_success: bool = False,
     continue_on_failure: bool = False,
@@ -4643,13 +4644,13 @@ def _synthesized_visible_download_completion_code(
                 "try:",
                 "    open_url_and_wait(prompt_url, "
                 f"expected_title_tokens={json.dumps(extra_targets, ensure_ascii=False)})",
+                "    search_first = False",
                 "except SystemExit as open_exc:",
                 '    print(f"prompt URL did not verify in browser: {open_exc}")',
                 "    if not prompt_open_fallback_url:",
                 "        raise",
                 "    fallback_search_url = prompt_open_fallback_url",
-                "    prompt_url = None",
-                "    search_first = True",
+                "    search_first = False",
             ]
         )
     lines.extend(
@@ -4665,7 +4666,7 @@ def _synthesized_visible_download_completion_code(
         ]
     )
     if download_glob:
-        short_wait_timeout = max(10.0, min(float(wait_timeout_s) * 0.35, 18.0))
+        short_wait_timeout = max(12.0, min(float(wait_timeout_s) * 0.45, 25.0))
         lines.extend(
             [
                 "    installer = None",
@@ -4673,16 +4674,16 @@ def _synthesized_visible_download_completion_code(
                 '    context_installer = str(context_payload.get("installer_path") or "").strip().strip(\'"\')',
                 "    if context_installer:",
                 "        context_installer_lower = str(context_installer).lower()",
-                "        context_installer_name = Path(context_installer).name.lower()",
-                "        context_matches_glob = True",
                 "        context_matches_keywords = True",
-                f"        expected_download_glob = {json.dumps(download_glob.lower(), ensure_ascii=False)}",
-                "        if expected_download_glob:",
-                "            context_matches_glob = fnmatch.fnmatch(context_installer_name, expected_download_glob)",
                 f"        target_keywords = {[str(item).lower() for item in extra_targets]}",
                 "        if target_keywords:",
-                "            context_matches_keywords = any(keyword in context_installer_lower for keyword in target_keywords)",
-                "        if context_matches_glob and context_matches_keywords:",
+                "            context_haystack = ' '.join([",
+                "                context_installer_lower,",
+                "                str(context_payload.get('source_url') or '').lower(),",
+                "                ' '.join(str(item).lower() for item in (context_payload.get('target_keywords') or [])),",
+                "            ])",
+                "            context_matches_keywords = any(keyword in context_haystack for keyword in target_keywords)",
+                "        if context_matches_keywords:",
                 "            try:",
                 "                installer = wait_for_stable_download(",
                 "                    context_installer,",
@@ -4697,26 +4698,37 @@ def _synthesized_visible_download_completion_code(
                 '            print(f"ignoring mismatched context installer: {context_installer}")',
                 "            installer = None",
                 "    last_download_error = None",
-                "    for download_attempt in range(2):",
+                "    for download_attempt in range(3):",
                 "        if installer is not None:",
                 "            break",
                 "        try:",
-                "            installer = wait_for_stable_download("
-                f"{json.dumps(download_glob, ensure_ascii=False)}, "
-                f"min_bytes=1_000_000, timeout_s={float(short_wait_timeout):.1f})",
-                '            print(f"download ready: {installer}")',
+                "            installer = wait_for_recent_download_artifact(",
+                f"                extra_targets={json.dumps(extra_targets, ensure_ascii=False)},",
+                "                min_bytes=1_000_000,",
+                f"                timeout_s={float(short_wait_timeout):.1f},",
+                "                since_ts=download_started_at,",
+                "            )",
+                '            print(f"recent download ready: {installer}")',
                 "            break",
                 "        except SystemExit as download_exc:",
                 "            last_download_error = download_exc",
-                "            if download_attempt >= 1:",
+                "            if download_attempt >= 2:",
                 "                break",
                 "            page_down_browser_view(steps=1)",
                 "            flow = advance_visible_download_flow("
                 f"extra_targets={json.dumps(extra_targets, ensure_ascii=False)}, "
                 "search_first=False, "
                 "search_url=None, "
-                "timeout_s=12.0)",
+                "timeout_s=36.0)",
                 '            print(f"advanced visible download flow retry: {flow}")',
+                "    if installer is None:",
+                "        try:",
+                "            installer = wait_for_stable_download("
+                f"{json.dumps(download_glob, ensure_ascii=False)}, "
+                "min_bytes=1_000_000, timeout_s=8.0)",
+                '            print(f"prompt-named download ready: {installer}")',
+                "        except SystemExit as named_download_exc:",
+                "            last_download_error = named_download_exc",
                 "    if installer is None:",
                 "        if prompt_url:",
                 "            installer = download_official_installer_from_page(",
@@ -4792,8 +4804,8 @@ def _synthesized_framework_visible_download_recovery_code(request: StepRequest) 
     return _synthesized_visible_download_completion_code(
         request,
         prompt_url=prompt_url,
-        timeout_s=24.0,
-        wait_timeout_s=55.0,
+        timeout_s=48.0,
+        wait_timeout_s=70.0,
         exit_on_success=True,
         continue_on_failure=False,
     )
@@ -4803,10 +4815,10 @@ def _prepare_python_code_for_execution(request: StepRequest | None, code: str) -
     normalized = _normalize_python_code(code)
     if not normalized:
         return normalized
-    if _should_replace_with_visible_download_recovery(request, normalized):
+    if _FRAMEWORK_OCR_UI_HELPERS_ENABLED and _should_replace_with_visible_download_recovery(request, normalized):
         normalized = _synthesized_framework_visible_download_recovery_code(request)
         return _expand_runtime_helpers(normalized)
-    if _should_replace_with_gui_first_browser_click(request, normalized):
+    if _FRAMEWORK_OCR_UI_HELPERS_ENABLED and _should_replace_with_gui_first_browser_click(request, normalized):
         prompt_url = _select_prompt_browser_url(request.user_prompt) or _fallback_browser_search_url_for_request(
             request,
             extra_targets=_visible_flow_extra_targets(request, limit=2),
@@ -4815,8 +4827,8 @@ def _prepare_python_code_for_execution(request: StepRequest | None, code: str) -
             normalized = _synthesized_visible_download_completion_code(
                 request,
                 prompt_url=prompt_url,
-                timeout_s=18.0,
-                wait_timeout_s=45.0,
+                timeout_s=42.0,
+                wait_timeout_s=65.0,
                 exit_on_success=True,
                 continue_on_failure=False,
             )
@@ -4831,12 +4843,12 @@ def _prepare_python_code_for_execution(request: StepRequest | None, code: str) -
             return _expand_runtime_helpers(normalized)
         prelude = f'open_url_and_wait({json.dumps(prompt_url, ensure_ascii=False)}, expected_title_tokens={json.dumps(keyword_tokens, ensure_ascii=False)})'
         normalized = f"{prelude}\n\n{normalized}"
-    if _should_auto_click_download_control(request, normalized):
+    if _FRAMEWORK_OCR_UI_HELPERS_ENABLED and _should_auto_click_download_control(request, normalized):
         click_prelude = _synthesized_visible_download_completion_code(
             request,
             prompt_url=None,
-            timeout_s=14.0,
-            wait_timeout_s=30.0,
+            timeout_s=30.0,
+            wait_timeout_s=45.0,
             exit_on_success=True,
             continue_on_failure=True,
         )
@@ -4868,8 +4880,8 @@ def _synthesized_visible_ui_click_recovery_code(request: StepRequest | None, *, 
     return _synthesized_visible_download_completion_code(
         request,
         prompt_url=prompt_url,
-        timeout_s=max(12.0, float(timeout_s)),
-        wait_timeout_s=30.0,
+        timeout_s=max(30.0, float(timeout_s)),
+        wait_timeout_s=45.0,
         exit_on_success=False,
         continue_on_failure=False,
     )
@@ -9012,6 +9024,8 @@ def _should_use_framework_official_download_recovery(request: StepRequest) -> bo
 
 
 def _should_use_framework_visible_download_flow(request: StepRequest) -> bool:
+    if not _FRAMEWORK_OCR_UI_HELPERS_ENABLED:
+        return False
     if str(request.execution_style or "python_first").lower() != "gui_first":
         return False
     if not _looks_like_download_artifact_only_chunk(request.user_prompt):
@@ -9022,6 +9036,8 @@ def _should_use_framework_visible_download_flow(request: StepRequest) -> bool:
 
 
 def _should_use_framework_visible_installer_recovery(request: StepRequest) -> bool:
+    if not _FRAMEWORK_OCR_UI_HELPERS_ENABLED:
+        return False
     if str(request.execution_style or "python_first").lower() != "gui_first":
         return False
     if _looks_like_launch_app_chunk_task(request.user_prompt):
@@ -9088,7 +9104,7 @@ def generate_step_response(
         code = _synthesized_visible_download_completion_code(
             request,
             prompt_url=prompt_url,
-            timeout_s=18.0,
+            timeout_s=36.0,
             wait_timeout_s=45.0,
             exit_on_success=False,
             continue_on_failure=False,
@@ -9774,7 +9790,11 @@ def run_agent_control_loop(
                 _write_json(retry_response_path, retry_response.to_dict())
                 response = retry_response
                 normalized_code = _normalize_python_code(response.python_code)
-            elif gui_first_download_chunk_network_bypass and str(request.execution_style or "python_first").lower() == "gui_first":
+            elif (
+                _FRAMEWORK_OCR_UI_HELPERS_ENABLED
+                and gui_first_download_chunk_network_bypass
+                and str(request.execution_style or "python_first").lower() == "gui_first"
+            ):
                 recovery_code = _synthesized_framework_visible_download_recovery_code(request)
                 retry_response = StepResponse(
                     python_code=recovery_code,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import computer_use_raw_python_agent.service as service_module
 from computer_use_raw_python_agent.service import (
     _dependency_repair_user_prompt,
     _expand_runtime_helpers,
@@ -183,7 +184,7 @@ def test_gui_first_download_retry_keeps_screenshot_for_generation() -> None:
     ) is False
 
 
-def test_prepare_python_code_for_execution_does_not_auto_click_download_control_for_gui_first_visible_ui() -> None:
+def test_prepare_python_code_for_execution_auto_clicks_download_control_for_gui_first_visible_ui() -> None:
     request = StepRequest(
         user_prompt="Use Python to open the official vendor page and download the Windows installer `.exe`.",
         execution_style="gui_first",
@@ -196,12 +197,37 @@ def test_prepare_python_code_for_execution_does_not_auto_click_download_control_
         },
     )
     prepared = _prepare_python_code_for_execution(request, 'print("continue")')
-    assert prepared == 'print("continue")'
+    assert "advance_visible_download_flow(" in prepared
+    assert 'print("continue")' in prepared
+    assert "click_download_like_target(" in prepared
+
+
+def test_prepare_python_code_for_execution_does_not_replace_blind_percentage_click_when_ocr_helpers_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", False)
+    request = StepRequest(
+        user_prompt="Continue from the visible official download page and download `targetapp-setup.exe` into Downloads.",
+        execution_style="gui_first",
+        screenshot_base64="ZmFrZQ==",
+        observation_text="Visible browser page with the official targetapp download button and installer file name.",
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+    )
+    prepared = _prepare_python_code_for_execution(
+        request,
+        """import pyautogui, time
+screen_w, screen_h = pyautogui.size()
+btn_x = int(screen_w * 0.68)
+btn_y = int(screen_h * 0.58)
+pyautogui.click(btn_x, btn_y)
+time.sleep(2)
+""",
+    )
     assert "advance_visible_download_flow(" not in prepared
-    assert "click_download_like_target(" not in prepared
+    assert "btn_x = int(screen_w * 0.68)" in prepared
 
 
-def test_prepare_python_code_for_execution_replaces_blind_percentage_click_with_visible_download_flow() -> None:
+def test_prepare_python_code_for_execution_replaces_blind_percentage_click_with_visible_download_flow(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
     request = StepRequest(
         user_prompt="Continue from the visible official download page and download `targetapp-setup.exe` into Downloads.",
         execution_style="gui_first",
@@ -225,7 +251,8 @@ time.sleep(2)
     assert "btn_x = int(screen_w * 0.68)" not in prepared
 
 
-def test_prepare_python_code_for_execution_replaces_risky_pygetwindow_retry_with_visible_download_flow() -> None:
+def test_prepare_python_code_for_execution_replaces_risky_pygetwindow_retry_with_visible_download_flow(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
     request = StepRequest(
         user_prompt="Continue from the visible browser page and download `targetapp-setup.exe` only.",
         execution_style="gui_first",
@@ -247,7 +274,8 @@ for win in gw.getAllWindows():
     assert "gw = gw.getActiveWindow()" not in prepared
 
 
-def test_prepare_python_code_for_execution_replaces_single_coordinate_replan_click_with_visible_download_flow() -> None:
+def test_prepare_python_code_for_execution_replaces_single_coordinate_replan_click_with_visible_download_flow(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
     request = StepRequest(
         user_prompt="Continue from the visible official download page and download `targetapp-setup.exe` only.",
         execution_style="gui_first",
@@ -266,7 +294,8 @@ pyautogui.click(720, 480)
     assert "pyautogui.click(720, 480)" not in prepared
 
 
-def test_prepare_python_code_for_execution_replaces_browser_save_shortcut_flow_with_visible_download_flow() -> None:
+def test_prepare_python_code_for_execution_replaces_browser_save_shortcut_flow_with_visible_download_flow(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
     request = StepRequest(
         user_prompt="Open the official page at https://vendor.example/download and download `targetapp-setup.exe`.",
         execution_style="gui_first",
@@ -302,10 +331,10 @@ print(html[:100])
 """,
     )
     assert "open_url_and_wait(" in prepared
-    assert "advance_visible_download_flow(" not in prepared
-    assert "click_download_like_target(" not in prepared
+    assert "advance_visible_download_flow(" in prepared
+    assert "click_download_like_target(" in prepared
     assert "browser_page_has_error_state(" not in prepared
-    assert "urllib.request.urlopen" in prepared
+    assert "urllib.request.urlopen" not in prepared
 
 
 def test_prepare_python_code_for_execution_does_not_treat_file_write_as_gui_progress() -> None:
@@ -323,11 +352,11 @@ with urllib.request.urlopen("https://example.com/download", timeout=30) as respo
 print(dest)
 """,
     )
-    assert "advance_visible_download_flow(" not in prepared
-    assert "urllib.request.urlopen" in prepared
+    assert "advance_visible_download_flow(" in prepared
+    assert "urllib.request.urlopen" not in prepared
 
 
-def test_prepare_python_code_for_execution_auto_clicks_search_result_for_visible_search_results() -> None:
+def test_prepare_python_code_for_execution_uses_visible_download_flow_for_visible_search_results() -> None:
     request = StepRequest(
         user_prompt="Use Python to open the official vendor page and download the Windows installer `.exe`.",
         execution_style="gui_first",
@@ -340,9 +369,9 @@ def test_prepare_python_code_for_execution_auto_clicks_search_result_for_visible
         },
     )
     prepared = _prepare_python_code_for_execution(request, 'print("continue")')
-    assert prepared == 'print("continue")'
-    assert "advance_visible_download_flow(" not in prepared
-    assert "search_first = True" not in prepared
+    assert "advance_visible_download_flow(" in prepared
+    assert 'print("continue")' in prepared
+    assert "search_first = True" in prepared
 
 
 def test_deprecated_ocr_helper_calls_are_detected() -> None:
@@ -351,9 +380,16 @@ def test_deprecated_ocr_helper_calls_are_detected() -> None:
     assert _uses_deprecated_ocr_helper("import pyautogui\npyautogui.click(900, 420)") is False
 
 
-def test_ocr_observation_text_is_sanitized_when_framework_ocr_helpers_are_disabled() -> None:
+def test_ocr_observation_text_is_sanitized_when_framework_ocr_helpers_are_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", False)
     assert _sanitize_observation_text_for_model("OCR visible text with download/install cues: 다운로드") is None
     assert _sanitize_observation_text_for_model("Visible installer wizard is open") == "Visible installer wizard is open"
+
+
+def test_ocr_observation_text_is_preserved_when_framework_ocr_helpers_are_enabled() -> None:
+    assert _sanitize_observation_text_for_model("OCR visible text with download/install cues: 다운로드") == (
+        "OCR visible text with download/install cues: 다운로드"
+    )
 
 
 def test_extract_prompt_install_marker_path() -> None:
@@ -672,6 +708,7 @@ def test_synthesized_framework_visible_download_recovery_code_uses_prompt_url_wi
     assert 'prompt_url = "https://www.google.com/search?q=' in code
     assert "open_url_and_wait(prompt_url" in code
     assert "advance_visible_download_flow(" in code
+    assert "timeout_s=48.0" in code
     assert "wait_for_recent_download_artifact(" in code
     assert "since_ts=download_started_at" in code
 
@@ -723,7 +760,9 @@ def test_synthesized_visible_download_completion_code_retries_visible_flow_befor
         request,
         prompt_url="https://download.example.com/app",
     )
-    assert "for download_attempt in range(2)" in code
+    assert "for download_attempt in range(3)" in code
+    assert "wait_for_recent_download_artifact(" in code
+    assert "since_ts=download_started_at" in code
     assert "advanced visible download flow retry" in code
     assert "page_down_browser_view(steps=1)" in code
     assert "download_official_installer_from_page(" in code
@@ -811,7 +850,7 @@ def test_extract_prompt_download_glob_ignores_generic_dot_exe_token() -> None:
     assert _extract_prompt_download_glob(prompt) is None
 
 
-def test_synthesized_visible_download_completion_code_waits_for_prompt_named_installer() -> None:
+def test_synthesized_visible_download_completion_code_prefers_recent_artifact_over_prompt_named_installer() -> None:
     request = StepRequest(
         user_prompt=(
             "Use Python-first automation on Windows to download the official Windows installer `.exe` "
@@ -825,8 +864,10 @@ def test_synthesized_visible_download_completion_code_waits_for_prompt_named_ins
         prompt_url="https://downloads.vendor.example/releases/TargetApp_Setup.exe",
     )
     assert code.startswith("import fnmatch\nimport time\nfrom pathlib import Path\n")
+    assert "wait_for_recent_download_artifact(" in code
     assert 'wait_for_stable_download("TargetApp_Setup.exe"' in code
-    assert 'print(f"download ready: {installer}")' in code
+    assert code.index("wait_for_recent_download_artifact(") < code.index('wait_for_stable_download("TargetApp_Setup.exe"')
+    assert 'print(f"recent download ready: {installer}")' in code
 
 
 def test_synthesized_visible_download_completion_code_waits_for_prompt_named_archive() -> None:
@@ -842,7 +883,9 @@ def test_synthesized_visible_download_completion_code_waits_for_prompt_named_arc
         request,
         prompt_url="https://downloads.vendor.example/releases/TargetApp_Installer.zip",
     )
+    assert "wait_for_recent_download_artifact(" in code
     assert 'wait_for_stable_download("TargetApp_Installer.zip"' in code
+    assert code.index("wait_for_recent_download_artifact(") < code.index('wait_for_stable_download("TargetApp_Installer.zip"')
     assert "download_official_installer_from_page(" in code
     expanded = _expand_runtime_helpers("download_official_installer_from_page('https://vendor.example/download')")
     assert 'installer_suffixes = (".exe", ".msi", ".zip", ".alz")' in expanded
@@ -884,8 +927,9 @@ def test_synthesized_visible_download_completion_code_rejects_mismatched_context
         prompt_url="https://vendor.example/download/",
     )
     assert code.startswith("import fnmatch\nimport time\nfrom pathlib import Path\n")
-    assert "context_installer_name = Path(context_installer).name.lower()" in code
-    assert 'expected_download_glob = "targetapp_setup.exe"' in code
+    assert "context_haystack = ' '.join([" in code
+    assert "source_url" in code
+    assert 'expected_download_glob = "targetapp_setup.exe"' not in code
     assert 'print(f"ignoring mismatched context installer: {context_installer}")' in code
 
 
@@ -941,7 +985,8 @@ def test_existing_installer_launch_task_detected_for_generic_downloaded_installe
     assert _looks_like_existing_installer_launch_task(prompt) is True
 
 
-def test_visible_installer_recovery_not_selected_for_generic_installer_prompt() -> None:
+def test_visible_installer_recovery_selected_for_generic_installer_prompt_when_ocr_helpers_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
     request = StepRequest(
         user_prompt=(
             "Locate the downloaded installer `.exe` in Downloads, verify it is the Windows installer, "
@@ -1037,11 +1082,9 @@ def test_expand_runtime_helpers_visible_installer_flow_does_not_target_runner_wi
     assert '"installer_keyboard_primary_guided_install"' in expanded
     assert '"installer_guided_action_click"' in expanded
     assert "def _installer_candidate_allowed(" in expanded
-    assert 'heuristic_sweep_threshold = 0 if installer_mode else 2' in expanded
     assert 'candidate_source="word_bbox"' in expanded
     assert 'candidate_source="line_bbox"' in expanded
-    assert '(0.78, 0.90)' in expanded
-    assert '(0.90, 0.90)' in expanded
+    assert "installer_primary_action_region" not in expanded
     assert "def _enumerate_child_controls(region):" in expanded
     assert "def _click_primary_action_child_button(region):" in expanded
     assert '"installer_child_button_click"' in expanded
@@ -1082,8 +1125,8 @@ def test_synthesized_visible_installer_recovery_does_not_use_extension_token_as_
 
 def test_expand_runtime_helpers_search_result_click_avoids_blind_heuristics() -> None:
     expanded = _expand_runtime_helpers("click_search_result_like_target(extra_targets=['targetapp'])")
-    assert "def _heuristic_browser_click(" in expanded
-    assert "browser_search_result_region" in expanded
+    assert "def _heuristic_browser_click(" not in expanded
+    assert "browser_search_result_region" not in expanded
     assert "screen-browser-region-fallback" in expanded
     assert "active_region = _browser_window_region()" in expanded
     helper_section = expanded.split("def click_search_result_like_target(", 1)[1].split("def click_text_targets(", 1)[0]
@@ -1097,8 +1140,8 @@ def test_expand_runtime_helpers_search_result_click_avoids_blind_heuristics() ->
 def test_expand_runtime_helpers_includes_responsive_header_menu_flow() -> None:
     expanded = _expand_runtime_helpers("advance_visible_download_flow(extra_targets=['targetapp'])")
     assert "def open_responsive_header_menu(" in expanded
-    assert 'heuristic_mode="menu"' in expanded
-    assert "browser_header_menu_region" in expanded
+    assert 'heuristic_mode="menu"' not in expanded
+    assert "browser_header_menu_region" not in expanded
     menu_section = expanded.split("def open_responsive_header_menu(", 1)[1].split("def click_text_targets(", 1)[0]
     assert "targets.extend" not in menu_section
     assert "min_primary_hits=1" in menu_section
@@ -1125,11 +1168,17 @@ def test_expand_runtime_helpers_includes_responsive_header_menu_flow() -> None:
     assert "context_match_scope=download_context_scope" in expanded
     assert "def click_download_related_fallback(" in expanded
     assert "download_related_window_fallback_skipped" in expanded
-    assert "clear_download_page_required" in expanded
+    assert "clear_download_page_or_target_context_required" in expanded
+    assert "max_same_page_fallback_candidates = 16" in expanded
+    assert "for candidate_index in range(1, max_same_page_fallback_candidates + 1)" in expanded
     assert "download_action_text" in expanded
     assert "candidate_index" in expanded
     assert "skip_click_points=clicked_points" in expanded
     assert "download_related_window_fallback_page_open" in expanded
+    related_fallback_section = expanded.split("def click_download_related_fallback(", 1)[1].split("def click_search_result_like_target(", 1)[0]
+    assert "targets.extend(str(item).strip().lower() for item in extra_targets" in related_fallback_section
+    assert "context_targets=context" in related_fallback_section
+    assert "context_match_scope=\"page\"" in related_fallback_section
     assert 'after_menu": False' in expanded
 
 
@@ -1721,7 +1770,8 @@ print(html[:80])
     ) is False
     prepared = _prepare_python_code_for_execution(request, code)
     assert "open_url_and_wait(" in prepared
-    assert "urllib.request.urlopen" in prepared
+    assert "advance_visible_download_flow(" in prepared
+    assert "urllib.request.urlopen" not in prepared
 
 
 def test_gui_first_download_bypass_not_soft_allowed_when_visible_ui_exists() -> None:
@@ -1871,6 +1921,8 @@ print(result)
     assert '"ko-KR"' in expanded
     assert '"raw_text": raw_text' in expanded
     assert '"center_x": left + int(width / 2)' in expanded
+    assert 'variant_specs.append((Path(button_text_path), scale, "button_text"))' in expanded
+    assert "target_and_cta = _has_context_target(lowered, compact) and _has_download_cta_action(lowered, compact)" in expanded
     assert "def _word_box_candidates_for_line(line_index, line_item, line_score)" in expanded
     assert "def _exact_target_word_match(text)" in expanded
     assert '"click_left": click_left' in expanded
@@ -1883,8 +1935,8 @@ print(result)
     assert "skip_click_points=skip_click_points" in expanded
     assert "context_scope = \"near\" if browser_page_has_search_results" in expanded
     assert "context_match_scope=context_scope" in expanded
-    assert "browser_download_cta_region" in expanded
-    assert "heuristic_sweep_threshold = 0 if installer_mode else 2" in expanded
+    assert "browser_download_cta_region" not in expanded
+    assert "heuristic_sweep_threshold = 0 if installer_mode else 2" not in expanded
 
 
 def test_expand_runtime_helpers_injects_advance_visible_download_flow_definition() -> None:
