@@ -7,12 +7,13 @@ import ast
 import base64
 import hashlib
 import json
+import os
 import re
 import urllib.parse
 
 try:
     from .executor_client import ExecutorHttpClient, ExecutorStdioClient
-    from .models import StepRequest, StepResponse
+    from .models import PromptBundle, StepRequest, StepResponse
     from .prompting import render_prompt_bundle_from_step_request, render_web_search_decision_bundle_from_step_request
     from .runtime import AgentRuntime, ExternalCliRawPythonRuntime, GUIOwlRawPythonRuntime
     from .web_search import (
@@ -24,7 +25,7 @@ try:
     )
 except ImportError:  # pragma: no cover - direct script execution fallback
     from executor_client import ExecutorHttpClient, ExecutorStdioClient
-    from models import StepRequest, StepResponse
+    from models import PromptBundle, StepRequest, StepResponse
     from prompting import render_prompt_bundle_from_step_request, render_web_search_decision_bundle_from_step_request
     from runtime import AgentRuntime, ExternalCliRawPythonRuntime, GUIOwlRawPythonRuntime
     from web_search import (
@@ -36,9 +37,16 @@ except ImportError:  # pragma: no cover - direct script execution fallback
     )
 
 
-# Keep framework OCR/text-click helpers enabled for gui_first recovery flows.
-# Executor-side automatic observation_text OCR injection is controlled separately.
-_FRAMEWORK_OCR_UI_HELPERS_ENABLED = True
+# Model-visible UI candidates are the default gui_first path.
+# Set COMPUTER_USE_ENABLE_FRAMEWORK_OCR_UI_HELPERS=1 to temporarily re-enable
+# executor-side OCR/text-click recovery helpers.
+_FRAMEWORK_OCR_UI_HELPERS_ENABLED = str(
+    os.environ.get("COMPUTER_USE_ENABLE_FRAMEWORK_OCR_UI_HELPERS", "")
+).strip().lower() in {"1", "true", "yes", "on"}
+_MODEL_UI_CANDIDATES_ENABLED = str(
+    os.environ.get("COMPUTER_USE_MODEL_UI_CANDIDATES", "1")
+    or os.environ.get("COMPUTER_USE_MODEL_OCR_UI_CANDIDATES", "1")
+).strip().lower() not in {"0", "false", "no", "off"}
 _DEPRECATED_OCR_HELPER_CALLS = (
     "ocr_screen_text_regions(",
     "click_text_targets(",
@@ -92,6 +100,13 @@ def _uses_deprecated_ocr_helper(code: str) -> bool:
     if not normalized:
         return False
     return any(token in normalized for token in _DEPRECATED_OCR_HELPER_CALLS)
+
+
+def _looks_like_missing_image_template_generation(code: str) -> bool:
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    return bool(re.search(r"locateonscreen\s*\(\s*['\"][^'\"]+['\"]", normalized))
 
 
 def _code_fingerprint(code: str) -> str:
@@ -438,7 +453,7 @@ def wait_for_stable_download(path_or_pattern, *, min_bytes=1_000_000, stable_che
     raise SystemExit(f"download not found for pattern: {raw}")
 """.strip(),
     "wait_for_recent_download_artifact": """
-def wait_for_recent_download_artifact(*, extra_targets=None, min_bytes=1_000_000, timeout_s=45.0, since_ts=None, download_dir=None):
+def wait_for_recent_download_artifact(*, extra_targets=None, min_bytes=1_000_000, timeout_s=45.0, since_ts=None, download_dir=None, require_target_match=False):
     import os
     import re
     import time
@@ -457,6 +472,8 @@ def wait_for_recent_download_artifact(*, extra_targets=None, min_bytes=1_000_000
 
     def _score_candidate(path):
         lowered = path.name.lower()
+        if "portable" in lowered and not any("portable" in token for token in normalized_targets):
+            return (-1, 0, 0.0)
         compact_name = re.sub(r"[^\\w가-힣]+", "", lowered, flags=re.UNICODE)
         keyword_hit = any(token in lowered for token in normalized_targets) or any(token and token in compact_name for token in compact_targets)
         suffix_score = 3 if lowered.endswith(".exe") else 2 if lowered.endswith(".msi") else 1
@@ -485,6 +502,11 @@ def wait_for_recent_download_artifact(*, extra_targets=None, min_bytes=1_000_000
                 candidates.append(path)
         candidates.sort(key=_score_candidate, reverse=True)
         for candidate in candidates:
+            score = _score_candidate(candidate)
+            if score[0] < 0:
+                continue
+            if require_target_match and normalized_targets and score[0] <= 0:
+                continue
             try:
                 remaining = max(6.0, min(12.0, deadline - time.time()))
                 return wait_for_stable_download(
@@ -504,6 +526,35 @@ def read_action_context(context_path, *, prompt_key=None):
     import os
     from pathlib import Path
 
+    def _valid_download_path(value):
+        raw = str(value or "").strip().strip('"')
+        if not raw:
+            return False
+        candidate = Path(os.path.expandvars(os.path.expanduser(raw)))
+        return candidate.exists() and candidate.is_file()
+
+    def _remove_context(path, **extra):
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        payload = {"_context_path": str(path), "_exists": False}
+        payload.update(extra)
+        return payload
+
+    def _drop_stale_download_fields(path, payload):
+        sanitized = dict(payload)
+        for key in ("installer_path", "source_url"):
+            sanitized.pop(key, None)
+        try:
+            path.write_text(json.dumps(sanitized, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            return _remove_context(path, _stale_context_pruned=True)
+        sanitized["_context_path"] = str(path)
+        sanitized["_exists"] = True
+        sanitized["_stale_download_pruned"] = True
+        return sanitized
+
     path = Path(os.path.expanduser(str(context_path or ""))).resolve()
     if not path.name:
         raise SystemExit("read_action_context requires a file path")
@@ -512,18 +563,15 @@ def read_action_context(context_path, *, prompt_key=None):
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
-        return {"_context_path": str(path), "_exists": True, "_error": f"invalid_json: {exc}"}
+        return _remove_context(path, _error=f"invalid_json: {exc}")
     if not isinstance(payload, dict):
         payload = {}
     expected_prompt_key = str(prompt_key or "").strip()
     stored_prompt_key = str(payload.get("prompt_key") or "").strip()
     if expected_prompt_key and stored_prompt_key != expected_prompt_key:
-        return {
-            "_context_path": str(path),
-            "_exists": True,
-            "_prompt_mismatch": True,
-            "previous_prompt_key": stored_prompt_key,
-        }
+        return _remove_context(path, _prompt_mismatch=True, previous_prompt_key=stored_prompt_key)
+    if payload.get("installer_path") and not _valid_download_path(payload.get("installer_path")):
+        return _drop_stale_download_fields(path, payload)
     payload["_context_path"] = str(path)
     payload["_exists"] = True
     return payload
@@ -534,6 +582,13 @@ def write_action_context(context_path, *, prompt_key=None, prompt_excerpt=None, 
     import os
     import time
     from pathlib import Path
+
+    def _valid_download_path(value):
+        raw = str(value or "").strip().strip('"')
+        if not raw:
+            return False
+        candidate = Path(os.path.expandvars(os.path.expanduser(raw)))
+        return candidate.exists() and candidate.is_file()
 
     path = Path(os.path.expanduser(str(context_path or ""))).resolve()
     if not path.name:
@@ -558,6 +613,9 @@ def write_action_context(context_path, *, prompt_key=None, prompt_excerpt=None, 
         if value is None:
             continue
         existing[key] = value
+    if not _valid_download_path(existing.get("installer_path")):
+        existing.pop("installer_path", None)
+        existing.pop("source_url", None)
     existing["version"] = 1
     existing["updated_at"] = time.time()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -713,7 +771,7 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
     import re
     import urllib.request
     from pathlib import Path
-    from urllib.parse import urljoin, urlparse, unquote
+    from urllib.parse import parse_qs, urljoin, urlparse, unquote
 
     target_url = str(page_url or "").strip()
     if not target_url:
@@ -752,17 +810,101 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
             .replace("&amp;", "&")
         )
 
+    def _host_matches_keyword_domain(host):
+        lowered_host = str(host or "").lower()
+        compact_host = re.sub(r"[^a-z0-9가-힣]+", "", lowered_host)
+        for keyword in keywords:
+            compact_keyword = re.sub(r"[^a-z0-9가-힣]+", "", str(keyword or "").lower())
+            if len(compact_keyword) < 4:
+                continue
+            if compact_keyword in compact_host:
+                return True
+        return False
+
+    def _is_search_engine_host(host):
+        lowered_host = str(host or "").lower()
+        return any(token in lowered_host for token in ("google.", "bing.", "duckduckgo.", "yahoo.", "naver.", "daum."))
+
+    def _normalize_link(base_url, raw):
+        resolved = urljoin(base_url, str(raw or "")).split("#", 1)[0]
+        parsed = urlparse(resolved)
+        if _is_search_engine_host(parsed.netloc):
+            query = parse_qs(parsed.query)
+            for key in ("q", "url", "u"):
+                for value in query.get(key) or []:
+                    candidate = unquote(str(value or "")).strip()
+                    if candidate.lower().startswith("http"):
+                        return candidate.split("#", 1)[0]
+        return resolved
+
+    def _prioritize_page_links(page_candidates, *, base_is_search_engine, limit=8):
+        if not base_is_search_engine:
+            return page_candidates[:limit]
+        keyword_roots = []
+        for keyword in keywords:
+            cleaned = re.sub(r"[^a-z0-9]+", "", str(keyword or "").lower())
+            if len(cleaned) >= 4 and cleaned not in keyword_roots:
+                keyword_roots.append(cleaned)
+        ranked = []
+        for order, link in enumerate(page_candidates):
+            parsed = urlparse(str(link or ""))
+            host = str(parsed.netloc or "").lower()
+            path = unquote(parsed.path or "").lower()
+            tld = host.rsplit(".", 1)[-1] if "." in host else host
+            compact_host = re.sub(r"[^a-z0-9]+", "", host)
+            compact_url = re.sub(r"[^a-z0-9]+", "", str(link or "").lower())
+            score = 0
+            if _host_matches_keyword_domain(host):
+                score += 50
+            if any(root == compact_host.removeprefix("www") or root in compact_host for root in keyword_roots):
+                score += 35
+            if tld == "kr" and any(root in compact_url for root in keyword_roots):
+                score += 40
+            if any(token in path for token in ("download", "client", "windows", "win64", "setup")):
+                score += 12
+            if any(token in host for token in ("youtube.", "youtu.be", "namu.", "tistory.", "blog.")):
+                score -= 100
+            ranked.append((score, -order, tld, _registrable_host(host), link))
+        ranked.sort(reverse=True)
+        selected = []
+        seen_tlds = set()
+        seen_registrables = set()
+        for _score, _order, tld, registrable, link in ranked:
+            if not tld or tld in seen_tlds:
+                continue
+            selected.append(link)
+            seen_tlds.add(tld)
+            if registrable:
+                seen_registrables.add(registrable)
+            if len(selected) >= limit:
+                return selected
+        for _score, _order, _tld, registrable, link in ranked:
+            if link in selected or (registrable and registrable in seen_registrables):
+                continue
+            selected.append(link)
+            if registrable:
+                seen_registrables.add(registrable)
+            if len(selected) >= limit:
+                return selected
+        for _score, _order, _tld, _registrable, link in ranked:
+            if link in selected:
+                continue
+            selected.append(link)
+            if len(selected) >= limit:
+                return selected
+        return selected
+
     def _extract_page_links(base_url, html_text, *, allowed_registrable):
         page_candidates = []
         seen_pages = set()
         for raw in re.findall(r'(?:href|src)\\s*=\\s*["\\']([^"\\']+)["\\']', html_text, flags=re.IGNORECASE):
-            resolved = urljoin(base_url, str(raw).split("#", 1)[0])
+            resolved = _normalize_link(base_url, str(raw).split("#", 1)[0])
             lowered = resolved.lower()
             if not lowered.startswith("http") or lowered in seen_pages:
                 continue
             parsed = urlparse(resolved)
             registrable = _registrable_host(parsed.netloc)
-            if registrable != allowed_registrable:
+            if registrable != allowed_registrable and not _host_matches_keyword_domain(parsed.netloc):
                 continue
             path_lower = unquote(parsed.path).lower()
             if path_lower.endswith(installer_suffixes):
@@ -771,7 +913,10 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
                 continue
             seen_pages.add(lowered)
             page_candidates.append(resolved)
-        return page_candidates
+        return _prioritize_page_links(
+            page_candidates,
+            base_is_search_engine=_is_search_engine_host(urlparse(base_url).netloc),
+        )
 
     def _extract_exe_links(base_url, html_text):
         installer_candidates = []
@@ -789,6 +934,40 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
                 seen_installer.add(lowered)
                 installer_candidates.append(resolved)
         return installer_candidates
+
+    def _download_candidate(candidate):
+        filename = Path(unquote(urlparse(candidate).path)).name or "installer.exe"
+        if not filename.lower().endswith(installer_suffixes):
+            lowered_candidate = candidate.lower()
+            if ".alz" in lowered_candidate:
+                filename = "installer.alz"
+            elif ".zip" in lowered_candidate:
+                filename = "installer.zip"
+            elif ".msi" in lowered_candidate:
+                filename = "installer.msi"
+            else:
+                filename = "installer.exe"
+        destination = destination_dir / filename
+        req = urllib.request.Request(candidate, headers={"User-Agent": user_agent})
+        with urllib.request.urlopen(req, timeout=90) as response, open(destination, "wb") as handle:
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                handle.write(chunk)
+        if destination.exists() and destination.stat().st_size >= int(min_bytes):
+            return destination
+        if destination.exists():
+            destination.unlink(missing_ok=True)
+        raise SystemExit(f"downloaded artifact was smaller than expected: {destination}")
+
+    parsed_target = urlparse(target_url)
+    target_path_lower = unquote(parsed_target.path).lower()
+    if target_path_lower.endswith(installer_suffixes):
+        lowered_target = target_url.lower()
+        if any(marker in lowered_target for marker in avoid_markers):
+            raise SystemExit(f"direct artifact URL was rejected by avoid markers: {target_url}")
+        return _download_candidate(target_url)
 
     initial_request = urllib.request.Request(target_url, headers={"User-Agent": user_agent})
     with urllib.request.urlopen(initial_request, timeout=60) as response:
@@ -814,7 +993,10 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
             page_request = urllib.request.Request(current_page, headers={"User-Agent": user_agent})
             with urllib.request.urlopen(page_request, timeout=60) as response:
                 current_page = response.geturl()
-                if _registrable_host(urlparse(current_page).netloc) != base_registrable:
+                if (
+                    _registrable_host(urlparse(current_page).netloc) != base_registrable
+                    and not _host_matches_keyword_domain(urlparse(current_page).netloc)
+                ):
                     continue
                 current_html = _normalized_html(response.read().decode("utf-8", errors="ignore"))
 
@@ -854,29 +1036,7 @@ def download_official_installer_from_page(page_url, *, extra_targets=None, downl
     last_error = None
     for candidate in candidates:
         try:
-            filename = Path(unquote(urlparse(candidate).path)).name or "installer.exe"
-            if not filename.lower().endswith(installer_suffixes):
-                lowered_candidate = candidate.lower()
-                if ".alz" in lowered_candidate:
-                    filename = "installer.alz"
-                elif ".zip" in lowered_candidate:
-                    filename = "installer.zip"
-                elif ".msi" in lowered_candidate:
-                    filename = "installer.msi"
-                else:
-                    filename = "installer.exe"
-            destination = destination_dir / filename
-            req = urllib.request.Request(candidate, headers={"User-Agent": user_agent})
-            with urllib.request.urlopen(req, timeout=90) as response, open(destination, "wb") as handle:
-                while True:
-                    chunk = response.read(65536)
-                    if not chunk:
-                        break
-                    handle.write(chunk)
-            if destination.exists() and destination.stat().st_size >= int(min_bytes):
-                return destination
-            if destination.exists():
-                destination.unlink(missing_ok=True)
+            return _download_candidate(candidate)
         except Exception as exc:
             last_error = exc
             continue
@@ -2647,42 +2807,10 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
             return True
         return False
 
-    def _current_browser_url():
-        import ctypes
-        import subprocess
-
-        if not hasattr(ctypes, "windll"):
-            return None
-        user32 = ctypes.windll.user32
-        vk_control = 0x11
-        vk_l = 0x4C
-        vk_c = 0x43
-        try:
-            user32.keybd_event(vk_control, 0, 0, 0)
-            user32.keybd_event(vk_l, 0, 0, 0)
-            time.sleep(0.05)
-            user32.keybd_event(vk_l, 0, 0x0002, 0)
-            user32.keybd_event(vk_control, 0, 0x0002, 0)
-            time.sleep(0.15)
-            user32.keybd_event(vk_control, 0, 0, 0)
-            user32.keybd_event(vk_c, 0, 0, 0)
-            time.sleep(0.05)
-            user32.keybd_event(vk_c, 0, 0x0002, 0)
-            user32.keybd_event(vk_control, 0, 0x0002, 0)
-            time.sleep(0.15)
-            completed = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
-                capture_output=True,
-                text=True,
-                errors="replace",
-                check=False,
-                timeout=5,
-            )
-            url = str(completed.stdout or "").strip().splitlines()[0].strip() if completed.stdout else ""
-            if url.startswith(("http://", "https://")):
-                return url
-        except Exception:
-            return None
+    def _isolated_recovery_url():
+        candidate = str(search_url or "").strip()
+        if candidate:
+            return candidate
         return None
     if search_first:
         if search_url and not browser_page_has_search_results(image_path=image_path, expected_title_tokens=extra_targets):
@@ -3024,56 +3152,35 @@ def advance_visible_download_flow(*, extra_targets=None, image_path=None, timeou
             return {"attempts": attempts}
         if _try_download_candidates("download_control_text"):
             return {"attempts": attempts}
-        fallback_url = _current_browser_url()
+        fallback_url = _isolated_recovery_url()
         if _try_menu_candidates_then_download("responsive_header_menu_retry"):
             return {"attempts": attempts}
-        clear_download_page = _clear_download_page_visible()
-        compact_visible_text = "".join(normalized_visible_text.split())
-        context = [str(item).strip().lower() for item in (extra_targets or []) if str(item).strip()]
-        fallback_url_lower = str(fallback_url or "").lower()
-        search_url_markers = ("google.", "bing.com/search", "search.naver.com", "duckduckgo.com", "yahoo.com/search")
-        same_page_context_visible = bool(
-            context
-            and (
-                any(token in normalized_visible_text or "".join(token.split()) in compact_visible_text for token in context)
-                or any(token in fallback_url_lower for token in context)
-            )
-        )
-        same_page_fallback_allowed = bool(
-            fallback_url
-            and not search_results_visible
-            and not any(marker in fallback_url_lower for marker in search_url_markers)
-            and (clear_download_page or same_page_context_visible)
-        )
-        if not same_page_fallback_allowed:
+        if not fallback_url:
             attempts.append(
                 {
                     "stage": "download_related_window_fallback_skipped",
-                    "reason": "clear_download_page_or_target_context_required",
-                    "clear_download_page": clear_download_page,
-                    "same_page_context_visible": same_page_context_visible,
+                    "reason": "isolated_recovery_url_required",
                     "url": fallback_url,
                 }
             )
-            raise SystemExit("download related fallback skipped: clear download page or target context required")
+            raise SystemExit("download related fallback skipped: isolated recovery url required")
         fallback_clicked = False
         fallback_points = []
         max_same_page_fallback_candidates = 16
         for candidate_index in range(1, max_same_page_fallback_candidates + 1):
-            if candidate_index > 1:
-                try:
-                    open_url_and_wait(
-                        fallback_url,
-                        expected_title_tokens=extra_targets,
-                        timeout_s=max(1.0, _budgeted_timeout(8.0, minimum=1.2)),
-                        settle_time_s=1.2,
-                    )
-                    attempts.append({"stage": "download_related_window_fallback_page_open", "opened": fallback_url, "candidate_index": candidate_index})
-                    _sleep_budgeted(1.0)
-                except SystemExit as fallback_open_exc:
-                    attempts.append({"stage": "download_related_window_fallback_page_open", "error": str(fallback_open_exc), "candidate_index": candidate_index})
-                    if not fallback_clicked:
-                        raise
+            try:
+                open_url_and_wait(
+                    fallback_url,
+                    expected_title_tokens=extra_targets,
+                    timeout_s=max(1.0, _budgeted_timeout(8.0, minimum=1.2)),
+                    settle_time_s=1.2,
+                )
+                attempts.append({"stage": "download_related_window_fallback_page_open", "opened": fallback_url, "candidate_index": candidate_index})
+                _sleep_budgeted(1.0)
+            except SystemExit as fallback_open_exc:
+                attempts.append({"stage": "download_related_window_fallback_page_open", "error": str(fallback_open_exc), "candidate_index": candidate_index})
+                if not fallback_clicked:
+                    raise
             try:
                 clicked = click_download_related_fallback(
                     extra_targets=extra_targets,
@@ -4330,7 +4437,64 @@ def _looks_like_risky_pygetwindow_usage(code: str) -> bool:
         "import pygetwindow as gw" in normalized
         and "gw = gw.getactivewindow(" in normalized
     )
-    return shadowed_active_window or "get_all_windows(" in normalized
+    module_level_activate_window = bool(
+        re.search(r"\b(?:gw|pygetwindow)\.activatewindow\(", normalized)
+    )
+    return (
+        shadowed_active_window
+        or "get_all_windows(" in normalized
+        or ".getallwindows(" in normalized
+        or module_level_activate_window
+    )
+
+
+def _should_replace_with_visible_installer_recovery(request: StepRequest | None, code: str) -> bool:
+    if request is None:
+        return False
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    if _looks_like_launch_app_chunk_task(request.user_prompt):
+        return False
+    if not _looks_like_existing_installer_launch_task(request.user_prompt):
+        return False
+    normalized = _normalize_python_code(code).lower()
+    if not normalized:
+        return False
+    if any(
+        token in normalized
+        for token in (
+            "advance_visible_installer_flow(",
+            "_launch_installer(",
+            "find_existing_installer(",
+            "find_installed_executable(",
+            "wait_for_installer_window(",
+        )
+    ):
+        return False
+    if _looks_like_risky_pygetwindow_usage(normalized):
+        return True
+    if _last_execution_opened_browser_for_gui_flow(request.last_execution) and any(
+        token in normalized
+        for token in (
+            "open_url_and_wait(",
+            "webbrowser.open(",
+            "webdriver.",
+            "selenium",
+            "urllib.request",
+            "urlopen(",
+            "requests.",
+            "httpx.",
+            "html =",
+            "html_text",
+            "download_url",
+            "wait_for_recent_download_artifact(",
+            "wait_for_stable_download(",
+            "click_download_like_target(",
+            "advance_visible_download_flow(",
+        )
+    ):
+        return True
+    return False
 
 
 def _looks_like_single_coordinate_click_retry(code: str) -> bool:
@@ -4555,6 +4719,22 @@ def _context_prompt_key_for_request(request: StepRequest | None) -> tuple[str, s
     return prompt_key, (excerpt or normalized_prompt)[:240]
 
 
+def _context_prompt_key_for_target_terms(
+    request: StepRequest | None,
+    target_terms: list[str] | tuple[str, ...],
+) -> tuple[str, str]:
+    normalized_terms: list[str] = []
+    for value in target_terms:
+        token = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        if token and token not in normalized_terms:
+            normalized_terms.append(token)
+    if normalized_terms:
+        basis = "target_terms:" + "\x1f".join(normalized_terms[:8])
+        prompt_key = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
+        return prompt_key, f"target_terms={', '.join(normalized_terms[:8])}"[:240]
+    return _context_prompt_key_for_request(request)
+
+
 def _looks_like_visible_installer_observation(request: StepRequest | None) -> bool:
     if request is None:
         return False
@@ -4618,6 +4798,11 @@ def _synthesized_visible_download_completion_code(
     )
     if not prompt_url:
         fallback_search_url = _fallback_browser_search_url_for_request(request, extra_targets=extra_targets)
+    primary_fallback_query = _search_query_from_url(prompt_open_fallback_url or fallback_search_url or "")
+    fallback_alternate_search_urls = _fallback_alternate_search_urls_from_parts(
+        extra_targets,
+        excluded_queries=[primary_fallback_query] if primary_fallback_query else None,
+    )
     lines: list[str] = []
     lines.append("import fnmatch")
     lines.append("import time")
@@ -4638,6 +4823,7 @@ def _synthesized_visible_download_completion_code(
         lines.append(f"prompt_open_fallback_url = {json.dumps(prompt_open_fallback_url, ensure_ascii=False)}")
     else:
         lines.append("prompt_open_fallback_url = None")
+    lines.append(f"fallback_alternate_search_urls = {json.dumps(fallback_alternate_search_urls, ensure_ascii=False)}")
     if prompt_url:
         lines.extend(
             [
@@ -4730,16 +4916,27 @@ def _synthesized_visible_download_completion_code(
                 "        except SystemExit as named_download_exc:",
                 "            last_download_error = named_download_exc",
                 "    if installer is None:",
-                "        if prompt_url:",
-                "            installer = download_official_installer_from_page(",
-                "                prompt_url,",
-                f"                extra_targets={json.dumps(extra_targets, ensure_ascii=False)},",
-                f"                download_glob={json.dumps(download_glob, ensure_ascii=False)},",
-                "                min_bytes=1_000_000,",
-                "            )",
-                '            print(f"download recovered from official page: {installer}")',
-                "        else:",
-                "            raise SystemExit(f\"download not found after visible-flow retry: {last_download_error}\")",
+                "        recovery_urls = []",
+                "        for recovery_url in [prompt_open_fallback_url, fallback_search_url, *fallback_alternate_search_urls]:",
+                "            if recovery_url and recovery_url not in recovery_urls:",
+                "                recovery_urls.append(recovery_url)",
+                "        recovery_errors = []",
+                "        for retry_source_url in recovery_urls:",
+                "            try:",
+                "                installer = download_official_installer_from_page(",
+                "                    retry_source_url,",
+                f"                    extra_targets={json.dumps(extra_targets, ensure_ascii=False)},",
+                f"                    download_glob={json.dumps(download_glob, ensure_ascii=False)},",
+                "                    min_bytes=1_000_000,",
+                "                )",
+                '                print(f"download recovered from fallback source page: {installer}")',
+                "                break",
+                "            except SystemExit as recovery_exc:",
+                "                recovery_errors.append(f'{retry_source_url}: {recovery_exc}')",
+                "                installer = None",
+                "                continue",
+                "        if installer is None:",
+                "            raise SystemExit(f\"download not found after visible-flow retry: {last_download_error}; fallback errors: {'; '.join(recovery_errors[-4:])}\")",
                 "    if installer is not None:",
                 "        write_action_context(",
                 "            CONTEXT_PATH,",
@@ -4749,7 +4946,7 @@ def _synthesized_visible_download_completion_code(
                 "            installer_path=str(installer),",
                 f"            expected_installer_glob={json.dumps(download_glob, ensure_ascii=False)},",
                 f"            target_keywords={json.dumps(extra_targets, ensure_ascii=False)},",
-                "            source_url=(prompt_url or fallback_search_url),",
+                "            source_url=(prompt_open_fallback_url or fallback_search_url or prompt_url),",
                 "        )",
             ]
         )
@@ -4772,7 +4969,7 @@ def _synthesized_visible_download_completion_code(
                 "        installer_path=str(installer),",
                 "        target_keywords="
                 f"{json.dumps(extra_targets, ensure_ascii=False)},",
-                "        source_url=(prompt_url or fallback_search_url),",
+                "        source_url=(prompt_open_fallback_url or fallback_search_url or prompt_url),",
                 "    )",
             ]
         )
@@ -4815,6 +5012,9 @@ def _prepare_python_code_for_execution(request: StepRequest | None, code: str) -
     normalized = _normalize_python_code(code)
     if not normalized:
         return normalized
+    if _FRAMEWORK_OCR_UI_HELPERS_ENABLED and _should_replace_with_visible_installer_recovery(request, normalized):
+        normalized = _synthesized_visible_installer_recovery_code(request)
+        return _expand_runtime_helpers(normalized)
     if _FRAMEWORK_OCR_UI_HELPERS_ENABLED and _should_replace_with_visible_download_recovery(request, normalized):
         normalized = _synthesized_framework_visible_download_recovery_code(request)
         return _expand_runtime_helpers(normalized)
@@ -6332,6 +6532,42 @@ def _looks_like_missing_install_progress_generation(code: str, user_prompt: str)
     return not _has_install_progress_action(normalized)
 
 
+def _looks_like_gui_first_installer_wait_without_ui_action(request: StepRequest, code: str) -> bool:
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    if not _looks_like_existing_installer_launch_task(request.user_prompt):
+        return False
+    normalized = _normalize_python_code(code).lower()
+    if not normalized or _has_task_complete_marker(normalized):
+        return False
+    if not _has_installer_launch_action(normalized):
+        return False
+    wait_tokens = (
+        ".wait(",
+        "proc.poll() is none",
+        "process.poll() is none",
+        "while proc.poll()",
+        "while process.poll()",
+        "waiting for installer to finish",
+        "installer finished",
+    )
+    if not any(token in normalized for token in wait_tokens):
+        return False
+    ui_progress_tokens = (
+        "pyautogui.click",
+        "pyautogui.press",
+        "pyautogui.hotkey",
+        "pyautogui.typewrite",
+        "pyautogui.write",
+        "sendinput",
+        "mouse_event",
+        "keybd_event",
+        "postmessage",
+        "sendmessage",
+    )
+    return not any(token in normalized for token in ui_progress_tokens)
+
+
 def _has_task_complete_marker(code: str) -> bool:
     for line in str(code or "").splitlines():
         stripped = line.strip().lower()
@@ -6494,12 +6730,25 @@ def _history_for_invalid_python_retry_with_prompt(
     gui_first_silent_install_shortcut: bool = False,
     store_detour_generation: bool = False,
     deprecated_ocr_helper_generation: bool = False,
+    missing_image_template_generation: bool = False,
+    installer_wait_without_ui_generation: bool = False,
+    bottom_strip_click_generation: bool = False,
 ) -> list[str]:
     retry_history = _history_for_invalid_python_retry(
         history,
         step_index=step_index,
         previous_code=previous_code,
     )
+    if gui_first_silent_install_shortcut or installer_wait_without_ui_generation:
+        retry_history = [
+            item
+            for item in retry_history
+            if not str(item).startswith("previous_python_prefix=")
+            and "continue the same script idea from the previous partial Python" not in str(item)
+        ]
+        retry_history.append(
+            "system_hint=discard the previous installer script shape entirely; do not continue or copy its launch-and-scan/silent-install structure"
+        )
     if duplicate_generation:
         retry_history.append(
             "system_hint=the previous generation repeated the exact same script as the last executed step; produce a materially different script structure and control flow"
@@ -6554,6 +6803,31 @@ def _history_for_invalid_python_retry_with_prompt(
         )
         retry_history.append(
             "system_hint=use the screenshot already provided to the model to choose visible coordinates, then drive the UI with pyautogui, ctypes mouse events, keyboard shortcuts, or window/process inspection"
+        )
+    if missing_image_template_generation:
+        retry_history.append(
+            "system_hint=the previous generation treated visible text as a local image template file; do not call pyautogui.locateOnScreen() with guessed .png/.jpg/.bmp filenames unless the script itself creates that image first"
+        )
+        retry_history.append(
+            "system_hint=when a visible UI candidate is provided, click its numeric click_point coordinates or inspect actual files on disk; visible labels are not local template image files"
+        )
+    if installer_wait_without_ui_generation:
+        retry_history.append(
+            "system_hint=the previous generation launched an installer and then waited for the installer process to exit without advancing the visible UI; for gui_first install chunks this is invalid"
+        )
+        retry_history.append(
+            "system_hint=on this retry, actively drive the visible installer/UAC/language/wizard controls with bounded pyautogui clicks or keyboard input, then verify installation; do not wait indefinitely on proc.poll() or process.wait()"
+        )
+    if gui_first_silent_install_shortcut or installer_wait_without_ui_generation:
+        retry_history.append(
+            "system_hint=if MODEL_VISIBLE_UI_CANDIDATES contains installer_dialog_control candidates, the first real action after imports and path checks should click or press those visible controls; do not start by relaunching the installer or scanning Program Files"
+        )
+    if bottom_strip_click_generation:
+        retry_history.append(
+            "system_hint=the previous generation clicked only in the Windows taskbar/dock strip instead of the visible page content; on this retry choose page-body search results, download buttons, or centered dialog controls above the bottom strip"
+        )
+        retry_history.append(
+            "system_hint=if the browser page is already open, do not click pinned app icons, the taskbar, or blank page margins; use a different visible page-content candidate from the current screenshot"
         )
     if gui_first_silent_install_shortcut:
         retry_history.append(
@@ -6767,6 +7041,18 @@ def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
     text = str(user_prompt or "").lower()
     if "launch-success.json" in text or "launch marker" in text:
         return False
+    download_only_markers = (
+        "this is a download-only step",
+        "download-only step",
+        "do not launch, silently install, or run the installer in this step",
+        "do not launch or run the installer in this step",
+        "do not run the installer in this step",
+        "end this step only when the installer file exists in downloads",
+        "설치는 다음 chunk",
+        "이 step은 다운로드 전용",
+    )
+    if any(marker in text for marker in download_only_markers):
+        return False
     download_stage_markers = (
         "obtain the official windows installer",
         "download the official windows installer",
@@ -6775,7 +7061,6 @@ def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
         "download the official",
         "save it to",
         "save it into",
-        "downloads folder",
         "download completed",
         "다운로드하세요",
         "다운로드가 끝나면",
@@ -6791,11 +7076,17 @@ def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
         "msiexec /i",
         "locate the downloaded msi",
         "downloaded msi",
+        "launch it with subprocess.popen",
+        "launch it with subprocess.run",
+        "start it with subprocess.popen",
+        "start it with subprocess.run",
         "installer wizard",
         "uac prompt",
         "license dialog",
         "destination dialog",
         "completion dialog",
+        "complete the installation",
+        "finish the installation",
         "do not download anything in this chunk",
         "설치 ui가 없을 때만",
         "설치 ui가 없으면",
@@ -6806,6 +7097,7 @@ def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
     launch_markers = (
         "downloaded installer",
         "already exists in downloads",
+        "already exists in ~/downloads",
         "existing installer",
         "existing installer file",
         "already-downloaded installer",
@@ -6841,36 +7133,28 @@ def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
         "찾아 실행",
         "설치 마법사",
         "uac가 뜨면",
+        "start it with subprocess.popen",
+        "start it with subprocess.run",
+        "launch it with subprocess.popen",
+        "launch it with subprocess.run",
+        "complete the windows setup",
+        "complete the setup",
+        "after installation",
+        "previously verified installer artifacts",
+        "prefer these exact installer paths",
+        "process starts successfully",
+        "starts successfully without errors",
     )
     if not _looks_like_download_or_install_task(text):
         return False
-    if any(marker in text for marker in download_stage_markers) and not any(marker in text for marker in strong_install_markers):
-        return False
-    if any(marker in text for marker in launch_markers):
-        return True
     has_installer_artifact = any(token in text for token in (".exe", ".msi", "msi", "installer", "setup", "설치 파일"))
     has_existing_location = any(token in text for token in ("downloads", "다운로드", "userprofile"))
-    has_existing_installer_signal = any(
-        token in text
-        for token in (
-            "already exists in downloads",
-            "existing installer",
-            "already downloaded",
-            "downloaded msi",
-            "downloaded installer",
-            "already present in downloads",
-            "do not download anything in this chunk",
-            "이미 다운로드된",
-            "설치 ui가 없을 때만",
-            "설치 ui가 없으면",
-        )
-    ) or ("downloaded" in text and any(token in text for token in ("installer", ".msi", " msi", ".exe")))
     has_run_signal = any(
         token in text
         for token in (
             "launch ",
             "run ",
-            "execute",
+            "execute the installer",
             "locate ",
             "find ",
             "wizard",
@@ -6884,17 +7168,93 @@ def _looks_like_existing_installer_launch_task(user_prompt: str) -> bool:
             "마법사",
         )
     )
-    return has_installer_artifact and has_existing_location and has_existing_installer_signal and has_run_signal
+    has_explicit_installer_start_signal = any(
+        token in text
+        for token in (
+            "start it with subprocess.popen",
+            "start it with subprocess.run",
+            "launch it with subprocess.popen",
+            "launch it with subprocess.run",
+            "start it with os.startfile",
+            "launch it with os.startfile",
+            "subprocess.popen",
+            "subprocess.run",
+        )
+    )
+    has_install_completion_signal = any(
+        token in text
+        for token in (
+            "complete the windows setup",
+            "complete the setup",
+            "complete setup",
+            "complete the installation",
+            "finish the installation",
+            "after installation",
+            "is installed and the",
+            "process starts successfully",
+            "starts successfully without errors",
+        )
+    )
+    has_verified_installer_signal = any(
+        token in text
+        for token in (
+            "previously verified installer artifacts",
+            "prefer these exact installer paths",
+        )
+    )
+    if any(marker in text for marker in download_stage_markers) and not any(marker in text for marker in strong_install_markers):
+        return False
+    if any(marker in text for marker in launch_markers):
+        return True
+    has_existing_installer_signal = any(
+        token in text
+        for token in (
+            "already exists in downloads",
+            "already exists in ~/downloads",
+            "existing installer",
+            "already downloaded",
+            "downloaded msi",
+            "downloaded installer",
+            "already present in downloads",
+            "do not download anything in this chunk",
+            "이미 다운로드된",
+            "설치 ui가 없을 때만",
+            "설치 ui가 없으면",
+        )
+    )
+    if (
+        has_installer_artifact
+        and has_existing_location
+        and any(token in text for token in ("locate the most recent", "locate the installer", "locate the official", "from the downloads folder", "from downloads"))
+        and (has_run_signal or has_explicit_installer_start_signal or has_install_completion_signal)
+    ):
+        has_existing_installer_signal = True
+    if re.search(r"already exists in .*downloads", text):
+        has_existing_installer_signal = True
+    return (
+        has_installer_artifact
+        and (has_existing_location or has_verified_installer_signal)
+        and (has_existing_installer_signal or has_verified_installer_signal)
+        and (has_run_signal or has_explicit_installer_start_signal or has_install_completion_signal)
+    )
 
 
 def _looks_like_launch_app_chunk_task(user_prompt: str) -> bool:
     text = str(user_prompt or "").lower()
+    if _looks_like_existing_installer_launch_task(user_prompt):
+        return False
     launch_markers = (
         "launch-success.json",
         "launch marker",
         "launch the app once",
         "launch the installed app",
+        "launch memoit if it is not already running",
+        "launch the app if it is not already running",
+        "already-installed app executable",
+        "installed executable or a running",
+        "confirm the app window opens successfully",
         "app process is running",
+        "app process/window is present",
         "bring the app window to the foreground",
         "do not redownload or reinstall",
     )
@@ -7032,6 +7392,31 @@ def _extract_click_points_from_python(code: str) -> list[tuple[int, int]]:
     return results
 
 
+def _looks_like_gui_first_bottom_strip_click_generation(request: StepRequest, code: str) -> bool:
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    if _looks_like_existing_installer_launch_task(request.user_prompt):
+        return False
+    if _looks_like_launch_app_chunk_task(request.user_prompt):
+        return False
+    screen_size = _request_screenshot_size(request)
+    if not screen_size:
+        return False
+    click_points = _extract_click_points_from_python(code)
+    if not click_points:
+        return False
+    if not (
+        _looks_like_download_artifact_only_chunk(request.user_prompt)
+        or _last_execution_opened_browser_for_gui_flow(request.last_execution)
+        or _has_visible_gui_continuation_cues(request)
+        or "MODEL_VISIBLE_UI_CANDIDATES" in str(request.observation_text or "")
+    ):
+        return False
+    _, screen_height = screen_size
+    bottom_strip_top = max(int(screen_height * 0.92), screen_height - 130)
+    return all(int(y) >= bottom_strip_top for _, y in click_points)
+
+
 def _last_execution_click_points(last_execution: dict[str, Any]) -> list[tuple[int, int]]:
     return _extract_click_points_from_python(_last_execution_python_code(last_execution))
 
@@ -7062,6 +7447,8 @@ def _rewrite_user_prompt_for_replan(
         return prompt
 
     prior_click_points = _last_execution_click_points(last_execution)
+    existing_installer_launch_task = _looks_like_existing_installer_launch_task(prompt)
+    partial_page_navigation = _looks_like_partial_download_page_navigation(last_execution)
     same_page_retry = any(
         reason in {
             "no_visual_change",
@@ -7073,14 +7460,20 @@ def _rewrite_user_prompt_for_replan(
     )
     download_replan = (
         _looks_like_download_or_install_task(prompt)
-        and not _looks_like_existing_installer_launch_task(prompt)
-        and _last_execution_opened_browser_for_gui_flow(last_execution)
+        and not existing_installer_launch_task
+        and (
+            _last_execution_opened_browser_for_gui_flow(last_execution)
+            or partial_page_navigation
+            or "partial_progress_opened_page_only" in unique_reasons
+            or "no_visible_download_candidates" in unique_reasons
+        )
         and any(
             reason in {
                 "execution_error",
                 "download_url_404",
                 "download_url_403",
                 "installer_url_not_found",
+                "no_visible_download_candidates",
                 "guessed_artifact_url_404",
                 "no_visual_change",
                 "partial_progress_opened_page_only",
@@ -7091,6 +7484,20 @@ def _rewrite_user_prompt_for_replan(
         )
     )
     if download_replan:
+        target_terms = _visible_flow_extra_targets(
+            StepRequest(
+                user_prompt=prompt,
+                execution_style="gui_first",
+                last_execution={},
+            ),
+            limit=8,
+        )
+        if not target_terms:
+            target_terms = _prompt_keyword_candidates(
+                re.sub(r"https?://\S+", " ", prompt),
+                limit=8,
+            )
+        prompt_urls = _extract_prompt_urls(prompt)
         override_lines = [
             "REPLAN OVERRIDE FOR THIS STEP:",
             "Return executable Python only.",
@@ -7101,6 +7508,12 @@ def _rewrite_user_prompt_for_replan(
             "Use the screenshot to estimate the visible download/install control coordinates, then use Python GUI actions to focus the browser, click or keyboard-navigate that control, and wait for the download artifact to stabilize in Downloads.",
             "If the browser is already on an official vendor page or search result page, keep following that visible path instead of restarting from scratch.",
         ]
+        if target_terms:
+            override_lines.append(
+                "Original task target terms to preserve: " + ", ".join(target_terms) + "."
+            )
+        if prompt_urls:
+            override_lines.append("Original official URLs to preserve: " + ", ".join(prompt_urls[:4]) + ".")
         if _looks_like_download_artifact_only_chunk(prompt):
             override_lines.append(
                 "This is a download-only step. Do not launch, silently install, or run the installer in this step."
@@ -7121,6 +7534,39 @@ def _rewrite_user_prompt_for_replan(
             override_lines.append(
                 "Do not treat the browser toolbar, address bar, tab strip, bookmarks bar, or blank page margins as download candidates."
             )
+        if (
+            "installer_url_not_found" in unique_reasons
+            or "no_visible_download_candidates" in unique_reasons
+            or _looks_like_no_visible_download_candidates(last_execution)
+        ):
+            override_lines.append(
+                "The current page did not produce usable download candidates. Discard that page as the next target unless it clearly becomes useful again."
+            )
+            override_lines.append(
+                "On retry, change the search terms or move to a different relevant vendor/product page instead of re-clicking the same URL."
+            )
+            override_lines.append(
+                "Preserve the target product keywords, but refresh the page/search query so the next attempt can discover a different clickable download candidate."
+            )
+            if target_terms:
+                override_lines.append(
+                    "If you must abandon the current page and run a new browser search, keep these exact task/product keywords in the query: "
+                    + ", ".join(target_terms[:6])
+                    + "."
+                )
+                override_lines.append(
+                    "Do not replace those task/product keywords with generic retry wording, verifier artifact names, or unrelated product names."
+                )
+        if _looks_like_exhausted_visible_download_recovery(last_execution):
+            override_lines.append(
+                "The visible-page grounded download recovery already exhausted the current page once."
+            )
+            override_lines.append(
+                "Do not run another same-page visible download recovery on this page in the next step."
+            )
+            override_lines.append(
+                "Move to a different relevant page or run a different search that keeps the same task/product keywords."
+            )
         if "download_url_404" in unique_reasons or "guessed_artifact_url_404" in unique_reasons:
             override_lines.append(
                 "The previous direct installer URL was wrong. Do not guess another same-host `.exe` or `.msi` path from the vendor domain."
@@ -7139,7 +7585,7 @@ def _rewrite_user_prompt_for_replan(
             override_lines.append(f"Previous stderr summary: {stderr_tail[-240:]}")
         return "\n".join(override_lines)
 
-    if not _looks_like_existing_installer_launch_task(prompt):
+    if not existing_installer_launch_task:
         return prompt
 
     optional_gui_dependency_failure = _looks_like_optional_windows_gui_module_failure(last_execution)
@@ -7350,6 +7796,11 @@ def _looks_like_download_artifact_only_chunk(user_prompt: str) -> bool:
         "nontrivial file size",
         "plausible size",
         "file size",
+        "installer file exists in downloads",
+        "installer file is fully present",
+        "download artifact to stabilize in downloads",
+        "wait for the download artifact to stabilize in downloads",
+        "fully present before finishing this chunk",
         "downloads 폴더",
         "downloads 안에",
         "다운로드 폴더",
@@ -7365,6 +7816,9 @@ def _looks_like_download_artifact_only_chunk(user_prompt: str) -> bool:
         "save the installer",
         "download the installer only",
         "download only",
+        "download-only step",
+        "this is a download-only step",
+        "download artifact",
         "installer is present",
         "다운로드",
         "설치파일",
@@ -7529,12 +7983,193 @@ def _looks_like_installer_url_discovery_failure(last_execution: dict[str, Any], 
     return any(token in normalized for token in discovery_tokens)
 
 
+def _looks_like_no_visible_download_candidates(last_execution: dict[str, Any]) -> bool:
+    if not last_execution:
+        return False
+    if _looks_like_exhausted_visible_download_recovery(last_execution):
+        return True
+    combined = "\n".join(
+        str(last_execution.get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    ).lower()
+    if not combined.strip():
+        return False
+    no_candidate_markers = (
+        "no clickable candidates",
+        "no target-matching model-visible ui candidates",
+        "no target matching model-visible ui candidates",
+        "no model-visible ui candidates were extracted",
+        "no remaining menu/download candidates produced download activity",
+        "download related fallback found no clickable candidates",
+        "found no clickable candidates",
+    )
+    return any(marker in combined for marker in no_candidate_markers)
+
+
+def _looks_like_exhausted_visible_download_recovery(last_execution: dict[str, Any]) -> bool:
+    if not last_execution:
+        return False
+    combined = "\n".join(
+        str(last_execution.get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    ).lower()
+    if not combined.strip():
+        return False
+    hard_markers = (
+        "clicked all grounded points for all visible candidates without a stable download",
+        "the current visible download controls were already attempted on this screen",
+        "no visible download-related control remains on the current screen",
+        "no new visible download-related control is available on the current screen",
+    )
+    if any(marker in combined for marker in hard_markers):
+        return True
+    return (
+        "click visible download candidate" in combined
+        and "recent installer download did not appear" in combined
+        and (
+            "opened isolated recovery page:" in combined
+            or "skipping repeated isolated recovery page:" in combined
+        )
+    )
+
+
+def _looks_like_partial_download_page_navigation(last_execution: dict[str, Any]) -> bool:
+    if not last_execution:
+        return False
+    combined = "\n".join(
+        str(last_execution.get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    ).lower()
+    if not combined.strip():
+        return False
+    navigation_markers = (
+        "visible candidate opened page:",
+        "opened browser page for screenshot-grounded ui continuation",
+        "continue with latest screenshot and model-visible ui candidates",
+    )
+    return any(marker in combined for marker in navigation_markers)
+
+
 def _extract_prompt_urls(text: str) -> list[str]:
-    matches = re.findall(r"https?://[^\s'\"`)>]+", str(text or ""))
+    korean_particle_suffixes = (
+        "으로는",
+        "에서는",
+        "에게는",
+        "한테는",
+        "으로",
+        "에서",
+        "에게",
+        "한테",
+        "까지",
+        "부터",
+        "보다",
+        "처럼",
+        "라고",
+        "이라",
+        "라도",
+        "이다",
+        "은",
+        "는",
+        "이",
+        "가",
+        "을",
+        "를",
+        "에",
+        "와",
+        "과",
+        "도",
+    )
+
+    def _strip_trailing_korean_particle(candidate: str) -> str:
+        cleaned_candidate = str(candidate or "").strip()
+        for suffix in korean_particle_suffixes:
+            if not cleaned_candidate.endswith(suffix):
+                continue
+            stripped = cleaned_candidate[: -len(suffix)]
+            if not stripped:
+                continue
+            if re.search(r"[가-힣]$", stripped):
+                continue
+            if stripped.lower().startswith(("http://", "https://")):
+                try:
+                    parsed = urllib.parse.urlparse(stripped)
+                except ValueError:
+                    continue
+                if parsed.scheme and parsed.netloc:
+                    return stripped
+                continue
+            host_part = stripped.split("/", 1)[0].split(":", 1)[0]
+            if "." in host_part:
+                return stripped
+        return cleaned_candidate
+
+    raw_text = str(text or "")
+    matches = re.findall(r"https?://[^\s'\"`)>]+", raw_text)
+    bare_domain_matches = re.findall(
+        r"(?<![@:/\w.-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{2,5})?(?:/[^\s'\"`<>()\]]*)?)",
+        raw_text,
+        flags=re.IGNORECASE,
+    )
     seen: set[str] = set()
     urls: list[str] = []
-    for raw in matches:
+    ignored_bare_tlds = {
+        "alz",
+        "appx",
+        "bat",
+        "bmp",
+        "cfg",
+        "cmd",
+        "com1",
+        "crdownload",
+        "dll",
+        "doc",
+        "docx",
+        "exe",
+        "gif",
+        "ini",
+        "jpeg",
+        "jpg",
+        "json",
+        "log",
+        "msi",
+        "msix",
+        "part",
+        "partial",
+        "pdf",
+        "png",
+        "ps1",
+        "py",
+        "rar",
+        "tmp",
+        "txt",
+        "xml",
+        "zip",
+    }
+    allowed_bare_tlds = {
+        "app",
+        "biz",
+        "co",
+        "com",
+        "dev",
+        "edu",
+        "example",
+        "gov",
+        "io",
+        "jp",
+        "kr",
+        "net",
+        "org",
+        "us",
+    }
+    for raw in [*matches, *bare_domain_matches]:
         cleaned = raw.rstrip(".,;:])}>")
+        cleaned = _strip_trailing_korean_particle(cleaned)
+        if not cleaned.lower().startswith(("http://", "https://")):
+            host_part = cleaned.split("/", 1)[0].split(":", 1)[0].lower()
+            tld = host_part.rsplit(".", 1)[-1] if "." in host_part else ""
+            if tld in ignored_bare_tlds or tld not in allowed_bare_tlds:
+                continue
+            cleaned = f"https://{cleaned}"
         if not cleaned or cleaned in seen:
             continue
         seen.add(cleaned)
@@ -7543,14 +8178,50 @@ def _extract_prompt_urls(text: str) -> list[str]:
 
 
 def _registrable_host_from_url(url: str) -> str:
-    parsed = urllib.parse.urlparse(str(url or "").strip())
+    try:
+        parsed = urllib.parse.urlparse(str(url or "").strip())
+    except ValueError:
+        return ""
     labels = [label for label in str(parsed.netloc or "").lower().split(".") if label]
     if len(labels) >= 2:
         return ".".join(labels[-2:])
     return str(parsed.netloc or "").lower()
 
 
-def _select_prompt_browser_url(text: str) -> str | None:
+def _search_url_matches_excluded_query(
+    url: str | None,
+    excluded_queries: list[str] | set[str] | None = None,
+) -> bool:
+    if not excluded_queries:
+        return False
+    normalized_query = _normalize_search_query_text(_search_query_from_url(str(url or "")))
+    if not normalized_query:
+        return False
+    normalized_excluded = {
+        _normalize_search_query_text(item)
+        for item in excluded_queries
+        if _normalize_search_query_text(item)
+    }
+    if normalized_query in normalized_excluded:
+        return True
+    query_fingerprint = _search_query_fingerprint(normalized_query)
+    excluded_fingerprints = {
+        _search_query_fingerprint(item)
+        for item in excluded_queries
+        if _search_query_fingerprint(item)
+    }
+    return bool(query_fingerprint and query_fingerprint in excluded_fingerprints)
+
+
+def _select_prompt_browser_url(
+    text: str,
+    *,
+    excluded_queries: list[str] | set[str] | None = None,
+) -> str | None:
+    validated_search_url = _select_validated_replan_search_url(text)
+    if validated_search_url:
+        if not _search_url_matches_excluded_query(validated_search_url, excluded_queries):
+            return validated_search_url
     prompt_urls = _extract_prompt_urls(text)
     if not prompt_urls:
         return None
@@ -7616,8 +8287,27 @@ def _select_prompt_browser_url(text: str) -> str | None:
             score += 6
         return (score, -len(url))
 
-    selected = sorted(prompt_urls, key=_score, reverse=True)[0]
+    filtered_prompt_urls = [
+        url
+        for url in prompt_urls
+        if not _search_url_matches_excluded_query(url, excluded_queries)
+    ]
+    if not filtered_prompt_urls:
+        return None
+    selected = sorted(filtered_prompt_urls, key=_score, reverse=True)[0]
     return _canonicalize_prompt_browser_url(selected)
+
+
+def _select_validated_replan_search_url(text: str) -> str | None:
+    for pattern in (
+        r"Validated replan (?:search|retry) URL(?: to use if a new browser search is needed)?:\s*(https?://\S+)",
+        r"REPLAN_SEARCH_URL\s*=\s*(https?://\S+)",
+        r"REPLAN_RETRY_URL\s*=\s*(https?://\S+)",
+    ):
+        match = re.search(pattern, str(text or ""), flags=re.IGNORECASE)
+        if match:
+            return str(match.group(1) or "").strip().rstrip(".,;:])}>")
+    return None
 
 
 def _canonicalize_prompt_browser_url(url: str) -> str:
@@ -7659,7 +8349,10 @@ def _url_looks_like_search_results(url: str | None) -> bool:
     cleaned = str(url or "").strip()
     if not cleaned:
         return False
-    parsed = urllib.parse.urlparse(cleaned)
+    try:
+        parsed = urllib.parse.urlparse(cleaned)
+    except ValueError:
+        return False
     host = str(parsed.netloc or "").lower()
     path = str(parsed.path or "").lower()
     query = str(parsed.query or "").lower()
@@ -7681,7 +8374,103 @@ def _url_looks_like_search_results(url: str | None) -> bool:
     return "q=" in query and any(token in host for token in ("bing", "google", "duckduckgo", "yahoo", "naver", "daum", "search"))
 
 
-def _fallback_browser_search_url_from_parts(keywords: list[str], urls: list[str]) -> str | None:
+def _normalize_search_query_text(query: str) -> str:
+    normalized = urllib.parse.unquote_plus(str(query or "")).strip().lower()
+    if not normalized:
+        return ""
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized
+
+
+def _search_query_fingerprint(query: str) -> str:
+    normalized = _normalize_search_query_text(query)
+    if not normalized:
+        return ""
+    generic_terms = {
+        "download",
+        "downloads",
+        "install",
+        "installer",
+        "setup",
+        "windows",
+        "window",
+        "pc",
+        "desktop",
+        "client",
+        "x64",
+        "x86",
+        "64",
+        "64bit",
+        "64-bit",
+        "win64",
+    }
+    terms = [
+        term
+        for term in re.split(r"\s+", normalized)
+        if term and term not in generic_terms
+    ]
+    return " ".join(terms) or normalized
+
+
+def _extract_search_queries_from_text(text: str) -> list[str]:
+    queries: list[str] = []
+    for url in _extract_prompt_urls(text):
+        if not _url_looks_like_search_results(url):
+            continue
+        normalized = _normalize_search_query_text(_search_query_from_url(url))
+        if normalized and normalized not in queries:
+            queries.append(normalized)
+    return queries
+
+
+def _failed_search_queries_for_request(request: StepRequest | None) -> list[str]:
+    if request is None:
+        return []
+    queries: list[str] = []
+    payload_metadata = dict((request.last_execution or {}).get("payload_metadata") or {})
+    executed_python_code = str(payload_metadata.get("executed_python_code") or "")
+    candidate_texts = [
+        executed_python_code,
+        str((request.last_execution or {}).get("stdout_tail") or ""),
+        str((request.last_execution or {}).get("stderr_tail") or ""),
+    ]
+    if bool(request.replan_requested):
+        candidate_texts.insert(0, str(request.user_prompt or ""))
+    for text in candidate_texts:
+        for query in _extract_search_queries_from_text(text):
+            if query not in queries:
+                queries.append(query)
+    return queries
+
+
+def _select_request_prompt_browser_url(
+    request: StepRequest | None,
+    *,
+    include_last_execution: bool = False,
+) -> str | None:
+    if request is None:
+        return None
+    excluded_queries = _failed_search_queries_for_request(request)
+    prompt_url = _select_prompt_browser_url(
+        request.user_prompt or "",
+        excluded_queries=excluded_queries,
+    )
+    if prompt_url or not include_last_execution:
+        return prompt_url
+    payload_metadata = dict((request.last_execution or {}).get("payload_metadata") or {})
+    last_execution_code = str(payload_metadata.get("executed_python_code") or "")
+    return _select_prompt_browser_url(
+        last_execution_code,
+        excluded_queries=excluded_queries,
+    )
+
+
+def _fallback_browser_search_url_from_parts(
+    keywords: list[str],
+    urls: list[str],
+    *,
+    excluded_queries: list[str] | set[str] | None = None,
+) -> str | None:
     cleaned_keywords: list[str] = []
     generic = {
         "network",
@@ -7711,6 +8500,17 @@ def _fallback_browser_search_url_from_parts(keywords: list[str], urls: list[str]
     }
 
     def _append_keyword(value: str) -> None:
+        raw_keyword = str(value or "").lower().strip(" ._-")
+        if (
+            raw_keyword
+            and raw_keyword not in cleaned_keywords
+            and raw_keyword not in {"download", "downloads", "install", "installer", "setup", "official", "windows"}
+            and not raw_keyword.isdigit()
+            and len(raw_keyword) >= 2
+        ):
+            cleaned_keywords.append(raw_keyword)
+            if len(cleaned_keywords) >= 4:
+                return
         for keyword in _prompt_keyword_candidates(str(value or ""), limit=4):
             if keyword in generic or keyword in cleaned_keywords:
                 continue
@@ -7744,7 +8544,10 @@ def _fallback_browser_search_url_from_parts(keywords: list[str], urls: list[str]
     for url in urls:
         if _url_looks_like_search_results(url):
             continue
-        parsed = urllib.parse.urlparse(str(url or "").strip())
+        try:
+            parsed = urllib.parse.urlparse(str(url or "").strip())
+        except ValueError:
+            continue
         host = str(parsed.netloc or "").strip().lower().split(":", 1)[0]
         if not host:
             continue
@@ -7759,40 +8562,243 @@ def _fallback_browser_search_url_from_parts(keywords: list[str], urls: list[str]
         lead = parts[-2]
         if lead and lead not in generic and lead not in cleaned_keywords and len(cleaned_keywords) < 4:
             cleaned_keywords.append(lead)
-        tld = parts[-1]
-        if (
-            lead
-            and len(lead) >= 4
-            and lead.isascii()
-            and lead.isalnum()
-            and not lead.endswith(("corp", "inc", "co", "group", "app"))
-            and tld in {"com", "net", "org"}
-        ):
-            sibling = f"{lead}corp.{tld}"
-            if sibling not in search_domains:
-                search_domains.append(sibling)
         if len(search_domains) >= 2:
             break
     if not cleaned_keywords:
         return None
     joined = " ".join(cleaned_keywords)
-    if re.search(r"[\uac00-\ud7a3]", joined):
-        query_terms = [*cleaned_keywords, "공식", "다운로드", "pc", "windows"]
-    else:
-        query_terms = [*cleaned_keywords, "official", "windows", "download"]
+    base_query_terms = list(cleaned_keywords)
+    has_platform_hint = any(keyword in {"pc", "windows", "desktop", "x64", "x86"} for keyword in cleaned_keywords)
+    if not has_platform_hint and not re.search(r"[\uac00-\ud7a3]", joined):
+        base_query_terms.append("windows")
     if search_domains:
         if len(search_domains) == 1:
-            query_terms.append(f"site:{search_domains[0]}")
+            base_query_terms.append(f"site:{search_domains[0]}")
         else:
-            query_terms.append("(" + " OR ".join(f"site:{domain}" for domain in search_domains[:2]) + ")")
-    query = urllib.parse.quote(" ".join(query_terms))
-    return f"https://www.google.com/search?q={query}"
+            base_query_terms.append("(" + " OR ".join(f"site:{domain}" for domain in search_domains[:2]) + ")")
+
+    excluded_normalized = {
+        _normalize_search_query_text(query)
+        for query in (excluded_queries or [])
+        if _normalize_search_query_text(query)
+    }
+    excluded_fingerprints = {
+        _search_query_fingerprint(query)
+        for query in (excluded_queries or [])
+        if _search_query_fingerprint(query)
+    }
+    candidate_queries: list[list[str]] = []
+    seen_candidate_queries: set[str] = set()
+
+    def _append_candidate(extra_terms: list[str] | None = None, *, remove_site_filter: bool = False) -> None:
+        terms: list[str] = []
+        for term in base_query_terms:
+            cleaned = str(term or "").strip()
+            if not cleaned:
+                continue
+            if remove_site_filter and ("site:" in cleaned or cleaned.startswith("(")):
+                continue
+            if cleaned not in terms:
+                terms.append(cleaned)
+        for term in extra_terms or []:
+            cleaned = str(term or "").strip()
+            if cleaned and cleaned not in terms:
+                terms.append(cleaned)
+        normalized = _normalize_search_query_text(" ".join(terms))
+        if normalized and normalized not in seen_candidate_queries:
+            seen_candidate_queries.add(normalized)
+            candidate_queries.append(terms)
+
+    _append_candidate()
+    _append_candidate(["pc"])
+    _append_candidate(["desktop"])
+    _append_candidate(["client"])
+    _append_candidate(["kr"])
+    _append_candidate(["global"])
+    _append_candidate(remove_site_filter=True)
+    _append_candidate(["pc"], remove_site_filter=True)
+    _append_candidate(["kr"], remove_site_filter=True)
+    for query_terms in candidate_queries:
+        normalized = _normalize_search_query_text(" ".join(query_terms))
+        if normalized in excluded_normalized or _search_query_fingerprint(normalized) in excluded_fingerprints:
+            continue
+        query = urllib.parse.quote(" ".join(query_terms))
+        return f"https://www.google.com/search?q={query}"
+    return None
 
 
-def _fallback_browser_search_url(text: str) -> str | None:
+def _fallback_alternate_search_urls_from_parts(
+    keywords: list[str],
+    *,
+    excluded_queries: list[str] | set[str] | None = None,
+    limit: int = 4,
+) -> list[str]:
+    cleaned_keywords: list[str] = []
+    platform_or_locale = {"pc", "windows", "desktop", "x64", "x86", "kr", "korea"}
+    for raw_keyword in keywords or []:
+        for keyword in _prompt_keyword_candidates(str(raw_keyword or ""), limit=4):
+            if keyword in platform_or_locale or keyword in cleaned_keywords:
+                continue
+            if len(keyword) < 2 or keyword.isdigit():
+                continue
+            cleaned_keywords.append(keyword)
+            if len(cleaned_keywords) >= 3:
+                break
+        if len(cleaned_keywords) >= 3:
+            break
+    if not cleaned_keywords:
+        return []
+
+    base_terms = cleaned_keywords[:2]
+    excluded_normalized = {
+        _normalize_search_query_text(query)
+        for query in (excluded_queries or [])
+        if _normalize_search_query_text(query)
+    }
+    excluded_fingerprints = {
+        _search_query_fingerprint(query)
+        for query in (excluded_queries or [])
+        if _search_query_fingerprint(query)
+    }
+    candidate_queries = [
+        [*base_terms, "kr"],
+        [*base_terms, "download", "kr"],
+        [*base_terms, "windows", "kr"],
+        [*base_terms, "pc", "kr"],
+    ]
+    urls: list[str] = []
+    seen: set[str] = set()
+    for terms in candidate_queries:
+        normalized = _normalize_search_query_text(" ".join(terms))
+        if (
+            not normalized
+            or normalized in seen
+            or normalized in excluded_normalized
+            or _search_query_fingerprint(normalized) in excluded_fingerprints
+        ):
+            continue
+        seen.add(normalized)
+        urls.append("https://www.google.com/search?q=" + urllib.parse.quote(" ".join(terms)))
+        if len(urls) >= limit:
+            return urls
+    return urls
+
+
+def _search_platform_hint_keywords(text: str, *, limit: int = 4) -> list[str]:
+    raw_text = str(text or "").lower()
+    compact_text = re.sub(r"\s+", "", raw_text)
+    hints: list[str] = []
+
+    def _append_hint(value: str) -> None:
+        cleaned = str(value or "").strip().lower()
+        if cleaned and cleaned not in hints:
+            hints.append(cleaned)
+
+    if any(token in compact_text for token in ("pc버전", "pc용", "피시버전", "피씨버전")) or re.search(r"\bpc\b", raw_text):
+        _append_hint("pc")
+    if "windows" in raw_text or "윈도우" in raw_text:
+        _append_hint("windows")
+    if "desktop" in raw_text or "데스크탑" in raw_text:
+        _append_hint("desktop")
+    if any(token in compact_text for token in ("64bit", "64-bit")) or "x64" in raw_text:
+        _append_hint("x64")
+    if any(token in compact_text for token in ("32bit", "32-bit")) or "x86" in raw_text:
+        _append_hint("x86")
+    return hints[:limit]
+
+
+def _search_locale_hint_keywords(text: str, *, limit: int = 2) -> list[str]:
+    raw_text = str(text or "").lower()
+    compact_text = re.sub(r"\s+", "", raw_text)
+    hints: list[str] = []
+
+    def _append_hint(value: str) -> None:
+        cleaned = str(value or "").strip().lower()
+        if cleaned and cleaned not in hints:
+            hints.append(cleaned)
+
+    if bool(re.search(r"[가-힣]", raw_text)) or any(token in compact_text for token in ("한국", "국내", "한글")):
+        _append_hint("kr")
+    return hints[:limit]
+
+
+def _fallback_official_domain_urls(keywords: list[str], *, limit: int = 12) -> list[str]:
+    ascii_keywords: list[str] = []
+    for raw in keywords or []:
+        cleaned = re.sub(r"[^a-z0-9]+", "", str(raw or "").lower())
+        if not cleaned or cleaned.isdigit():
+            continue
+        if cleaned in {
+            "download",
+            "downloads",
+            "install",
+            "installer",
+            "setup",
+            "official",
+            "windows",
+        }:
+            continue
+        if len(cleaned) < 2:
+            continue
+        if cleaned not in ascii_keywords:
+            ascii_keywords.append(cleaned)
+    if not ascii_keywords:
+        return []
+    bases: list[str] = []
+
+    def _append_base(value: str) -> None:
+        if value and value not in bases:
+            bases.append(value)
+
+    if len(ascii_keywords) >= 2:
+        _append_base(ascii_keywords[-1] + ascii_keywords[-2])
+        _append_base(ascii_keywords[0] + ascii_keywords[1])
+    if len(ascii_keywords) >= 3:
+        _append_base("".join(ascii_keywords))
+        _append_base("-".join(ascii_keywords))
+    _append_base(ascii_keywords[0])
+    if len(ascii_keywords) >= 2:
+        _append_base(ascii_keywords[-1])
+
+    urls: list[str] = []
+    for base in bases:
+        hosts: list[str] = []
+        for host in (
+            f"{base}.org",
+            f"{base}-project.org",
+            f"{base}.com",
+            f"{base}.io",
+            f"{base}.net",
+            f"{base}-project.com",
+        ):
+            if host not in hosts:
+                hosts.append(host)
+        for host in hosts:
+            for path in ("/dl/", "/download/", "/downloads/", "/"):
+                url = f"https://{host}{path}"
+                if url not in urls:
+                    urls.append(url)
+                if len(urls) >= limit:
+                    return urls
+    return urls
+
+
+def _fallback_browser_search_url(
+    text: str,
+    *,
+    excluded_queries: list[str] | set[str] | None = None,
+) -> str | None:
+    product_keywords = _prompt_keyword_candidates(text, limit=4)
+    if not product_keywords:
+        return None
     return _fallback_browser_search_url_from_parts(
-        _prompt_keyword_candidates(text, limit=4),
+        [
+            *product_keywords,
+            *_search_platform_hint_keywords(text, limit=4),
+            *_search_locale_hint_keywords(text, limit=2),
+        ],
         _extract_prompt_urls(text),
+        excluded_queries=excluded_queries,
     )
 
 
@@ -7814,36 +8820,402 @@ def _fallback_browser_search_url_for_request(
 ) -> str | None:
     last_execution_payload = dict(request.last_execution.get("payload_metadata") or {})
     last_execution_code = str(last_execution_payload.get("executed_python_code") or "")
+    prompt_for_search = _strip_replan_diagnostic_summaries(str(request.user_prompt or ""))
+    excluded_queries = _failed_search_queries_for_request(request)
     source_keywords: list[str] = []
     source_urls: list[str] = []
 
-    for keyword in extra_targets or []:
+    explicit_retry_keywords = _explicit_retry_search_keywords(prompt_for_search, limit=6)
+    for keyword in explicit_retry_keywords:
         cleaned = str(keyword or "").strip()
         if cleaned and cleaned not in source_keywords:
             source_keywords.append(cleaned)
 
-    explicit_installer = _extract_prompt_download_glob(request.user_prompt or "")
-    if explicit_installer:
-        source_keywords.extend(_installer_filename_keywords(explicit_installer, limit=4))
+    if not explicit_retry_keywords:
+        for keyword in extra_targets or []:
+            cleaned = str(keyword or "").strip()
+            if cleaned and cleaned not in source_keywords:
+                source_keywords.append(cleaned)
 
-    for pattern in (
-        r"from this task:\s*(.+?)(?:\.\s|\n|$)",
-        r"source task:\s*(.+?)(?:\.\s|\n|$)",
-        r"source_task\"\s*:\s*\"(.+?)\"",
-    ):
-        for match in re.finditer(pattern, str(request.user_prompt or ""), flags=re.IGNORECASE):
-            source_keywords.extend(_prompt_keyword_candidates(match.group(1), limit=4))
+    if not explicit_retry_keywords:
+        explicit_installer = _extract_prompt_download_glob(prompt_for_search)
+        if explicit_installer:
+            source_keywords.extend(_installer_filename_keywords(explicit_installer, limit=4))
 
-    source_keywords.extend(_expected_title_tokens_from_code(last_execution_code))
+        for pattern in (
+            r"from this task:\s*(.+?)(?:[.,]\s|\n|$)",
+            r"source task:\s*(.+?)(?:[.,]\s|\n|$)",
+            r"source_task\"\s*:\s*\"(.+?)\"",
+        ):
+            for match in re.finditer(pattern, prompt_for_search, flags=re.IGNORECASE):
+                source_keywords.extend(_prompt_keyword_candidates(match.group(1), limit=4))
+
+        source_keywords.extend(_expected_title_tokens_from_code(last_execution_code))
 
     if prompt_url:
         source_urls.append(prompt_url)
-    source_urls.extend(_extract_prompt_urls(request.user_prompt or ""))
+    source_urls.extend(_extract_prompt_urls(prompt_for_search))
     source_urls.extend(_extract_prompt_urls(last_execution_code))
 
+    if not source_keywords:
+        for keyword in _visible_flow_extra_targets(request, limit=4):
+            cleaned = str(keyword or "").strip()
+            if cleaned and cleaned not in source_keywords:
+                source_keywords.append(cleaned)
+    if source_keywords:
+        for keyword in _search_platform_hint_keywords(prompt_for_search, limit=4):
+            if keyword not in source_keywords:
+                source_keywords.append(keyword)
+        for keyword in _search_locale_hint_keywords(prompt_for_search, limit=2):
+            if keyword not in source_keywords:
+                source_keywords.append(keyword)
+
     if not source_keywords and not source_urls and not request.replan_requested:
-        return _fallback_browser_search_url(request.user_prompt)
-    return _fallback_browser_search_url_from_parts(source_keywords, source_urls)
+        return _fallback_browser_search_url(prompt_for_search, excluded_queries=excluded_queries)
+    return _fallback_browser_search_url_from_parts(
+        source_keywords,
+        source_urls,
+        excluded_queries=excluded_queries,
+    )
+
+
+def _search_query_from_url(url: str) -> str:
+    try:
+        parsed = urllib.parse.urlparse(str(url or "").strip())
+    except ValueError:
+        return ""
+    query_map = urllib.parse.parse_qs(str(parsed.query or ""), keep_blank_values=False)
+    values = query_map.get("q") or query_map.get("query") or query_map.get("p") or []
+    if not values:
+        return ""
+    return urllib.parse.unquote_plus(str(values[0] or "")).strip()
+
+
+def _search_url_validation_error(
+    url: str,
+    target_terms: list[str],
+    *,
+    max_query_chars: int = 80,
+    max_query_terms: int = 7,
+    excluded_queries: list[str] | set[str] | None = None,
+) -> str | None:
+    raw_url = str(url or "").strip()
+    if not raw_url:
+        return "missing_url"
+    try:
+        parsed = urllib.parse.urlparse(raw_url)
+    except ValueError:
+        return "invalid_url"
+    host = str(parsed.netloc or "").lower()
+    if parsed.scheme not in {"http", "https"} or not host:
+        return "invalid_url"
+    if not any(token in host for token in ("google.", "bing.", "duckduckgo.", "yahoo.", "naver.", "daum.")):
+        return "not_search_url"
+    query_text = _search_query_from_url(raw_url)
+    if not query_text:
+        return "missing_query"
+    normalized_query = _normalize_search_query_text(query_text)
+    if normalized_query:
+        excluded_normalized = {
+            _normalize_search_query_text(query)
+            for query in (excluded_queries or [])
+            if _normalize_search_query_text(query)
+        }
+        excluded_fingerprints = {
+            _search_query_fingerprint(query)
+            for query in (excluded_queries or [])
+            if _search_query_fingerprint(query)
+        }
+        if normalized_query in excluded_normalized or _search_query_fingerprint(normalized_query) in excluded_fingerprints:
+            return "repeated_query"
+    query_terms = [term for term in re.split(r"\s+", query_text.strip()) if term]
+    if len(query_text) > max_query_chars or len(query_terms) > max_query_terms:
+        return "query_too_long"
+    compact_query = re.sub(r"[^a-z0-9가-힣]+", "", query_text.lower())
+    required_terms = [
+        re.sub(r"[^a-z0-9가-힣]+", "", str(term or "").lower())
+        for term in target_terms
+        if str(term or "").strip()
+    ]
+    required_terms = [
+        term
+        for term in required_terms
+        if len(term) >= (2 if re.search(r"[가-힣]", term) else 3)
+    ]
+    if required_terms and not any(term in compact_query for term in required_terms):
+        return "missing_target_keyword"
+    if not _prompt_keyword_candidates(query_text, limit=4):
+        return "generic_query_only"
+    return None
+
+
+def _extract_search_url_from_model_text(text: str) -> str | None:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return None
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict):
+        for key in ("search_url", "url", "query_url"):
+            value = payload.get(key)
+            if value:
+                return str(value).strip()
+    match = re.search(r"https?://[^\s'\"`)>]+", stripped)
+    if match:
+        return str(match.group(0) or "").strip().rstrip(".,;:])}>")
+    return None
+
+
+def _fallback_replan_search_url_for_terms(
+    target_terms: list[str],
+    *,
+    alternate_domain_hint: bool = False,
+    excluded_queries: list[str] | set[str] | None = None,
+) -> str | None:
+    keywords = []
+    for keyword in target_terms:
+        cleaned = str(keyword or "").strip().lower()
+        if cleaned and cleaned not in keywords:
+            keywords.append(cleaned)
+    if not keywords:
+        return None
+    fallback_terms = [*keywords[:2], "windows"]
+    if alternate_domain_hint:
+        fallback_terms.extend(["kr", "global"])
+    return _fallback_browser_search_url_from_parts(
+        fallback_terms,
+        [],
+        excluded_queries=excluded_queries,
+    )
+
+
+def _should_prefer_alternate_replan_search(request: StepRequest) -> bool:
+    if not bool(request.replan_requested):
+        return False
+    if any(
+        reason in {
+            "no_visible_download_candidates",
+            "download_url_404",
+            "guessed_artifact_url_404",
+            "installer_url_not_found",
+        }
+        for reason in (request.replan_reasons or [])
+    ):
+        return True
+    combined = "\n".join(
+        str((request.last_execution or {}).get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    ).lower()
+    return any(
+        marker in combined
+        for marker in (
+            "no visible download",
+            "no clickable candidates",
+            "download related fallback found no clickable candidates",
+            "download failed:",
+            "http error 404",
+            "404: not found",
+            "failed to find download url",
+            "no download url found",
+        )
+    )
+
+
+def _preferred_alternate_replan_search_url(
+    target_terms: list[str],
+    *,
+    excluded_queries: list[str] | set[str] | None = None,
+) -> str | None:
+    for url in _fallback_alternate_search_urls_from_parts(
+        target_terms,
+        excluded_queries=excluded_queries,
+    ):
+        if (
+            _search_url_validation_error(
+                url,
+                target_terms,
+                max_query_chars=96,
+                max_query_terms=8,
+                excluded_queries=excluded_queries,
+            )
+            is None
+        ):
+            return url
+    return None
+
+
+def _generate_validated_replan_search_url(
+    *,
+    runtime: AgentRuntime,
+    request: StepRequest,
+    target_terms: list[str],
+    root: Path,
+    step_id: str,
+) -> str | None:
+    clean_terms = []
+    for keyword in target_terms:
+        cleaned = str(keyword or "").strip().lower()
+        if cleaned and cleaned not in clean_terms:
+            clean_terms.append(cleaned)
+    if not clean_terms:
+        return None
+
+    excluded_queries = _failed_search_queries_for_request(request)
+    feedback: list[str] = []
+    attempts: list[dict[str, Any]] = []
+    attempt_counter = 0
+    max_model_attempts = 2
+
+    preferred_alternate_url = (
+        _preferred_alternate_replan_search_url(clean_terms, excluded_queries=excluded_queries)
+        if _should_prefer_alternate_replan_search(request)
+        else None
+    )
+    if preferred_alternate_url:
+        attempts.append(
+            {
+                "attempt": "preferred_alternate_search",
+                "candidate": preferred_alternate_url,
+                "error": None,
+                "reason": "previous_download_search_failed",
+            }
+        )
+        _write_json(
+            root / "responses" / f"{step_id}.replan-search-url.json",
+            {"attempts": attempts, "selected": preferred_alternate_url},
+        )
+        return preferred_alternate_url
+
+    attempt_plans = (
+        {
+            "stage": "primary",
+            "attempts": 2,
+            "constraints": [
+                "Return JSON only: {\"search_url\":\"https://www.google.com/search?q=...\"}",
+                "The q query must include at least one target term exactly.",
+                "Use at most 7 query terms and keep the query short.",
+                "Do not use diagnostic words such as not, execution, path, download-like, official, or generic retry text as the product query.",
+            ],
+            "max_query_chars": 80,
+            "max_query_terms": 7,
+        },
+        {
+            "stage": "secondary_alt_tld",
+            "attempts": 2,
+            "constraints": [
+                "Return JSON only: {\"search_url\":\"https://www.google.com/search?q=...\"}",
+                "The q query must include at least one target term exactly.",
+                "Build a different retry query than the primary attempt by adding a country code or alternate top-level-domain hint.",
+                "Use one hint such as kr, ko, jp, de, fr, eu, global, intl, or a single site:*.tld filter.",
+                "Keep the query compact and avoid generic diagnostic wording.",
+            ],
+            "max_query_chars": 96,
+            "max_query_terms": 8,
+        },
+    )
+
+    for plan in attempt_plans:
+        for local_index in range(int(plan["attempts"])):
+            if attempt_counter >= max_model_attempts:
+                break
+            user_payload = {
+                "task": request.user_prompt[:1600],
+                "target_terms": clean_terms[:4],
+                "retry_stage": plan["stage"],
+                "constraints": list(plan["constraints"]),
+                "previous_failed_queries": excluded_queries[:8],
+                "previous_invalid_feedback": feedback,
+            }
+            generated = runtime.generate_text(
+                prompt_bundle=PromptBundle(
+                    system_prompt=(
+                        "You produce one browser search URL for retrying a Windows software download task. "
+                        "Output strict JSON only. Do not explain."
+                    ),
+                    user_prompt=json.dumps(user_payload, ensure_ascii=False, indent=2),
+                    session_prompt=request.user_prompt,
+                    policy=request.policy,
+                    execution_style=request.execution_style,
+                    reasoning_enabled=False,
+                    observation_text=None,
+                    last_execution=request.last_execution,
+                    web_search_context={},
+                    recent_history=[],
+                    replan_requested=request.replan_requested,
+                    replan_reasons=request.replan_reasons,
+                ),
+                use_blank_image=True,
+                max_new_tokens=96,
+                generation_context=_make_generation_context(
+                    run_dir=root,
+                    step_id=f"{step_id}.replan-search-url-{attempt_counter:02d}",
+                    request_kind="replan_search_url",
+                    step_index=request.step_index,
+                ),
+            )
+            candidate = _extract_search_url_from_model_text(generated.text)
+            error = _search_url_validation_error(
+                candidate or "",
+                clean_terms,
+                max_query_chars=int(plan["max_query_chars"]),
+                max_query_terms=int(plan["max_query_terms"]),
+                excluded_queries=excluded_queries,
+            )
+            attempts.append(
+                {
+                    "attempt": attempt_counter,
+                    "stage": plan["stage"],
+                    "local_attempt": local_index,
+                    "model_id": generated.model_id,
+                    "raw_text": generated.text,
+                    "candidate": candidate,
+                    "error": error,
+                }
+            )
+            if error is None and candidate:
+                _write_json(root / "responses" / f"{step_id}.replan-search-url.json", {"attempts": attempts, "selected": candidate})
+                return candidate
+            feedback.append(
+                f"Invalid URL: {error}. Regenerate a short Google search URL including one of {', '.join(clean_terms[:4])} and do not reuse any exact failed query."
+            )
+            attempt_counter += 1
+        if attempt_counter >= max_model_attempts:
+            break
+
+    fallback_url = _fallback_replan_search_url_for_terms(
+        clean_terms,
+        alternate_domain_hint=False,
+        excluded_queries=excluded_queries,
+    )
+    fallback_error = _search_url_validation_error(
+        fallback_url or "",
+        clean_terms,
+        excluded_queries=excluded_queries,
+    )
+    attempts.append({"attempt": "fallback_primary", "candidate": fallback_url, "error": fallback_error})
+    if fallback_error is None and fallback_url:
+        _write_json(root / "responses" / f"{step_id}.replan-search-url.json", {"attempts": attempts, "selected": fallback_url})
+        return fallback_url
+    secondary_fallback_url = _fallback_replan_search_url_for_terms(
+        clean_terms,
+        alternate_domain_hint=True,
+        excluded_queries=excluded_queries,
+    )
+    secondary_fallback_error = _search_url_validation_error(
+        secondary_fallback_url or "",
+        clean_terms,
+        max_query_chars=96,
+        max_query_terms=8,
+        excluded_queries=excluded_queries,
+    )
+    attempts.append({"attempt": "fallback_secondary_alt_tld", "candidate": secondary_fallback_url, "error": secondary_fallback_error})
+    _write_json(
+        root / "responses" / f"{step_id}.replan-search-url.json",
+        {"attempts": attempts, "selected": secondary_fallback_url if secondary_fallback_error is None else None},
+    )
+    return secondary_fallback_url if secondary_fallback_error is None else None
 
 
 def _last_execution_opened_search_results(last_execution: dict[str, Any]) -> bool:
@@ -7961,6 +9333,8 @@ def _looks_like_gui_first_download_chunk_install_mix(request: StepRequest, code:
 def _looks_like_gui_first_download_chunk_network_bypass(request: StepRequest, code: str) -> bool:
     if str(request.execution_style or "python_first").lower() != "gui_first":
         return False
+    if _looks_like_launch_app_chunk_task(request.user_prompt) or _looks_like_existing_installer_launch_task(request.user_prompt):
+        return False
     if not _looks_like_download_artifact_only_chunk(request.user_prompt):
         return False
     normalized = _normalize_python_code(code).lower()
@@ -8036,10 +9410,13 @@ def _looks_like_download_chunk_completed(*, user_prompt: str, last_execution: di
         "downloaded:",
         "downloaded successfully:",
         "download ready:",
+        "download ready after visible click:",
         "download recovered from official page:",
+        "download recovered from official page after stalled click:",
         "existing installer found:",
         "using existing installer:",
         "using context installer:",
+        "using previously downloaded artifact:",
     )
     if not any(marker in combined for marker in success_markers):
         return False
@@ -8105,6 +9482,17 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         "cues",
         "search-result",
         "retry",
+        "not",
+        "execution",
+        "execution-path",
+        "path",
+        "artifact",
+        "vendor",
+        "keep",
+        "following",
+        "instead",
+        "restarting",
+        "scratch",
         "verifier",
         "evidence",
         "pattern",
@@ -8115,7 +9503,18 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         "logic",
         "regex",
         "regex-based",
+        "executor-side",
+        "text-click",
+        "ocr_screen_text_regions",
+        "open_responsive_header_menu",
+        "keyboard-navigate",
+        "estimate",
+        "wait",
         "direct-download",
+        "download-only",
+        "download-like",
+        "install-like",
+        "installer-like",
         "discovery",
         "impossible",
         "grounded",
@@ -8139,6 +9538,7 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         "focus",
         "activate",
         "executable",
+        "obtain",
         "python",
         "only",
         "chunk",
@@ -8151,6 +9551,24 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         "current",
         "target",
         "machine",
+        "read",
+        "reading",
+        "soft",
+        "continuity",
+        "file",
+        "files",
+        "exist",
+        "exists",
+        "they",
+        "reuse",
+        "reused",
+        "marker",
+        "markers",
+        "valid",
+        "validation",
+        "validate",
+        "trust",
+        "ignore",
         "community",
         "https",
         "http",
@@ -8159,13 +9577,23 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         "net",
         "org",
         "pc",
+        "kr",
+        "ko",
+        "kor",
+        "korea",
         "page",
         "pages",
         "html",
         "link",
         "links",
         "url",
+        "urls",
         "prompt",
+        "original",
+        "preserve",
+        "term",
+        "terms",
+        "end",
         "from",
         "into",
         "task",
@@ -8222,6 +9650,9 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         "launch",
         "launched",
         "launching",
+        "run",
+        "running",
+        "silently",
         "finish",
         "finished",
         "complete",
@@ -8231,7 +9662,39 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         "buttons",
         "설치",
         "설치해줘",
+        "설치해",
+        "설치파일",
         "다운로드",
+        "다운로드해",
+        "다운로드해줘",
+        "다운받아",
+        "다운받아줘",
+        "내려받아",
+        "내려받아줘",
+        "해줘",
+        "해주세요",
+        "가능한",
+        "에서",
+        "에서는",
+        "으로",
+        "으로는",
+        "에게",
+        "에게는",
+        "한테",
+        "한테는",
+        "까지",
+        "부터",
+        "보다",
+        "처럼",
+        "라고",
+        "이라",
+        "코드만",
+        "수행하세요",
+        "현재",
+        "스크린샷",
+        "검색",
+        "결과",
+        "보입니다",
         "프로그램",
         "프로그램을",
         "버전",
@@ -8276,6 +9739,19 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         "completion",
         "advance",
         "script",
+        "bookmark",
+        "bookmarks",
+        "북마크",
+        "해줘",
+        "해주세요",
+        "다운로드해줘",
+        "다운받아줘",
+        "내려받아줘",
+        "다운로드해",
+        "다운받아",
+        "내려받아",
+        "cancel",
+        "취소",
         "repeat",
         "launch-and-scan",
         "verysilent",
@@ -8285,7 +9761,25 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         "ctypes",
         "psutil",
         "click",
+        "avoid",
+        "locate",
+        "save",
+        "preconditions",
+        "home",
+        "edition",
+        "site",
+        "choose",
+        "coordinates",
+        "coordinate",
+        "plausible",
+        "non-trivial",
+        "size",
+        "keyboard",
+        "guessing",
+        "retrying",
+        "cancel",
     }
+    search_query_params = ("q", "query", "p", "text", "keyword", "keywords")
     korean_particle_suffixes = (
         "으로는",
         "에서는",
@@ -8317,21 +9811,158 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     candidate_words: list[str] = []
+    protected_product_words: set[str] = set()
+
+    comma_list_tokens = re.findall(r"[a-z0-9가-힣][a-z0-9가-힣._-]*", raw_text.lower())
+    if (
+        "," in raw_text
+        and len(raw_text) <= 120
+        and len(comma_list_tokens) <= 8
+        and not re.search(r"\b(using|return|open|download|only|current|previous)\b", raw_text, flags=re.IGNORECASE)
+    ):
+        for raw_token in comma_list_tokens:
+            cleaned_token = raw_token.strip("._-")
+            if (
+                not cleaned_token
+                or cleaned_token in {"for", "of", "with", "and", "the"}
+                or cleaned_token in {"download", "downloads", "install", "installer", "setup", "official", "windows"}
+                or cleaned_token.isdigit()
+                or (len(cleaned_token) < 2 and re.search(r"[가-힣]", cleaned_token) is None)
+            ):
+                continue
+            protected_product_words.add(cleaned_token)
+            candidate_words.append(cleaned_token)
+
+    def _product_phrase_keyword_candidates(value: str) -> list[str]:
+        task_prefix = re.split(
+            r"(?:설치|다운로드|실행|프로그램|install|download|launch|run)\b",
+            str(value or ""),
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        raw_tokens = re.findall(r"[A-Za-z0-9가-힣]+", task_prefix)
+        if len(raw_tokens) < 2:
+            return []
+        has_product_case = any(
+            (token.isupper() and len(token) <= 5)
+            or (any(ch.isupper() for ch in token) and any(ch.islower() for ch in token))
+            for token in raw_tokens
+        )
+        has_connector = any(token.lower() in {"for", "of", "with", "and"} for token in raw_tokens)
+        if not (has_product_case or has_connector):
+            return []
+        phrase_words: list[str] = []
+        for raw_token in raw_tokens:
+            lowered = str(raw_token or "").lower().strip("._-")
+            if not lowered or lowered in {"for", "of", "with", "and", "the"}:
+                continue
+            if lowered in stop_words and lowered != "browser":
+                continue
+            if lowered.isdigit():
+                continue
+            if re.search(r"[가-힣]", lowered) is None and len(lowered) <= 2 and not raw_token.isupper():
+                continue
+            if lowered not in phrase_words:
+                phrase_words.append(lowered)
+        return phrase_words
+
+    def _clean_task_keyword_token(value: str) -> str:
+        cleaned = str(value or "").strip().lower().strip("._-")
+        if not cleaned:
+            return ""
+        command_suffixes = (
+            "설치해주세요",
+            "다운로드해주세요",
+            "다운받아주세요",
+            "내려받아주세요",
+            "설치해줘",
+            "다운로드해줘",
+            "다운받아줘",
+            "내려받아줘",
+            "설치해",
+            "다운로드해",
+            "다운받아",
+            "내려받아",
+            "설치",
+            "다운로드",
+            "해줘",
+            "해주세요",
+        )
+        changed = True
+        while changed:
+            changed = False
+            for suffix in command_suffixes:
+                if cleaned.endswith(suffix) and len(cleaned) > len(suffix):
+                    cleaned = cleaned[: -len(suffix)].strip("._- ")
+                    changed = True
+                    break
+        if cleaned in {"kr", "ko", "kor", "korea", "korean", "한국", "한국어", "한글"}:
+            return ""
+        return cleaned
+
     task_segments: list[str] = []
     for pattern in (
-        r"from this task:\s*(.+?)(?:\.\s|\n|$)",
-        r"source task:\s*(.+?)(?:\.\s|\n|$)",
+        r"from this task:\s*(.+?)(?:[.,]\s|\n|$)",
+        r"source task:\s*(.+?)(?:[.,]\s|\n|$)",
         r"source_task\"\s*:\s*\"(.+?)\"",
+        r"original task target terms to preserve:\s*(.+?)(?:[.\n]|$)",
+        r"original target terms to preserve:\s*(.+?)(?:[.\n]|$)",
     ):
         task_segments.extend(match.group(1) for match in re.finditer(pattern, raw_text, flags=re.IGNORECASE))
     task_candidate_words: list[str] = []
     for segment in task_segments:
+        phrase_words = _product_phrase_keyword_candidates(segment)
+        protected_product_words.update(phrase_words)
+        task_candidate_words.extend(phrase_words)
         task_candidate_words.extend(re.findall(r"[a-z0-9가-힣][a-z0-9가-힣._-]{1,}", segment.lower()))
     if task_candidate_words:
         candidate_words.extend(task_candidate_words)
+    text_without_urls = re.sub(r"https?://\S+", " ", raw_text)
+    for prompt_url in _extract_prompt_urls(raw_text):
+        parsed_prompt_url = urllib.parse.urlparse(prompt_url)
+        host = str(parsed_prompt_url.netloc or "").lower()
+        if host:
+            text_without_urls = re.sub(rf"(?<![@:/\w.-]){re.escape(host)}(?:/[^\s'\"`<>()\]]*)?", " ", text_without_urls, flags=re.IGNORECASE)
+    if not re.match(r"\s*(return|replan|use|using|continue|prefer)\b", text_without_urls, flags=re.IGNORECASE):
+        phrase_words = _product_phrase_keyword_candidates(text_without_urls)
+        protected_product_words.update(phrase_words)
+        candidate_words.extend(phrase_words)
+    product_case_words: list[str] = []
+    for match in re.finditer(r"\b[A-Za-z][A-Za-z0-9._-]{1,}\b", text_without_urls):
+        token = str(match.group(0) or "").strip()
+        lowered_token = token.lower().strip("._-")
+        if not lowered_token or lowered_token in stop_words:
+            continue
+        has_lower = any(ch.islower() for ch in token)
+        has_upper = any(ch.isupper() for ch in token)
+        has_digit = any(ch.isdigit() for ch in token)
+        is_acronym = token.isupper() and 2 <= len(token) <= 5
+        if not ((has_lower and has_upper) or (has_digit and has_upper) or is_acronym):
+            continue
+        if lowered_token not in product_case_words:
+            product_case_words.append(lowered_token)
+    candidate_words.extend(product_case_words)
+    korean_candidate_words = re.findall(r"[가-힣][가-힣0-9._-]{1,}", text_without_urls)
+    candidate_words.extend(korean_candidate_words)
+    if korean_candidate_words:
+        candidate_words.extend(word for word in words if re.search(r"[a-z0-9]", word))
     url_candidate_words: list[str] = []
     for url in _extract_prompt_urls(text):
         parsed = urllib.parse.urlparse(str(url))
+        if _url_looks_like_search_results(url):
+            query_map = urllib.parse.parse_qs(str(parsed.query or ""), keep_blank_values=False)
+            extracted_from_query = False
+            for key in search_query_params:
+                for value in query_map.get(key, []):
+                    decoded = urllib.parse.unquote_plus(str(value or ""))
+                    query_words = re.findall(r"[a-z0-9가-힣][a-z0-9가-힣._-]{1,}", decoded.lower())
+                    if query_words:
+                        url_candidate_words.extend(query_words)
+                        extracted_from_query = True
+                if extracted_from_query:
+                    break
+            if extracted_from_query:
+                continue
         host = str(parsed.netloc or "").lower()
         host_parts = [
             part
@@ -8351,7 +9982,7 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
     if not candidate_words:
         candidate_words.extend(words)
     for word in candidate_words:
-        cleaned = word.strip("._-")
+        cleaned = _clean_task_keyword_token(word)
         if not cleaned or cleaned[0].isdigit():
             continue
         if re.search(r"[가-힣]", cleaned):
@@ -8360,7 +9991,9 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
                     cleaned = cleaned[: -len(suffix)]
                     break
         min_len = 2 if re.search(r"[가-힣]", cleaned) else 3
-        if len(cleaned) < min_len or cleaned in stop_words or cleaned in seen:
+        if len(cleaned) < min_len and cleaned not in protected_product_words:
+            continue
+        if (cleaned in stop_words and cleaned not in protected_product_words) or cleaned in seen:
             continue
         if cleaned.startswith(("targetapp-", "downloads-", "userprofile-")):
             continue
@@ -8371,6 +10004,44 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         if len(result) >= limit:
             break
     return result
+
+
+def _is_low_signal_target_keyword(value: str) -> bool:
+    cleaned = str(value or "").strip().lower().strip("._-")
+    if not cleaned:
+        return True
+    if cleaned in {
+        "kr",
+        "ko",
+        "kor",
+        "korea",
+        "korean",
+        "한국",
+        "한국어",
+        "한글",
+        "bit",
+        "bits",
+        "32bit",
+        "64bit",
+        "sponsored",
+        "sponsor",
+        "sponsors",
+        "sponsorship",
+        "offer",
+        "offers",
+        "bundle",
+        "bundled",
+    }:
+        return True
+    if re.fullmatch(r"(?:32|64)(?:bit)?", cleaned):
+        return True
+    if re.fullmatch(r"(?:win|x|arm|amd)?\d{2,4}(?:bit)?", cleaned):
+        return True
+    if re.fullmatch(r"sponsored\d*", cleaned):
+        return True
+    if re.fullmatch(r"(?:kr|ko|kor|korea)?(?:설치|설치해줘|다운로드|다운로드해줘|다운받아줘|내려받아줘)", cleaned):
+        return True
+    return False
 
 
 def _installer_filename_keywords(value: str, *, limit: int = 4) -> list[str]:
@@ -8410,6 +10081,8 @@ def _installer_filename_keywords(value: str, *, limit: int = 4) -> list[str]:
         cleaned = token.strip("._-")
         if not cleaned or cleaned in generic or cleaned in result:
             continue
+        if _is_low_signal_target_keyword(cleaned):
+            continue
         if cleaned.isdigit() or re.fullmatch(r"v?\d+(?:\d+)?", cleaned):
             continue
         min_len = 2 if re.search(r"[가-힣]", cleaned) else 2
@@ -8428,6 +10101,63 @@ def _installer_filename_keywords(value: str, *, limit: int = 4) -> list[str]:
         if len(result) >= limit:
             break
     return result
+
+
+def _string_list_assignment_values(code: str, names: tuple[str, ...]) -> list[str]:
+    result: list[str] = []
+    if not code or not names:
+        return result
+    name_pattern = "|".join(re.escape(name) for name in names)
+    for match in re.finditer(rf"\b(?:{name_pattern})\s*=\s*(\[[^\]]*\])", str(code), flags=re.S):
+        try:
+            parsed = ast.literal_eval(match.group(1))
+        except (SyntaxError, ValueError):
+            continue
+        if not isinstance(parsed, (list, tuple)):
+            continue
+        for item in parsed:
+            cleaned = str(item or "").strip().lower()
+            if cleaned and cleaned not in result:
+                result.append(cleaned)
+    return result
+
+
+def _explicit_retry_search_keywords(text: str, *, limit: int = 6) -> list[str]:
+    results: list[str] = []
+    for pattern in (
+        r"keep these exact task/product keywords in the query:\s*(.+?)(?:[.\n]|$)",
+        r"preserve these exact task/product keywords in the query:\s*(.+?)(?:[.\n]|$)",
+    ):
+        for match in re.finditer(pattern, str(text or ""), flags=re.IGNORECASE):
+            for keyword in _prompt_keyword_candidates(str(match.group(1) or ""), limit=limit):
+                if keyword not in results:
+                    results.append(keyword)
+                if len(results) >= limit:
+                    return results
+    return results
+
+
+def _strip_replan_diagnostic_summaries(text: str) -> str:
+    cleaned = str(text or "")
+    for marker in ("Previous stdout summary:", "Previous stderr summary:"):
+        while marker in cleaned:
+            start = cleaned.find(marker)
+            next_candidates = [
+                pos
+                for token in (
+                    "\nPrevious stdout summary:",
+                    "\nPrevious stderr summary:",
+                    "\nUse the existing",
+                    "\nIf ",
+                    "\nEnd ",
+                    "\nOnly ",
+                )
+                for pos in [cleaned.find(token, start + len(marker))]
+                if pos >= 0
+            ]
+            end = min(next_candidates) if next_candidates else len(cleaned)
+            cleaned = cleaned[:start] + "\n" + cleaned[end:]
+    return cleaned
 
 
 def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) -> list[str]:
@@ -8460,6 +10190,7 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
         "requests",
         "regex-based",
         "direct-download",
+        "download-only",
         "discovery",
         "stabilize",
         "clearly",
@@ -8476,19 +10207,57 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
         "normal-gui",
         "launching",
         "launch",
+        "run",
+        "running",
         "helper",
         "helpers",
+        "artifact",
+        "vendor",
+        "keep",
+        "following",
+        "instead",
+        "restarting",
+        "scratch",
         "such",
         "click",
         "target",
         "targets",
+        "keyword",
+        "keywords",
+        "original",
+        "preserve",
+        "term",
+        "terms",
+        "model",
+        "ui",
+        "local",
+        "visual",
+        "extraction",
+        "candidate",
+        "candidates",
+        "these",
+        "come",
+        "below",
+        "schema",
+        "json",
+        "url",
+        "urls",
+        "end",
         "text",
+        "project",
         "click-download-like-target",
         "click-text-targets",
         "click-search-result-like-target",
         "click_download_like_target",
         "click_text_targets",
         "click_search_result_like_target",
+        "executor-side",
+        "text-click",
+        "keyboard-navigate",
+        "estimate",
+        "wait",
+        "ocr_screen_text_regions",
+        "open_responsive_header_menu",
         "pyautogui",
         "pygetwindow",
         "psutil",
@@ -8499,6 +10268,8 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
         "win32api",
         "pythoncom",
         "python",
+        "executable",
+        "obtain",
         "code",
         "chunk",
         "screenshot",
@@ -8531,27 +10302,132 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
         "launch-and-scan",
         "verysilent",
         "silent",
+        "starting",
+        "flow",
+        "installer_path",
+        "source_url",
+        "target_keywords",
+        "silently",
+        "plausible",
+        "non-trivial",
+        "size",
+        "kr",
+        "ko",
+        "kor",
+        "korea",
+        "korean",
+        "한국",
+        "한국어",
+        "한글",
+        "에서",
+        "에서는",
+        "으로",
+        "으로는",
+        "에게",
+        "에게는",
+        "한테",
+        "한테는",
+        "까지",
+        "부터",
+        "보다",
+        "처럼",
+        "라고",
+        "이라",
     }
     merged: list[str] = []
+    authoritative_keywords: list[str] = []
 
-    def _append_keyword(keyword: str) -> bool:
+    def _keyword_roots(keyword: str) -> list[str]:
+        cleaned = str(keyword or "").strip().lower().strip("._-")
+        if not cleaned:
+            return []
+        roots = [cleaned]
+        alpha_prefix = re.sub(r"\d+$", "", cleaned)
+        if alpha_prefix and alpha_prefix != cleaned:
+            roots.append(alpha_prefix)
+        deduped: list[str] = []
+        for item in roots:
+            if item and item not in deduped:
+                deduped.append(item)
+        return deduped
+
+    def _keyword_matches_authoritative(keyword: str) -> bool:
+        authoritative_ascii = [
+            item for item in authoritative_keywords if re.search(r"[a-z]", str(item or ""))
+        ]
+        if not authoritative_ascii:
+            return True
+        keyword_roots = _keyword_roots(keyword)
+        authoritative_roots: list[str] = []
+        for item in authoritative_ascii:
+            for root in _keyword_roots(item):
+                if root not in authoritative_roots:
+                    authoritative_roots.append(root)
+        for candidate in keyword_roots:
+            for authoritative in authoritative_roots:
+                if (
+                    candidate == authoritative
+                    or candidate in authoritative
+                    or authoritative in candidate
+                ):
+                    return True
+        return False
+
+    def _append_keyword(
+        keyword: str,
+        *,
+        authoritative: bool = False,
+        supplemental: bool = False,
+        keep_generic: bool = False,
+    ) -> bool:
         cleaned = str(keyword or "").strip().lower()
-        if not cleaned or cleaned in generic_workflow_keywords or cleaned in merged:
+        command_suffixes = (
+            "설치해주세요",
+            "다운로드해주세요",
+            "다운받아주세요",
+            "내려받아주세요",
+            "설치해줘",
+            "다운로드해줘",
+            "다운받아줘",
+            "내려받아줘",
+            "설치해",
+            "다운로드해",
+            "다운받아",
+            "내려받아",
+            "설치",
+            "다운로드",
+            "해줘",
+            "해주세요",
+        )
+        changed = True
+        while changed:
+            changed = False
+            for suffix in command_suffixes:
+                if cleaned.endswith(suffix) and len(cleaned) > len(suffix):
+                    cleaned = cleaned[: -len(suffix)].strip("._- ")
+                    changed = True
+                    break
+        if (
+            not cleaned
+            or (cleaned in generic_workflow_keywords and not keep_generic)
+            or _is_low_signal_target_keyword(cleaned)
+            or cleaned in merged
+        ):
+            return False
+        if supplemental and not _keyword_matches_authoritative(cleaned):
             return False
         merged.append(cleaned)
+        if authoritative and cleaned not in authoritative_keywords:
+            authoritative_keywords.append(cleaned)
         return len(merged) >= limit
 
-    explicit_installer = _extract_prompt_download_glob(request.user_prompt or "")
-    if explicit_installer:
-        for explicit_keyword in _installer_filename_keywords(explicit_installer, limit=limit):
-            explicit_cleaned = str(explicit_keyword or "").strip().lower()
-            if not explicit_cleaned or explicit_cleaned in merged:
-                continue
-            merged.append(explicit_cleaned)
-            if len(merged) >= limit:
-                return merged[:limit]
+    prompt_for_keywords = _strip_replan_diagnostic_summaries(str(request.user_prompt or ""))
     last_execution_payload = dict(request.last_execution.get("payload_metadata") or {})
     last_execution_code = str(last_execution_payload.get("executed_python_code") or "")
+    last_execution_target_terms = _string_list_assignment_values(
+        last_execution_code,
+        ("TARGET_TERMS", "target_terms", "TARGET_KEYWORDS", "target_keywords"),
+    )
     last_execution_title_tokens: list[str] = []
     for title_match in re.finditer(r"expected_title_tokens\s*=\s*\[(.*?)\]", last_execution_code, flags=re.S):
         for token_match in re.findall(r'"([^"]+)"|\'([^\']+)\'', str(title_match.group(1) or "")):
@@ -8560,16 +10436,18 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
                 last_execution_title_tokens.append(token)
     task_segments: list[str] = []
     for pattern in (
-        r"from this task:\s*(.+?)(?:\.\s|\n|$)",
-        r"source task:\s*(.+?)(?:\.\s|\n|$)",
+        r"from this task:\s*(.+?)(?:[.,]\s|\n|$)",
+        r"source task:\s*(.+?)(?:[.,]\s|\n|$)",
         r"source_task\"\s*:\s*\"(.+?)\"",
+        r"original task target terms to preserve:\s*(.+?)(?:[.\n]|$)",
+        r"original target terms to preserve:\s*(.+?)(?:[.\n]|$)",
     ):
         task_segments.extend(
             match.group(1)
-            for match in re.finditer(pattern, str(request.user_prompt or ""), flags=re.IGNORECASE)
+            for match in re.finditer(pattern, prompt_for_keywords, flags=re.IGNORECASE)
         )
     quoted_task_segments: list[str] = []
-    for match in re.finditer(r"`([^`]+)`", str(request.user_prompt or "")):
+    for match in re.finditer(r"`([^`]+)`", prompt_for_keywords):
         candidate = str(match.group(1) or "").strip()
         lowered = candidate.lower()
         if (
@@ -8589,26 +10467,50 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
         quoted_task_segments.append(candidate)
     for source_text in (
         " ".join(task_segments),
-        " ".join(quoted_task_segments),
         " ".join(last_execution_title_tokens),
-        _select_prompt_browser_url(request.user_prompt or "") or "",
-        _select_prompt_browser_url(last_execution_code) or "",
+    ):
+        for keyword in _prompt_keyword_candidates(str(source_text or ""), limit=limit):
+            if _append_keyword(keyword, authoritative=True, keep_generic=True):
+                return merged
+    for keyword in _prompt_keyword_candidates(" ".join(quoted_task_segments), limit=limit):
+        if _append_keyword(keyword, authoritative=True):
+            return merged
+    explicit_installer = _extract_prompt_download_glob(prompt_for_keywords)
+    if explicit_installer:
+        for explicit_keyword in _installer_filename_keywords(explicit_installer, limit=limit):
+            if _append_keyword(explicit_keyword, supplemental=True, keep_generic=True):
+                return merged
+    for keyword in last_execution_target_terms:
+        if _append_keyword(keyword, supplemental=True, keep_generic=True):
+            return merged[:limit]
+    prompt_urls_for_keywords = _extract_prompt_urls(prompt_for_keywords)
+    if merged and (
+        (request.replan_requested and not prompt_urls_for_keywords)
+        or (
+            prompt_for_keywords.lstrip().lower().startswith("replan override")
+            and not prompt_urls_for_keywords
+        )
+        or quoted_task_segments
+        or (explicit_installer and not prompt_urls_for_keywords and not task_segments)
+    ):
+        return merged[:limit]
+    prompt_without_urls = re.sub(r"https?://\S+", " ", prompt_for_keywords)
+    if not merged:
+        for keyword in _prompt_keyword_candidates(prompt_without_urls, limit=max(limit * 4, 12)):
+            if _append_keyword(keyword):
+                return merged
+    excluded_queries = _failed_search_queries_for_request(request)
+    for source_text in (
+        _select_prompt_browser_url(request.user_prompt or "", excluded_queries=excluded_queries) or "",
+        _select_prompt_browser_url(last_execution_code, excluded_queries=excluded_queries) or "",
     ):
         for keyword in _prompt_keyword_candidates(str(source_text or ""), limit=limit):
             if _append_keyword(keyword):
                 return merged
-    if merged and (
-        request.replan_requested
-        or str(request.user_prompt or "").lstrip().lower().startswith("replan override")
-        or quoted_task_segments
-        or (explicit_installer and not _extract_prompt_urls(request.user_prompt or "") and not task_segments)
-    ):
-        return merged[:limit]
-    prompt_without_urls = re.sub(r"https?://\S+", " ", str(request.user_prompt or ""))
     for keyword in _prompt_keyword_candidates(prompt_without_urls, limit=max(limit * 4, 12)):
         if _append_keyword(keyword):
             return merged
-    prompt_keywords = _prompt_keyword_candidates(str(request.user_prompt or ""), limit=max(limit * 4, 12))
+    prompt_keywords = _prompt_keyword_candidates(prompt_for_keywords, limit=max(limit * 4, 12))
     for keyword in prompt_keywords:
         if _append_keyword(keyword):
             return merged
@@ -8687,6 +10589,8 @@ def _looks_like_search_results_observation(request: StepRequest | None) -> bool:
             request.last_execution.get("stderr_tail"),
         )
     ).lower()
+    if "after opening a search result candidate" in combined:
+        return False
     if any(
         marker in combined
         for marker in (
@@ -8841,9 +10745,25 @@ def _looks_like_store_detour_generation(request: StepRequest, code: str) -> bool
 
 def _synthesized_official_download_recovery_code(*, user_prompt: str) -> str:
     prompt_urls = _extract_prompt_urls(user_prompt)
-    keyword_candidates = _prompt_keyword_candidates(user_prompt)
+    keyword_request = StepRequest(
+        user_prompt=user_prompt,
+        execution_style="gui_first",
+        replan_requested=str(user_prompt or "").lstrip().lower().startswith("replan override"),
+    )
+    keyword_candidates = _visible_flow_extra_targets(keyword_request, limit=8) or _prompt_keyword_candidates(user_prompt)
+    fallback_search_url = _fallback_browser_search_url_from_parts(keyword_candidates, prompt_urls)
+    primary_search_query = _search_query_from_url(fallback_search_url or "")
+    fallback_alternate_search_urls = _fallback_alternate_search_urls_from_parts(
+        keyword_candidates,
+        excluded_queries=[primary_search_query] if primary_search_query else None,
+    )
+    lucky_terms = [*keyword_candidates[:4], "download", "pc", "windows", "-site:apps.microsoft.com", "-microsoft", "store"]
+    allow_lucky_search = bool(keyword_candidates) and not re.search(r"[\uac00-\ud7a3]", " ".join(keyword_candidates))
+    fallback_lucky_url = "https://www.google.com/search?btnI=1&q=" + urllib.parse.quote(" ".join(lucky_terms)) if allow_lucky_search else None
+    fallback_domain_urls = _fallback_official_domain_urls(keyword_candidates)
+    context_prompt_key, context_prompt_excerpt = _context_prompt_key_for_target_terms(keyword_request, keyword_candidates)
     return f"""from pathlib import Path
-from urllib.parse import urljoin, urlparse, unquote
+from urllib.parse import parse_qs, urljoin, urlparse, unquote
 from html import unescape
 import json
 import os
@@ -8853,14 +10773,24 @@ import urllib.request
 
 PROMPT_URLS = {json.dumps(prompt_urls, ensure_ascii=False)}
 KEYWORDS = {json.dumps(keyword_candidates, ensure_ascii=False)}
+FALLBACK_SEARCH_URL = {json.dumps(fallback_search_url, ensure_ascii=False)}
+FALLBACK_ALTERNATE_SEARCH_URLS = {json.dumps(fallback_alternate_search_urls, ensure_ascii=False)}
+FALLBACK_LUCKY_URL = {json.dumps(fallback_lucky_url, ensure_ascii=False)}
+FALLBACK_DOMAIN_URLS = {json.dumps(fallback_domain_urls, ensure_ascii=False)}
 USER_AGENT = "Mozilla/5.0"
+CONTEXT_PATH = Path.home() / "Downloads" / "computer-use-agent-context.json"
+CONTEXT_PROMPT_KEY = {json.dumps(context_prompt_key, ensure_ascii=False)}
+CONTEXT_PROMPT_EXCERPT = {json.dumps(context_prompt_excerpt, ensure_ascii=False)}
 
 downloads = Path.home() / "Downloads"
 downloads.mkdir(parents=True, exist_ok=True)
+CONTEXT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 installer_suffixes = (".exe", ".msi", ".zip", ".alz")
 generic_bad = ("portable", ".7z", ".tar", ".gz", ".pkg", ".dmg")
 preferred_markers = ("setup", "installer", "install", "standard", "package", "archive", "win64", "windows", "x64", ".exe", ".msi", ".zip", ".alz")
+failed_urls: set[str] = set()
+failed_hosts: dict[str, int] = {{}}
 
 def score_url(url: str) -> int:
     lowered = unquote(urlparse(url).path).lower()
@@ -8880,42 +10810,202 @@ def score_url(url: str) -> int:
 
 def request_bytes(url: str) -> tuple[str, bytes]:
     req = urllib.request.Request(url, headers={{"User-Agent": USER_AGENT}})
-    with urllib.request.urlopen(req, timeout=60) as response:
+    with urllib.request.urlopen(req, timeout=15) as response:
         return response.geturl(), response.read()
+
+def normalized_url_key(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    path = unquote(parsed.path or "/")
+    query = ("?" + parsed.query) if parsed.query else ""
+    return f"{{parsed.scheme.lower()}}://{{parsed.netloc.lower()}}{{path}}{{query}}"
+
+def normalized_host_key(url: str) -> str:
+    return str(urlparse(str(url or "")).netloc or "").lower()
+
+def is_search_engine_url(url: str) -> bool:
+    host = normalized_host_key(url)
+    return any(token in host for token in ("google.", "bing.", "duckduckgo.", "yahoo.", "naver.", "daum."))
+
+def previously_failed_url(url: str) -> bool:
+    key = normalized_url_key(url)
+    if not key:
+        return False
+    if key.lower() in failed_urls:
+        return True
+    host = normalized_host_key(url)
+    if (
+        host
+        and not is_search_engine_url(url)
+        and int(failed_hosts.get(host, 0) or 0) >= 2
+    ):
+        return True
+    return False
+
+def record_failed_url(url: str, reason: str) -> None:
+    key = normalized_url_key(url)
+    if not key:
+        return
+    failed_urls.add(key.lower())
+    host = normalized_host_key(url)
+    if host and not is_search_engine_url(url):
+        failed_hosts[host] = min(20, int(failed_hosts.get(host, 0) or 0) + 1)
+
+def enqueue_page(page_queue: list[str], url: str) -> None:
+    if not url or url in page_queue:
+        return
+    if previously_failed_url(url):
+        print(f"Skipping previously failed source URL: {{url}}")
+        return
+    page_queue.append(url)
+
+def normalize_link(base_url: str, raw: str) -> str:
+    resolved = urljoin(base_url, unescape(raw)).split("#", 1)[0]
+    parsed = urlparse(resolved)
+    host = str(parsed.netloc or "").lower()
+    if any(token in host for token in ("google.", "bing.", "duckduckgo.", "yahoo.", "naver.", "daum.")):
+        query = parse_qs(parsed.query)
+        for key in ("q", "url", "u"):
+            values = query.get(key) or []
+            for value in values:
+                candidate = unquote(str(value or "")).strip()
+                if candidate.lower().startswith("http"):
+                    return candidate.split("#", 1)[0]
+    return resolved
+
+def prioritize_page_links(page_links: list[str], *, base_is_search_engine: bool, limit: int = 8) -> list[str]:
+    if not base_is_search_engine:
+        return page_links[:limit]
+    keyword_roots = []
+    for keyword in KEYWORDS:
+        cleaned = re.sub(r"[^a-z0-9]+", "", str(keyword or "").lower())
+        if len(cleaned) >= 4 and cleaned not in keyword_roots:
+            keyword_roots.append(cleaned)
+    ranked_links = []
+    for order, link in enumerate(page_links):
+        parsed = urlparse(str(link or ""))
+        host = str(parsed.netloc or "").lower()
+        path = unquote(parsed.path or "").lower()
+        tld = host.rsplit(".", 1)[-1] if "." in host else host
+        compact_host = re.sub(r"[^a-z0-9]+", "", host)
+        compact_url = re.sub(r"[^a-z0-9]+", "", str(link or "").lower())
+        score = 0
+        if host_matches_keyword_domain(host):
+            score += 50
+        if any(root == compact_host.removeprefix("www") or root in compact_host for root in keyword_roots):
+            score += 35
+        if tld == "kr" and any(root in compact_url for root in keyword_roots):
+            score += 40
+        if any(token in path for token in ("download", "client", "windows", "win64", "setup")):
+            score += 12
+        if any(token in host for token in ("youtube.", "youtu.be", "namu.", "tistory.", "blog.")):
+            score -= 100
+        ranked_links.append((score, -order, tld, registrable_host(host), link))
+    ranked_links.sort(reverse=True)
+    selected: list[str] = []
+    seen_tlds: set[str] = set()
+    seen_registrables: set[str] = set()
+    for _score, _order, tld, registrable, link in ranked_links:
+        if not tld or tld in seen_tlds:
+            continue
+        selected.append(link)
+        seen_tlds.add(tld)
+        if registrable:
+            seen_registrables.add(registrable)
+        if len(selected) >= limit:
+            return selected
+    for _score, _order, tld, registrable, link in ranked_links:
+        if registrable and registrable in seen_registrables:
+            continue
+        if link in selected:
+            continue
+        selected.append(link)
+        if registrable:
+            seen_registrables.add(registrable)
+        if len(selected) >= limit:
+            return selected
+    for _score, _order, _tld, _registrable, link in ranked_links:
+        if link in selected:
+            continue
+        selected.append(link)
+        if len(selected) >= limit:
+            return selected
+    return selected
 
 def extract_links(base_url: str, html_text: str) -> tuple[list[str], list[str]]:
     page_links: list[str] = []
     installer_links: list[str] = []
     seen_pages = set()
     seen_installer = set()
-    attr_matches = re.findall(r'''(?:href|src)\\s*=\\s*["\\']([^"\\']+)["\\']''', html_text, flags=re.IGNORECASE)
-    for raw in attr_matches:
-        resolved = urljoin(base_url, unescape(raw)).split("#", 1)[0]
-        lowered = resolved.lower()
-        path_lower = unquote(urlparse(resolved).path).lower()
-        if not lowered.startswith("http"):
-            continue
-        if path_lower.endswith(installer_suffixes) and lowered not in seen_installer:
-            seen_installer.add(lowered)
-            installer_links.append(resolved)
-            continue
-        if any(token in lowered for token in ("download", "install", "release", "community", "edition")) and lowered not in seen_pages:
-            seen_pages.add(lowered)
-            page_links.append(resolved)
-    for raw in re.findall(r'https://[^\\s"\\'<>]+', html_text, flags=re.IGNORECASE):
-        resolved = raw.split("#", 1)[0]
-        lowered = resolved.lower()
-        path_lower = unquote(urlparse(resolved).path).lower()
-        if path_lower.endswith(installer_suffixes) and lowered not in seen_installer:
-            seen_installer.add(lowered)
-            installer_links.append(resolved)
-    return page_links[:8], installer_links
+    base_host = str(urlparse(base_url).netloc or "").lower()
+    base_is_search_engine = any(token in base_host for token in ("google.", "bing.", "duckduckgo.", "yahoo.", "naver.", "daum."))
+    normalized_texts = [
+        html_text,
+        html_text.replace("\\\\u002F", "/").replace("\\\\u002f", "/").replace("\\\\/", "/"),
+    ]
+    for candidate_text in normalized_texts:
+        attr_matches = re.findall(r'''(?:href|src)\\s*=\\s*["\\']([^"\\']+)["\\']''', candidate_text, flags=re.IGNORECASE)
+        for raw in attr_matches:
+            resolved = normalize_link(base_url, raw)
+            lowered = resolved.lower()
+            path_lower = unquote(urlparse(resolved).path).lower()
+            if not lowered.startswith("http"):
+                continue
+            if path_lower.endswith(installer_suffixes) and lowered not in seen_installer:
+                seen_installer.add(lowered)
+                installer_links.append(resolved)
+                continue
+            resolved_host = str(urlparse(resolved).netloc or "").lower()
+            resolved_is_search_engine = any(token in resolved_host for token in ("google.", "bing.", "duckduckgo.", "yahoo.", "naver.", "daum."))
+            resolved_is_store = any(token in lowered for token in ("apps.microsoft.com", "microsoft.com/store", "microsoft store", "windows store"))
+            resolved_is_download_catalog = any(token in resolved_host for token in (
+                "softonic.",
+                "uptodown.",
+                "filehorse.",
+                "filehippo.",
+                "softpedia.",
+                "download.cnet.",
+                "download.com",
+                "majorgeeks.",
+                "lo4d.",
+                "malavida.",
+            ))
+            resolved_has_target_keyword = any(str(keyword or "").lower() in lowered for keyword in KEYWORDS)
+            if (
+                (not resolved_is_download_catalog or resolved_has_target_keyword)
+                and (
+                    any(token in lowered for token in ("download", "install", "release", "community", "edition"))
+                    or host_matches_keyword_domain(urlparse(resolved).netloc)
+                    or (base_is_search_engine and not resolved_is_search_engine and not resolved_is_store)
+                )
+            ) and lowered not in seen_pages:
+                seen_pages.add(lowered)
+                page_links.append(resolved)
+        for raw in re.findall(r'https://[^\\s"\\'<>]+', candidate_text, flags=re.IGNORECASE):
+            resolved = normalize_link(base_url, raw)
+            lowered = resolved.lower()
+            path_lower = unquote(urlparse(resolved).path).lower()
+            if path_lower.endswith(installer_suffixes) and lowered not in seen_installer:
+                seen_installer.add(lowered)
+                installer_links.append(resolved)
+    return prioritize_page_links(page_links, base_is_search_engine=base_is_search_engine, limit=8), installer_links
 
 def registrable_host(host: str) -> str:
     labels = [label for label in str(host or "").lower().split(".") if label]
     if len(labels) >= 2:
         return ".".join(labels[-2:])
     return str(host or "").lower()
+
+def host_matches_keyword_domain(host: str) -> bool:
+    host_lower = str(host or "").lower()
+    registrable = registrable_host(host_lower)
+    keyword_roots = []
+    for keyword in KEYWORDS:
+        cleaned = re.sub(r"[^a-z0-9]+", "", str(keyword or "").lower())
+        if len(cleaned) >= 4 and cleaned not in keyword_roots:
+            keyword_roots.append(cleaned)
+    return any(keyword in host_lower or keyword in registrable for keyword in keyword_roots)
 
 def candidate_destination(url: str) -> Path:
     name = Path(unquote(urlparse(url).path)).name or "installer.exe"
@@ -8931,6 +11021,23 @@ def candidate_destination(url: str) -> Path:
             name = "installer.exe"
     return downloads / name
 
+def write_download_context(path: Path, source_url: str) -> None:
+    CONTEXT_PATH.write_text(
+        json.dumps(
+            {{
+            "prompt_key": CONTEXT_PROMPT_KEY,
+            "prompt_excerpt": CONTEXT_PROMPT_EXCERPT,
+            "installer_path": str(path),
+            "source_url": str(source_url),
+            "target_keywords": KEYWORDS,
+            "phase": "downloaded",
+            }},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
 existing_candidates = []
 for pattern in ("*.exe", "*.msi", "*.zip", "*.alz"):
     for path in downloads.glob(pattern):
@@ -8945,10 +11052,19 @@ for pattern in ("*.exe", "*.msi", "*.zip", "*.alz"):
 if existing_candidates:
     existing = max(existing_candidates, key=lambda p: p.stat().st_mtime)
     print(f"Found existing installer: {{existing}}")
+    write_download_context(existing, PROMPT_URLS[0] if PROMPT_URLS else "")
     sys.exit(0)
 
 visited_pages = set()
-page_queue = list(PROMPT_URLS)
+page_queue: list[str] = []
+for prompt_url in PROMPT_URLS:
+    enqueue_page(page_queue, prompt_url)
+enqueue_page(page_queue, FALLBACK_SEARCH_URL)
+for fallback_alternate_search_url in FALLBACK_ALTERNATE_SEARCH_URLS:
+    enqueue_page(page_queue, fallback_alternate_search_url)
+enqueue_page(page_queue, FALLBACK_LUCKY_URL)
+for fallback_domain_url in FALLBACK_DOMAIN_URLS:
+    enqueue_page(page_queue, fallback_domain_url)
 exe_candidates: list[str] = []
 seen_candidate_urls = set()
 base_registrables = {{registrable_host(urlparse(url).netloc) for url in PROMPT_URLS if url}}
@@ -8957,20 +11073,38 @@ while page_queue and len(visited_pages) < 10:
     page_url = page_queue.pop(0)
     if page_url in visited_pages:
         continue
+    if previously_failed_url(page_url):
+        print(f"Skipping previously failed source URL: {{page_url}}")
+        continue
     visited_pages.add(page_url)
     try:
         final_page_url, html_bytes = request_bytes(page_url)
         html_text = html_bytes.decode("utf-8", errors="ignore")
     except Exception as exc:
         print(f"Failed to fetch page {{page_url}}: {{exc}}")
+        record_failed_url(page_url, str(exc))
         continue
     extra_pages, exe_links = extract_links(final_page_url, html_text)
+    current_host = str(urlparse(final_page_url or page_url).netloc or "").lower()
+    current_is_search_engine = any(token in current_host for token in ("google.", "bing.", "duckduckgo.", "yahoo.", "naver.", "daum."))
     for extra_page in extra_pages:
-        if registrable_host(urlparse(extra_page).netloc) not in base_registrables:
+        if previously_failed_url(extra_page):
+            print(f"Skipping previously failed linked page: {{extra_page}}")
+            continue
+        parsed_extra = urlparse(extra_page)
+        allow_external_search_result = not base_registrables and current_is_search_engine
+        if (
+            not allow_external_search_result
+            and registrable_host(parsed_extra.netloc) not in base_registrables
+            and not host_matches_keyword_domain(parsed_extra.netloc)
+        ):
             continue
         if extra_page not in visited_pages:
             page_queue.append(extra_page)
     for exe_url in exe_links:
+        if previously_failed_url(exe_url):
+            print(f"Skipping previously failed installer URL: {{exe_url}}")
+            continue
         if exe_url.lower() in seen_candidate_urls:
             continue
         seen_candidate_urls.add(exe_url.lower())
@@ -8995,11 +11129,13 @@ for exe_url in exe_candidates:
         size = dest.stat().st_size if dest.exists() else 0
         if size > 1_000_000:
             print(f"Downloaded: {{dest}} ({{size}} bytes)")
+            write_download_context(dest, exe_url)
             sys.exit(0)
         if dest.exists():
             dest.unlink(missing_ok=True)
     except Exception as exc:
         print(f"Candidate failed {{exe_url}}: {{exc}}")
+        record_failed_url(exe_url, str(exc))
         continue
 
 raise SystemExit("All official installer candidates failed.")
@@ -9009,21 +11145,92 @@ raise SystemExit("All official installer candidates failed.")
 def _should_use_framework_official_download_recovery(request: StepRequest) -> bool:
     if not request.replan_requested:
         return False
-    if str(request.execution_style or "python_first").lower() == "gui_first":
-        return False
     if not _looks_like_download_or_install_task(request.user_prompt):
         return False
-    if _has_visible_gui_continuation_cues(request):
+    gui_first = str(request.execution_style or "python_first").lower() == "gui_first"
+    combined_runtime = "\n".join(
+        str(value or "")
+        for value in (
+            request.observation_text,
+            request.last_execution.get("stdout_tail"),
+            request.last_execution.get("stderr_tail"),
+        )
+    ).lower()
+    exhausted_visible_download_recovery = _looks_like_exhausted_visible_download_recovery(request.last_execution)
+    visible_download_stalled = any(
+        marker in combined_runtime
+        for marker in (
+            "no visible download-related control remains",
+            "no new visible download-related control is available",
+            "current visible download controls were already attempted",
+            "recent installer download did not appear",
+        )
+    )
+    visible_download_stalled = visible_download_stalled or exhausted_visible_download_recovery
+    if "no official windows installer/archive candidate found" in combined_runtime:
         return False
-    if not _extract_prompt_urls(request.user_prompt):
+    recovery_reasons = {
+        "download_url_404",
+        "download_url_403",
+        "guessed_artifact_url_404",
+        "installer_url_not_found",
+        "execution_error",
+    }
+    url_recovery_reasons = {
+        "download_url_404",
+        "download_url_403",
+        "guessed_artifact_url_404",
+        "installer_url_not_found",
+    }
+    has_recovery_reason = bool(recovery_reasons.intersection(request.replan_reasons))
+    has_url_recovery_reason = bool(url_recovery_reasons.intersection(request.replan_reasons))
+    if gui_first and not visible_download_stalled and not has_url_recovery_reason:
         return False
-    recovery_reasons = {"download_url_404", "installer_url_not_found", "execution_error"}
-    if not recovery_reasons.intersection(request.replan_reasons):
+    if _has_visible_gui_continuation_cues(request) and not visible_download_stalled and not has_url_recovery_reason:
+        return False
+    if _MODEL_UI_CANDIDATES_ENABLED:
+        visible_candidates = _model_ui_candidates_from_observation(request.observation_text)
+        if not exhausted_visible_download_recovery and any(
+            "target_like" in [str(tag) for tag in candidate.get("tags", [])]
+            or "installer_filename" in [str(tag) for tag in candidate.get("tags", [])]
+            for candidate in visible_candidates
+        ):
+            return False
+    prompt_urls = _extract_prompt_urls(request.user_prompt)
+    target_terms = _visible_flow_extra_targets(request, limit=8)
+    fallback_search_url = _fallback_browser_search_url_from_parts(target_terms, prompt_urls)
+    if not prompt_urls and not fallback_search_url:
+        return False
+    if not gui_first and not has_recovery_reason:
         return False
     return int(request.step_index or 0) >= 1
 
 
+def _should_use_framework_official_download_retry_for_invalid_generation(
+    request: StepRequest,
+    *,
+    prompt_url_violation: bool,
+    gui_first_visible_ui_violation: bool,
+    guessed_artifact_url_generation: bool,
+    gui_first_download_chunk_network_bypass: bool,
+    gui_first_download_chunk_install_mix: bool,
+) -> bool:
+    if not _should_use_framework_official_download_recovery(request):
+        return False
+    return any(
+        (
+            prompt_url_violation,
+            gui_first_visible_ui_violation,
+            guessed_artifact_url_generation,
+            gui_first_download_chunk_network_bypass,
+            gui_first_download_chunk_install_mix,
+        )
+    )
+
+
 def _should_use_framework_visible_download_flow(request: StepRequest) -> bool:
+    if _MODEL_UI_CANDIDATES_ENABLED:
+        return False
     if not _FRAMEWORK_OCR_UI_HELPERS_ENABLED:
         return False
     if str(request.execution_style or "python_first").lower() != "gui_first":
@@ -9036,6 +11243,8 @@ def _should_use_framework_visible_download_flow(request: StepRequest) -> bool:
 
 
 def _should_use_framework_visible_installer_recovery(request: StepRequest) -> bool:
+    if _MODEL_UI_CANDIDATES_ENABLED:
+        return False
     if not _FRAMEWORK_OCR_UI_HELPERS_ENABLED:
         return False
     if str(request.execution_style or "python_first").lower() != "gui_first":
@@ -9048,6 +11257,8 @@ def _should_use_framework_visible_installer_recovery(request: StepRequest) -> bo
 
 
 def _should_use_framework_visible_launch_recovery(request: StepRequest) -> bool:
+    if _MODEL_UI_CANDIDATES_ENABLED:
+        return False
     if str(request.execution_style or "python_first").lower() != "gui_first":
         return False
     last_execution_payload = dict(request.last_execution.get("payload_metadata") or {})
@@ -9065,6 +11276,2287 @@ def _should_use_framework_visible_launch_recovery(request: StepRequest) -> bool:
     return _looks_like_launch_app_chunk_task(request.user_prompt)
 
 
+def _should_use_model_ui_candidates(request: StepRequest) -> bool:
+    if not _MODEL_UI_CANDIDATES_ENABLED:
+        return False
+    if request.request_kind != "task_step":
+        return False
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    if not (request.screenshot_base64 or request.screenshot_path):
+        return False
+    if _looks_like_existing_installer_launch_task(request.user_prompt):
+        return True
+    return int(request.step_index or 0) > 0 or _has_visible_gui_continuation_cues(request)
+
+
+def _request_image_bytes(request: StepRequest) -> bytes | None:
+    if request.screenshot_base64:
+        try:
+            return base64.b64decode(request.screenshot_base64)
+        except Exception:
+            return None
+    if request.screenshot_path:
+        try:
+            return Path(request.screenshot_path).read_bytes()
+        except OSError:
+            return None
+    return None
+
+
+def _image_size_from_bytes(image_bytes: bytes | None) -> tuple[int, int] | None:
+    if not image_bytes:
+        return None
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n") and len(image_bytes) >= 24:
+        return int.from_bytes(image_bytes[16:20], "big"), int.from_bytes(image_bytes[20:24], "big")
+    try:
+        from PIL import Image
+        from io import BytesIO
+
+        with Image.open(BytesIO(image_bytes)) as image:
+            return int(image.width), int(image.height)
+    except Exception:
+        return None
+
+
+def _request_screenshot_size(request: StepRequest) -> tuple[int, int] | None:
+    return _image_size_from_bytes(_request_image_bytes(request))
+
+
+def _extract_json_object_or_array(text: str) -> Any:
+    raw = re.sub(r"<think>.*?</think>", "", str(text or ""), flags=re.DOTALL | re.IGNORECASE).strip()
+    if not raw:
+        return None
+    for fenced in re.findall(r"```(?:json)?\s*(.*?)```", raw, flags=re.DOTALL | re.IGNORECASE):
+        try:
+            return json.loads(fenced.strip())
+        except json.JSONDecodeError:
+            continue
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    starts = [index for index in (raw.find("{"), raw.find("[")) if index >= 0]
+    if not starts:
+        return None
+    start = min(starts)
+    opening = raw[start]
+    closing = "}" if opening == "{" else "]"
+    end = raw.rfind(closing)
+    while end > start:
+        try:
+            return json.loads(raw[start : end + 1])
+        except json.JSONDecodeError:
+            end = raw.rfind(closing, start, end)
+    return None
+
+
+def _model_ui_ocr_elements_from_payload(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        for key in ("elements", "items", "ui_elements", "candidates"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        return []
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def _model_ui_ocr_elements_from_text(text: str) -> list[dict[str, Any]]:
+    raw = str(text or "")
+    if not raw.strip():
+        return []
+    elements: list[dict[str, Any]] = []
+    pattern = re.compile(
+        r'"text"\s*:\s*"(?P<text>(?:\\.|[^"\\])*)".{0,800}?'
+        r'"kind"\s*:\s*"(?P<kind>(?:\\.|[^"\\])*)".{0,800}?'
+        r'"bbox"\s*:\s*\[(?P<bbox>[^\]]+)\]',
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    for match in pattern.finditer(raw):
+        text_fragment = match.group("text")
+        kind_fragment = match.group("kind")
+        try:
+            parsed_text = json.loads(f'"{text_fragment}"')
+        except json.JSONDecodeError:
+            parsed_text = text_fragment
+        try:
+            parsed_kind = json.loads(f'"{kind_fragment}"')
+        except json.JSONDecodeError:
+            parsed_kind = kind_fragment
+        numbers = re.findall(r"-?\d+(?:\.\d+)?", match.group("bbox"))
+        if len(numbers) < 4:
+            continue
+        elements.append(
+            {
+                "text": str(parsed_text),
+                "kind": str(parsed_kind),
+                "bbox": [float(number) for number in numbers[:4]],
+            }
+        )
+    return elements
+
+
+def _coerce_model_bbox(value: Any, *, image_size: tuple[int, int] | None) -> tuple[int, int, int, int] | None:
+    if isinstance(value, dict):
+        raw_values = [value.get(key) for key in ("left", "top", "right", "bottom")]
+        if any(item is None for item in raw_values):
+            left = value.get("x")
+            top = value.get("y")
+            width = value.get("width", value.get("w"))
+            height = value.get("height", value.get("h"))
+            raw_values = [left, top, None if left is None or width is None else float(left) + float(width), None if top is None or height is None else float(top) + float(height)]
+    elif isinstance(value, (list, tuple)) and len(value) >= 4:
+        raw_values = list(value[:4])
+    else:
+        return None
+    try:
+        left, top, right, bottom = [float(item) for item in raw_values]
+    except (TypeError, ValueError):
+        return None
+    if right <= left or bottom <= top:
+        right = left + abs(right)
+        bottom = top + abs(bottom)
+    if image_size:
+        width, height = image_size
+        if 0 <= left <= 1 and 0 <= top <= 1 and 0 <= right <= 1 and 0 <= bottom <= 1:
+            left, right = left * width, right * width
+            top, bottom = top * height, bottom * height
+        elif 0 <= left <= 1000 and 0 <= top <= 1000 and 0 <= right <= 1000 and 0 <= bottom <= 1000:
+            # Qwen-style visual grounding often returns a 0-1000 image grid even
+            # when the prompt asks for pixels. Convert that grid to screen pixels.
+            left, right = left / 1000.0 * width, right / 1000.0 * width
+            top, bottom = top / 1000.0 * height, bottom / 1000.0 * height
+        left = max(0, min(int(round(left)), width - 1))
+        right = max(0, min(int(round(right)), width))
+        top = max(0, min(int(round(top)), height - 1))
+        bottom = max(0, min(int(round(bottom)), height))
+    else:
+        left, top, right, bottom = [int(round(item)) for item in (left, top, right, bottom)]
+    if right - left < 4 or bottom - top < 4:
+        return None
+    return left, top, right, bottom
+
+
+def _looks_like_browser_url_text(text: str) -> bool:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return False
+    compact = re.sub(r"\s+", "", normalized)
+    if compact.startswith(("http://", "https://", "www.")):
+        return True
+    if "://" in compact:
+        return True
+    if any(token in compact for token in ("/download", "/downloads", "/setup", "/installer", "?q=", "&q=", ".php?", ".aspx?")):
+        if re.search(r"(?:[a-z0-9-]+\.)+[a-z]{2,}", compact):
+            return True
+    return bool(re.fullmatch(r"(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:/[^\s]*)?", compact))
+
+
+def _score_model_ui_candidate(
+    text: str,
+    kind: str,
+    bbox: tuple[int, int, int, int],
+    *,
+    request: StepRequest,
+    screen_size: tuple[int, int] | None = None,
+) -> tuple[int, list[str]]:
+    normalized = str(text or "").strip().lower()
+    kind_normalized = str(kind or "").strip().lower()
+    left, top, right, bottom = bbox
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    score = 0
+    tags: list[str] = []
+
+    def _prompt_url_host_matches_targets(targets: list[str]) -> bool:
+        prompt_url = _select_request_prompt_browser_url(request)
+        if not prompt_url or _url_looks_like_search_results(prompt_url):
+            return False
+        try:
+            parsed = urllib.parse.urlparse(prompt_url)
+        except ValueError:
+            return False
+        compact_host = re.sub(r"[^a-z0-9]+", "", str(parsed.netloc or "").lower())
+        if not compact_host:
+            return False
+        for target in targets:
+            compact_target = re.sub(r"[^a-z0-9]+", "", str(target or "").lower())
+            if len(compact_target) >= 4 and compact_target in compact_host:
+                return True
+        return False
+
+    if kind_normalized in {"button", "link", "menuitem", "tab", "input", "control"}:
+        score += 18
+        tags.append("clickable_kind")
+    if kind_normalized == "button":
+        score += 10
+        tags.append("button_kind")
+    download_terms = (
+        "download",
+        "downloads",
+        "downloading",
+        "get",
+        "installer",
+        "setup",
+        "windows",
+        "윈도우",
+        "다운로드",
+        "내려받기",
+        "받기",
+    )
+    install_terms = (
+        "install",
+        "setup",
+        "run",
+        "open",
+        "next",
+        "finish",
+        "agree",
+        "accept",
+        "yes",
+        "ok",
+        "설치",
+        "실행",
+        "다음",
+        "완료",
+        "동의",
+        "예",
+        "확인",
+    )
+    for term in download_terms:
+        if term in normalized:
+            score += 35
+            tags.append("download_like")
+            break
+    for term in install_terms:
+        if term in normalized:
+            score += 25
+            tags.append("install_like")
+            break
+    if _looks_like_existing_installer_launch_task(request.user_prompt):
+        installer_dialog_terms = (
+            "ok",
+            "yes",
+            "next",
+            "install",
+            "finish",
+            "run",
+            "agree",
+            "accept",
+            "확인",
+            "예",
+            "다음",
+            "설치",
+            "완료",
+            "동의",
+            "실행",
+        )
+        if any(term in normalized for term in installer_dialog_terms):
+            score += 45
+            tags.append("installer_dialog_control")
+        if any(term in normalized for term in ("download", "downloads", "다운로드", "내려받기")):
+            score -= 25
+            tags.append("install_chunk_download_penalty")
+    prompt_lower = str(request.user_prompt or "").lower()
+    if "portable" in normalized and "portable" not in prompt_lower:
+        score -= 95
+        tags.append("portable_package_penalty")
+    if (
+        _looks_like_download_artifact_only_chunk(request.user_prompt)
+        and "install_like" in tags
+        and "download_like" not in tags
+        and "target_like" not in tags
+        and "installer_filename" not in tags
+    ):
+        score -= 70
+        tags.append("download_chunk_install_penalty")
+    target_terms = _visible_flow_extra_targets(request, limit=4)
+    for target in target_terms:
+        target_normalized = str(target or "").strip().lower()
+        if target_normalized and target_normalized in normalized:
+            score += 22
+            tags.append("target_like")
+            break
+    if (
+        "target_like" not in tags
+        and "download_like" in tags
+        and re.search(r"[가-힣]", normalized)
+        and _prompt_url_host_matches_targets(target_terms)
+    ):
+        score += 18
+        tags.append("target_page_download_like")
+        tags.append("target_like")
+    if (
+        _looks_like_download_or_install_task(request.user_prompt)
+        and any(term in normalized for term in ("server", "서버"))
+        and not any(term in prompt_lower for term in ("server", "서버"))
+    ):
+        score -= 24
+        tags.append("server_variant_penalty")
+    if (
+        _looks_like_search_results_observation(request)
+        and "target_like" not in tags
+        and ("download_like" in tags or "install_like" in tags)
+    ):
+        score -= 60
+        tags.append("offtarget_search_result_penalty")
+    if "target_like" not in tags and any(
+        term in normalized
+        for term in (
+            "microsoft edge",
+            "google chrome",
+            "mozilla firefox",
+            "safari",
+            "브라우저",
+        )
+    ):
+        score -= 55
+        tags.append("browser_brand_penalty")
+    if (
+        "target_like" not in tags
+        and not any(token in prompt_lower for token in ("login", "sign in", "signin", "account", "로그인", "계정"))
+        and any(
+            term in normalized
+            for term in (
+                "sign in",
+                "signin",
+                "login",
+                "로그인",
+                "account",
+                "계정",
+                "profile",
+                "프로필",
+            )
+        )
+    ):
+        score -= 55
+        tags.append("account_panel_penalty")
+    if any(
+        term in normalized
+        for term in (
+            "blog",
+            "블로그",
+            "forum",
+            "reddit",
+            "cafe",
+            "사용법",
+            "방법",
+            "설치법",
+            "사용자별",
+            "tutorial",
+            "guide",
+            "how to",
+            "review",
+            "후기",
+            "정책 정보",
+        )
+    ):
+        score -= 70 if _looks_like_search_results_observation(request) else 35
+        tags.append("community_article_penalty")
+    if not any(token in prompt_lower for token in ("microsoft store", "ms store", "windows store", "app store", "스토어")) and any(
+        term in normalized
+        for term in (
+            "microsoft store",
+            "windows store",
+            "app store",
+            "스토어",
+        )
+    ):
+        score -= 80
+        tags.append("store_result_penalty")
+    if re.search(r"\.(exe|msi|msix|appx)\b", normalized):
+        score += 20
+        tags.append("installer_filename")
+    if 10 <= height <= 120 and 30 <= width <= 900:
+        score += 8
+        tags.append("button_shape")
+    if top < 90:
+        score -= 30
+        tags.append("browser_chrome_penalty")
+    looks_like_url_text = _looks_like_browser_url_text(normalized)
+    if looks_like_url_text and "target_like" in tags and re.search(r"\s", normalized) and kind_normalized in {"link", "text"}:
+        looks_like_url_text = False
+    if looks_like_url_text:
+        score -= 140
+        tags.append("browser_url_penalty")
+    if (
+        top < 140
+        and "target_like" not in tags
+        and normalized in {"download", "downloads", "install", "installer", "setup", "다운로드", "설치"}
+    ):
+        score -= 120
+        tags.append("browser_chrome_fragment_penalty")
+    if any(token in normalized for token in ("address", "url", "tab", "bookmark", "검색어", "주소")) and top < 160:
+        score -= 30
+        tags.append("toolbar_text_penalty")
+    if screen_size:
+        screen_width, screen_height = screen_size
+        domain_like_text = bool(re.search(r"\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b", normalized))
+        if _looks_like_search_results_observation(request) and "target_like" in tags and domain_like_text:
+            score += 35
+            tags.append("search_result_domain_like")
+        if (
+            _looks_like_search_results_observation(request)
+            and "download_like" in tags
+            and "target_like" in tags
+            and not domain_like_text
+            and left >= int(screen_width * 0.55)
+        ):
+            score -= 85
+            tags.append("search_result_side_panel_penalty")
+        if (
+            "download_like" in tags
+            and "target_like" not in tags
+            and kind_normalized in {"link", "tab", "text"}
+            and normalized in {"download", "downloads", "다운로드"}
+            and top < int(screen_height * 0.25)
+        ):
+            score -= 16
+            tags.append("generic_header_download_penalty")
+        bottom_strip_top = max(int(screen_height * 0.92), screen_height - 130)
+        if top >= bottom_strip_top:
+            score -= 90
+            tags.append("taskbar_penalty")
+    return score, list(dict.fromkeys(tags))
+
+
+def _model_ui_candidates_observation(
+    *,
+    runtime: AgentRuntime,
+    request: StepRequest,
+    max_new_tokens: int,
+    generation_context: dict[str, Any] | None,
+) -> str | None:
+    if not _should_use_model_ui_candidates(request):
+        return None
+    image_bytes = _request_image_bytes(request)
+    image_size = _image_size_from_bytes(image_bytes)
+    if not image_bytes and not request.screenshot_path:
+        return None
+    screenshot_size_text = list(image_size) if image_size else None
+    system_prompt = (
+        "Return compact strict JSON only. Do not return markdown, Python, prose, or reasoning. "
+        "Extract at most 12 visible actionable UI elements from the screenshot. "
+        "Use one-line minified JSON, not pretty-printed JSON. "
+        "Use model-native bbox coordinates. For Qwen3.5/Qwen3-VL, bbox values are normalized 0-1000 coordinates."
+    )
+    search_results_focus = _looks_like_search_results_observation(request)
+
+    def _generate_elements(*, search_results_retry: bool) -> tuple[Any, list[dict[str, Any]]]:
+        instructions = [
+            "Return only visible actionable or highly relevant elements.",
+            "If a topmost modal dialog, installer wizard, UAC prompt, language selector, file-open confirmation, or completion dialog is visible, list its buttons and controls before browser/page elements.",
+            "When a browser page or search results page is visible, list page-body result titles, primary links, and download buttons before browser tabs, address bar, bookmarks, sidebars, or taskbar/dock icons.",
+            "Do not list the browser URL text shown inside the address bar, even if that URL contains words such as download, install, setup, or the app name.",
+            "Preserve visible Latin product names, domains, and URLs exactly as shown. Do not translate, romanize, or phoneticize Latin text into Korean or another language.",
+            "On a browser search results page, include several distinct top page-body result titles or primary links. Do not spend multiple slots on the same result card's site label, snippet, or repeated host text.",
+            "For search result candidates, include the visible domain or URL in the text when it is visible near the result title.",
+            "Prefer result titles or links whose visible text contains the task target token or a plausible vendor/product domain over generic browser, store, or account-related text.",
+            "Always include visible installer/dialog controls such as OK, Yes, Next, Agree, Install, Finish, Cancel, 확인, 예, 다음, 동의, 설치, 완료 when present.",
+            "Prioritize page-content buttons, links, installer controls, download controls, search result titles, and installer file names.",
+            "Ignore Windows taskbar/dock/pinned app icons unless the task explicitly requires switching apps from the OS shell.",
+            "Do not list the browser toolbar, address bar, tab strip, bookmarks bar, or taskbar text when page-content candidates are visible in the same screenshot.",
+            "Do not invent hidden elements.",
+            "Use bbox as [left, top, right, bottom]. For Qwen3.5/Qwen3-VL, use normalized 0-1000 coordinates for both x and y.",
+            "Output exactly this schema, compactly: {\"elements\":[{\"text\":\"...\",\"kind\":\"button|link|input|menuitem|text\",\"bbox\":[l,t,r,b],\"confidence\":0.0}]}",
+        ]
+        if _looks_like_download_artifact_only_chunk(request.user_prompt):
+            instructions = [
+                "This is a download-only step.",
+                "Prefer page-body download controls, target-specific page links, and installer file names over generic installer-dialog buttons.",
+                "Do not surface generic Install, OK, Yes, Confirm, or Next buttons unless a real installer/UAC dialog clearly occupies the active foreground UI and no page-content download control is visible.",
+            ] + instructions
+        if search_results_retry:
+            instructions = [
+                "A browser search results page is visible or strongly likely visible.",
+                "Ignore browser-brand labels, login/account/profile cards, assistant/chat side panels, and right-side browser panels.",
+                "Extract only the main page-body result titles, primary result links, and visible download buttons from the central content column below the toolbar.",
+                "If the task target contains Latin letters, the returned search result text must keep those Latin letters exactly when visible.",
+                "Prefer candidates whose title, URL, or domain contains the task target token. Do not return generic download-center links that omit the task target when target-containing results are visible.",
+                "Do not return Microsoft Edge, Chrome, login, account, profile, 채팅, or similar browser-side labels unless the task explicitly asks for them.",
+            ] + instructions
+        user_payload = {
+            "task": request.user_prompt,
+            "screenshot_size": screenshot_size_text,
+            "search_results_focus": bool(search_results_retry),
+            "instructions": instructions,
+            "last_execution_summary": {
+                "return_code": request.last_execution.get("return_code"),
+                "stderr_tail": request.last_execution.get("stderr_tail"),
+                "stdout_tail": request.last_execution.get("stdout_tail"),
+            }
+            if request.last_execution
+            else None,
+        }
+        generated = runtime.generate_text(
+            prompt_bundle=PromptBundle(
+                system_prompt=system_prompt,
+                user_prompt=json.dumps(user_payload, ensure_ascii=False, indent=2),
+                session_prompt=request.user_prompt,
+                policy=request.policy,
+                execution_style=request.execution_style,
+                reasoning_enabled=False,
+                observation_text=None,
+                last_execution=request.last_execution,
+                web_search_context={},
+                recent_history=request.recent_history,
+                replan_requested=request.replan_requested,
+                replan_reasons=request.replan_reasons,
+            ),
+            image_path=request.screenshot_path,
+            image_bytes=image_bytes,
+            use_blank_image=False,
+            max_new_tokens=256,
+            generation_context=generation_context,
+        )
+        payload = _extract_json_object_or_array(generated.text)
+        elements = _model_ui_ocr_elements_from_payload(payload)
+        if not elements:
+            elements = _model_ui_ocr_elements_from_text(generated.text)
+        return generated, elements
+
+    def _elements_to_candidates(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        extracted: list[dict[str, Any]] = []
+        target_terms = _visible_flow_extra_targets(request, limit=4)
+
+        def _has_ascii_target() -> bool:
+            return any(
+                len(re.sub(r"[^a-z0-9]+", "", str(target or "").lower())) >= 4
+                and re.search(r"[a-z]", str(target or ""), flags=re.IGNORECASE)
+                for target in target_terms
+            )
+
+        def _has_hangul_target() -> bool:
+            return any(re.search(r"[가-힣]", str(target or "")) for target in target_terms)
+
+        def _has_hangul_product_download_alias_text(value: str) -> bool:
+            if not re.search(r"[가-힣]", value):
+                return False
+            generic_hangul_terms = {
+                "다운로드",
+                "내려받기",
+                "받기",
+                "설치",
+                "무료",
+                "윈도우",
+                "프로그램",
+                "버전",
+                "클라이언트",
+                "서버",
+                "공식",
+                "최신",
+                "파일",
+                "센터",
+            }
+            for token in re.findall(r"[가-힣]{2,}", value):
+                if token in generic_hangul_terms:
+                    continue
+                if any(generic in token and len(token) <= len(generic) + 1 for generic in generic_hangul_terms):
+                    continue
+                return True
+            return False
+
+        def _has_latin_product_download_alias_text(value: str) -> bool:
+            if not re.search(r"[a-z]", value, flags=re.IGNORECASE):
+                return False
+            generic_latin_terms = {
+                "download",
+                "downloads",
+                "downloading",
+                "install",
+                "installer",
+                "setup",
+                "windows",
+                "win32",
+                "win64",
+                "x64",
+                "x86",
+                "client",
+                "server",
+                "free",
+                "official",
+                "latest",
+                "version",
+                "program",
+                "software",
+                "app",
+                "for",
+            }
+            for token in re.findall(r"[a-z][a-z0-9._-]{2,}", value, flags=re.IGNORECASE):
+                lowered = token.lower().strip("._-")
+                if lowered in generic_latin_terms:
+                    continue
+                if re.fullmatch(r"(?:exe|msi|zip|alz|msix|appx)", lowered):
+                    continue
+                return True
+            return False
+
+        for index, item in enumerate(elements):
+            text = str(item.get("text") or item.get("label") or item.get("content") or "").strip()
+            raw_bbox_value = item.get("bbox") or item.get("box") or item.get("rect")
+            bbox = _coerce_model_bbox(raw_bbox_value, image_size=image_size)
+            if not text or bbox is None:
+                continue
+            try:
+                confidence = float(item.get("confidence", 1.0))
+            except (TypeError, ValueError):
+                confidence = 1.0
+            if confidence <= 0.05:
+                continue
+            kind = str(item.get("kind") or item.get("type") or "text").strip().lower()
+            score, tags = _score_model_ui_candidate(text, kind, bbox, request=request, screen_size=image_size)
+            if "browser_url_penalty" in tags:
+                continue
+            if score <= 0:
+                continue
+            left, top, right, bottom = bbox
+            extracted.append(
+                {
+                    "candidate_id": f"model-ui-{index:02d}",
+                    "text": text[:160],
+                    "kind": kind or "text",
+                    "bbox": [left, top, right, bottom],
+                    "click_point": [int((left + right) / 2), int((top + bottom) / 2)],
+                    "score": int(score),
+                    "confidence": confidence,
+                    "reason_tags": tags,
+                }
+            )
+        has_direct_target_candidate = any(
+            "target_like" in {str(tag) for tag in item.get("reason_tags") or []}
+            for item in extracted
+        )
+        if has_direct_target_candidate and _looks_like_search_results_observation(request):
+            for item in extracted:
+                tags = [str(tag) for tag in item.get("reason_tags") or []]
+                if "target_like" in tags:
+                    continue
+                text = str(item.get("text") or "").strip().lower()
+                if "download_like" not in tags and "install_like" not in tags:
+                    continue
+                if _has_ascii_target() and _has_hangul_product_download_alias_text(text):
+                    cleaned_tags = [tag for tag in tags if tag != "offtarget_search_result_penalty"]
+                    penalty_recovery = 60 if "offtarget_search_result_penalty" in tags else 0
+                    item["score"] = int(item.get("score") or 0) + 16 + penalty_recovery
+                    item["reason_tags"] = list(dict.fromkeys([*cleaned_tags, "target_alias_like", "target_like"]))
+                elif _has_hangul_target() and _has_latin_product_download_alias_text(text):
+                    cleaned_tags = [tag for tag in tags if tag != "offtarget_search_result_penalty"]
+                    penalty_recovery = 60 if "offtarget_search_result_penalty" in tags else 0
+                    item["score"] = int(item.get("score") or 0) + 16 + penalty_recovery
+                    item["reason_tags"] = list(dict.fromkeys([*cleaned_tags, "target_alias_like", "target_like"]))
+        extracted.sort(key=lambda item: (int(item.get("score", 0)), item.get("bbox", [0, 0, 0, 0])[1] * -1), reverse=True)
+        return extracted[:8]
+
+    def _needs_search_results_retry(candidates: list[dict[str, Any]]) -> bool:
+        if not search_results_focus:
+            return False
+        if not candidates:
+            return True
+        useful_tags = {
+            "target_like",
+            "download_like",
+            "install_like",
+            "installer_dialog_control",
+            "search_result_domain_like",
+        }
+        if any("search_result_domain_like" in {str(tag) for tag in item.get("reason_tags") or []} for item in candidates):
+            return False
+        for item in candidates:
+            tags = {str(tag) for tag in item.get("reason_tags") or []}
+            if not useful_tags.intersection(tags):
+                continue
+            if "offtarget_search_result_penalty" in tags and "target_like" not in tags:
+                continue
+            if "search_result_side_panel_penalty" in tags:
+                continue
+            return False
+        return True
+
+    generated, elements = _generate_elements(search_results_retry=False)
+    candidates = _elements_to_candidates(elements)
+    search_results_retry_used = False
+    if _needs_search_results_retry(candidates):
+        retry_generated, retry_elements = _generate_elements(search_results_retry=True)
+        retry_candidates = _elements_to_candidates(retry_elements)
+        if retry_candidates:
+            generated = retry_generated
+            elements = retry_elements
+            candidates = retry_candidates
+            search_results_retry_used = True
+    debug_payload = {
+        "enabled": True,
+        "model_id": generated.model_id,
+        "screenshot_size": screenshot_size_text,
+        "search_results_retry_used": search_results_retry_used,
+        "raw_text": generated.text[:4000],
+        "parsed_element_count": len(elements),
+        "candidates": candidates,
+    }
+    if generation_context and generation_context.get("run_dir") and generation_context.get("step_id"):
+        run_dir = Path(str(generation_context["run_dir"]))
+        step_id = str(generation_context["step_id"])
+        _write_json(run_dir / "responses" / f"{step_id}.model-ui-candidates.json", debug_payload)
+    if not candidates:
+        if search_results_focus:
+            target_terms = _visible_flow_extra_targets(request, limit=4)
+            return (
+                "MODEL_VISIBLE_UI_CANDIDATES: []\n"
+                "No target-matching model-visible UI candidates were extracted from the latest search-results screenshot.\n"
+                f"SEARCH_RESULTS_TARGET_TERMS: {json.dumps(target_terms, ensure_ascii=False)}\n"
+                "Do not click generic Windows/Microsoft download/install results unless the visible title contains one of those target terms or a clear vendor/product domain for the task."
+            )
+        return "MODEL_VISIBLE_UI_CANDIDATES: []\nNo model-visible UI candidates were extracted from the latest screenshot."
+    return (
+        "MODEL_VISIBLE_UI_CANDIDATES:\n"
+        "These candidates come from local model visual extraction of the latest screenshot, not Windows OCR.\n"
+        "Prefer a high-ranked candidate's click_point for visible page-content or installer controls. Avoid browser toolbar/address/tab/bookmark/taskbar/dock regions.\n"
+        "For install chunks, try candidates tagged installer_dialog_control before relaunching installers, using silent switches, or scanning installed app folders.\n"
+        + json.dumps(
+            {
+                "screenshot_size": screenshot_size_text,
+                "candidates": candidates,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def _request_with_model_ui_candidates(
+    *,
+    runtime: AgentRuntime,
+    request: StepRequest,
+    max_new_tokens: int,
+    generation_context: dict[str, Any] | None,
+) -> StepRequest:
+    observation = _model_ui_candidates_observation(
+        runtime=runtime,
+        request=request,
+        max_new_tokens=max_new_tokens,
+        generation_context=generation_context,
+    )
+    if not observation:
+        return request
+    existing_observation = str(request.observation_text or "").strip()
+    merged_observation = observation if not existing_observation else f"{existing_observation}\n\n{observation}"
+    return StepRequest(
+        user_prompt=request.user_prompt,
+        policy=request.policy,
+        execution_style=request.execution_style,
+        request_kind=request.request_kind,
+        repair_context=request.repair_context,
+        replan_requested=request.replan_requested,
+        replan_reasons=list(request.replan_reasons),
+        strong_visual_grounding=request.strong_visual_grounding,
+        reasoning_enabled=request.reasoning_enabled,
+        screenshot_path=request.screenshot_path,
+        screenshot_base64=request.screenshot_base64,
+        screenshot_media_type=request.screenshot_media_type,
+        observation_text=merged_observation,
+        web_search_context=request.web_search_context,
+        recent_history=list(request.recent_history) + ["system_hint=use MODEL_VISIBLE_UI_CANDIDATES click_point values for visible UI controls before inventing new coordinates"],
+        last_execution=request.last_execution,
+        step_index=request.step_index,
+    )
+
+
+def _model_ui_candidates_from_observation(observation_text: str | None) -> list[dict[str, Any]]:
+    text = str(observation_text or "")
+    if "MODEL_VISIBLE_UI_CANDIDATES" not in text:
+        return []
+    payload = _extract_json_object_or_array(text)
+    if not isinstance(payload, dict):
+        return []
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list):
+        return []
+    return [item for item in candidates if isinstance(item, dict)]
+
+
+def _has_model_ui_download_action_candidate(candidates: list[dict[str, Any]]) -> bool:
+    download_terms = (
+        "download",
+        "downloads",
+        "downloading",
+        "installer",
+        "setup",
+        "windows",
+        "win64",
+        "x64",
+        "윈도우",
+        "다운로드",
+        "내려받기",
+        "받기",
+    )
+    for item in candidates:
+        tags = {str(tag) for tag in (item.get("reason_tags") or item.get("tags") or [])}
+        if tags.intersection({"download_like", "installer_filename"}):
+            return True
+        text = str(item.get("text") or "").strip().lower()
+        if re.search(r"\.(exe|msi|zip|alz)\b", text):
+            return True
+        if any(term in text for term in download_terms):
+            return True
+    return False
+
+
+def _has_model_ui_target_action_candidate(candidates: list[dict[str, Any]]) -> bool:
+    for item in candidates:
+        tags = {str(tag) for tag in (item.get("reason_tags") or item.get("tags") or [])}
+        if "target_like" not in tags:
+            continue
+        if tags.intersection({"browser_chrome_penalty", "toolbar_text_penalty", "taskbar_penalty", "store_result_penalty"}):
+            continue
+        if "browser_url_penalty" in tags:
+            continue
+        point = item.get("click_point") or item.get("point")
+        if not isinstance(point, list) or len(point) < 2:
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        return True
+    return False
+
+
+def _visible_candidate_text_signature(candidates: list[dict[str, Any]]) -> tuple[str, ...]:
+    values: list[str] = []
+    for item in candidates:
+        text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip().lower()
+        if text:
+            values.append(text[:160])
+    return tuple(sorted(values))
+
+
+def _last_execution_visible_candidates(last_execution: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(last_execution, dict):
+        return []
+    payload_metadata = last_execution.get("payload_metadata")
+    if not isinstance(payload_metadata, dict):
+        return []
+    agent_response = payload_metadata.get("agent_response")
+    if not isinstance(agent_response, dict):
+        return []
+    code = str(agent_response.get("python_code") or "")
+    if "VISIBLE_CANDIDATES" not in code:
+        return []
+    try:
+        parsed = ast.parse(code)
+    except SyntaxError:
+        return []
+    for node in parsed.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "VISIBLE_CANDIDATES" for target in node.targets):
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except (ValueError, SyntaxError):
+            return []
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        return []
+    return []
+
+
+def _should_use_model_ui_download_recovery(request: StepRequest) -> bool:
+    if not _MODEL_UI_CANDIDATES_ENABLED:
+        return False
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    if _looks_like_existing_installer_launch_task(request.user_prompt):
+        return False
+    if _looks_like_launch_app_chunk_task(request.user_prompt):
+        return False
+    if not _looks_like_download_artifact_only_chunk(request.user_prompt):
+        return False
+    candidates = _model_ui_candidates_from_observation(request.observation_text)
+    if not candidates:
+        return False
+    if _looks_like_exhausted_visible_download_recovery(request.last_execution):
+        previous_candidates = _last_execution_visible_candidates(request.last_execution)
+        if not previous_candidates:
+            return False
+        if _visible_candidate_text_signature(previous_candidates) == _visible_candidate_text_signature(candidates):
+            return False
+    if (
+        int(request.step_index or 0) <= 1
+        and _last_execution_opened_search_results(request.last_execution)
+        and not _has_model_ui_download_action_candidate(candidates)
+    ):
+        return False
+    combined_runtime = "\n".join(
+        str(value or "")
+        for value in (
+            request.last_execution.get("stdout_tail"),
+            request.last_execution.get("stderr_tail"),
+        )
+    ).lower()
+    if (
+        int(request.step_index or 0) >= 4
+        and "click visible download candidate" in combined_runtime
+        and "recent installer download did not appear" in combined_runtime
+        and len(candidates) <= 1
+    ):
+        previous_candidates = _last_execution_visible_candidates(request.last_execution)
+        if not previous_candidates:
+            return False
+        if _visible_candidate_text_signature(previous_candidates) == _visible_candidate_text_signature(candidates):
+            return False
+    if _has_model_ui_download_action_candidate(candidates):
+        return True
+    return int(request.step_index or 0) >= 2 and _has_model_ui_target_action_candidate(candidates)
+
+
+def _should_use_model_ui_installer_recovery(request: StepRequest) -> bool:
+    if not _MODEL_UI_CANDIDATES_ENABLED:
+        return False
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    return _looks_like_existing_installer_launch_task(request.user_prompt)
+
+
+def _should_use_model_ui_launch_recovery(request: StepRequest) -> bool:
+    if not _MODEL_UI_CANDIDATES_ENABLED:
+        return False
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    if _looks_like_existing_installer_launch_task(request.user_prompt):
+        return False
+    return _looks_like_launch_app_chunk_task(request.user_prompt)
+
+
+def _synthesized_model_ui_download_recovery_code(request: StepRequest) -> str:
+    candidates = _model_ui_candidates_from_observation(request.observation_text)
+    ranked_candidates: list[dict[str, Any]] = []
+    seen_points: set[tuple[int, int]] = set()
+    reject_terms = (
+        "cancel",
+        "취소",
+        "close",
+        "닫기",
+        "no",
+        "아니",
+        "address",
+        "bookmark",
+        "tab",
+        "url",
+        "주소",
+        "검색어",
+        "microsoft store",
+        "windows store",
+        "app store",
+        "스토어",
+    )
+    explicit_download_terms = (
+        "download",
+        "다운로드",
+        "install",
+        "설치",
+        "installer",
+        "setup",
+        ".exe",
+        ".msi",
+        ".zip",
+        ".alz",
+        "windows",
+        "win32",
+        "win64",
+        "x64",
+    )
+    for item in candidates:
+        text = str(item.get("text") or "")
+        lowered = text.lower()
+        if any(term in lowered for term in reject_terms):
+            continue
+        explicit_download_text = any(term in lowered for term in explicit_download_terms)
+        point = item.get("click_point")
+        if not isinstance(point, list) or len(point) < 2:
+            continue
+        try:
+            x, y = int(point[0]), int(point[1])
+        except (TypeError, ValueError):
+            continue
+        key = (x, y)
+        if key in seen_points:
+            continue
+        tags = [str(tag) for tag in item.get("reason_tags") or []]
+        bbox = item.get("bbox")
+        normalized_bbox: list[int] | None = None
+        if isinstance(bbox, list) and len(bbox) >= 4:
+            try:
+                normalized_bbox = [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
+            except (TypeError, ValueError):
+                normalized_bbox = None
+        if (
+            "browser_chrome_penalty" in tags
+            or "browser_url_penalty" in tags
+            or "toolbar_text_penalty" in tags
+            or "taskbar_penalty" in tags
+            or "store_result_penalty" in tags
+            or "portable_package_penalty" in tags
+        ):
+            continue
+        seen_points.add(key)
+        ranked_candidates.append(
+            {
+                "text": text[:160],
+                "point": [x, y],
+                "score": int(item.get("score") or 0),
+                "tags": tags,
+                "bbox": normalized_bbox,
+                "explicit_download_text": explicit_download_text,
+            }
+        )
+    merged_candidates: list[dict[str, Any]] = []
+    for item in sorted(
+        ranked_candidates,
+        key=lambda entry: (
+            int((entry.get("bbox") or [entry["point"][0], 0, 0, 0])[1]),
+            int((entry.get("bbox") or [0, 0, 0, 0])[0] if entry.get("bbox") else entry["point"][0]),
+        ),
+    ):
+        bbox = item.get("bbox")
+        if not isinstance(bbox, list) or len(bbox) < 4:
+            merged_candidates.append(dict(item))
+            continue
+        merged = False
+        for existing in merged_candidates:
+            existing_bbox = existing.get("bbox")
+            if not isinstance(existing_bbox, list) or len(existing_bbox) < 4:
+                continue
+            if str(existing.get("text") or "") != str(item.get("text") or ""):
+                continue
+            existing_tags = {str(tag) for tag in existing.get("tags") or []}
+            current_tags = {str(tag) for tag in item.get("tags") or []}
+            if not existing_tags.intersection({"download_like", "target_like", "installer_filename"}):
+                continue
+            if not current_tags.intersection({"download_like", "target_like", "installer_filename"}):
+                continue
+            if abs(int(existing_bbox[1]) - int(bbox[1])) > 28:
+                continue
+            if int(bbox[0]) > int(existing_bbox[2]) + 96:
+                continue
+            existing_bbox[0] = min(int(existing_bbox[0]), int(bbox[0]))
+            existing_bbox[1] = min(int(existing_bbox[1]), int(bbox[1]))
+            existing_bbox[2] = max(int(existing_bbox[2]), int(bbox[2]))
+            existing_bbox[3] = max(int(existing_bbox[3]), int(bbox[3]))
+            existing["point"] = [
+                int((int(existing_bbox[0]) + int(existing_bbox[2])) / 2),
+                int((int(existing_bbox[1]) + int(existing_bbox[3])) / 2),
+            ]
+            existing["score"] = max(int(existing.get("score") or 0), int(item.get("score") or 0))
+            existing["tags"] = list(dict.fromkeys([*existing.get("tags", []), *item.get("tags", [])]))
+            merged = True
+            break
+        if not merged:
+            merged_candidates.append(dict(item))
+    ranked_candidates = merged_candidates
+    search_results_focus_for_ranking = _looks_like_search_results_observation(request)
+
+    def _candidate_rank_key(item: dict[str, Any]) -> tuple[int, int, int, int, int, int]:
+        tags = {str(tag) for tag in item.get("tags") or []}
+        if search_results_focus_for_ranking:
+            return (
+                0 if "offtarget_search_result_penalty" in tags and "target_like" not in tags else 1,
+                1 if "target_like" in tags else 0,
+                1 if "download_like" in tags else 0,
+                1 if bool(item.get("explicit_download_text")) else 0,
+                1 if "installer_filename" in tags else 0,
+                int(item.get("score") or 0),
+            )
+        return (
+            1,
+            1 if "download_like" in tags else 0,
+            1 if bool(item.get("explicit_download_text")) else 0,
+            1 if "installer_filename" in tags else 0,
+            1 if "target_like" in tags else 0,
+            int(item.get("score") or 0),
+        )
+
+    ranked_candidates.sort(key=_candidate_rank_key, reverse=True)
+    preferred_candidates = [
+        item
+        for item in ranked_candidates
+        if (
+            not (
+                search_results_focus_for_ranking
+                and "offtarget_search_result_penalty" in item["tags"]
+                and "target_like" not in item["tags"]
+            )
+            and (
+                "download_like" in item["tags"]
+                or "installer_filename" in item["tags"]
+                or bool(item.get("explicit_download_text"))
+            )
+        )
+    ]
+    fallback_target_candidates = [
+        item
+        for item in ranked_candidates
+        if item not in preferred_candidates and "target_like" in item["tags"]
+    ]
+    if preferred_candidates:
+        selected_candidates: list[dict[str, Any]] = [preferred_candidates[0]]
+        for item in fallback_target_candidates:
+            if item not in selected_candidates:
+                selected_candidates.append(item)
+            if len(selected_candidates) >= 2:
+                break
+        for item in preferred_candidates[1:]:
+            if item not in selected_candidates:
+                selected_candidates.append(item)
+            if len(selected_candidates) >= 3:
+                break
+        ranked_candidates = selected_candidates[:3]
+    else:
+        ranked_candidates = ranked_candidates[:3]
+    target_terms = _visible_flow_extra_targets(request, limit=8)
+    context_prompt_key, context_prompt_excerpt = _context_prompt_key_for_target_terms(request, target_terms)
+    prompt_url = _select_request_prompt_browser_url(request)
+    fallback_search_url = _fallback_browser_search_url_for_request(request, extra_targets=target_terms[:2]) if not prompt_url else None
+    search_results_focus = _looks_like_search_results_observation(request)
+    primary_fallback_query = _search_query_from_url(prompt_url or fallback_search_url or "")
+    fallback_alternate_search_urls = _fallback_alternate_search_urls_from_parts(
+        target_terms,
+        excluded_queries=[primary_fallback_query] if primary_fallback_query else None,
+    )
+    lines = [
+        "from pathlib import Path",
+        "import json",
+        "import re",
+        "import subprocess",
+        "import time",
+        "import urllib.parse",
+        "",
+        "import pyautogui",
+        "",
+        f"TARGET_TERMS = {repr(target_terms)}",
+        f"VISIBLE_CANDIDATES = {repr(ranked_candidates)}",
+        f"PROMPT_URL = {repr(prompt_url)}",
+        f"FALLBACK_SEARCH_URL = {repr(fallback_search_url)}",
+        f"FALLBACK_ALTERNATE_SEARCH_URLS = {repr(fallback_alternate_search_urls)}",
+        f"SEARCH_RESULTS_FOCUS = {repr(bool(search_results_focus))}",
+        "CONTEXT_PATH = Path.home() / 'Downloads' / 'computer-use-agent-context.json'",
+        f"CONTEXT_PROMPT_KEY = {json.dumps(context_prompt_key, ensure_ascii=False)}",
+        f"CONTEXT_PROMPT_EXCERPT = {json.dumps(context_prompt_excerpt, ensure_ascii=False)}",
+        "RECOVERY_URL_ATTEMPTS = set()",
+        "pyautogui.PAUSE = 0.18",
+        "pyautogui.FAILSAFE = False",
+        "",
+        "def _path_matches_reuse_target(path_text):",
+        "    strict_terms = []",
+        "    for raw in TARGET_TERMS:",
+        "        term = str(raw or '').lower().strip()",
+        "        if len(term) >= 4 and re.fullmatch(r'[a-z0-9][a-z0-9._-]*', term):",
+        "            strict_terms.append(term)",
+        "    if not strict_terms:",
+        "        return True",
+        "    lowered = str(path_text or '').lower()",
+        "    return any(term in lowered for term in strict_terms)",
+        "",
+        "def _normalize_search_query_text(query):",
+        "    normalized = urllib.parse.unquote_plus(str(query or '')).strip().lower()",
+        "    if not normalized:",
+        "        return ''",
+        "    return re.sub(r'\\s+', ' ', normalized)",
+        "",
+        "def _search_query_fingerprint(query):",
+        "    normalized = _normalize_search_query_text(query)",
+        "    if not normalized:",
+        "        return ''",
+        "    generic_terms = {'download', 'downloads', 'install', 'installer', 'setup', 'windows', 'window', 'pc', 'desktop', 'client', 'x64', 'x86', '64', '64bit', '64-bit', 'win64'}",
+        "    terms = [term for term in re.split(r'\\s+', normalized) if term and term not in generic_terms]",
+        "    return ' '.join(terms) or normalized",
+        "",
+        "def _search_query_from_url(url):",
+        "    try:",
+        "        parsed = urllib.parse.urlparse(str(url or '').strip())",
+        "    except ValueError:",
+        "        return ''",
+        "    values = urllib.parse.parse_qs(str(parsed.query or ''), keep_blank_values=False).get('q') or []",
+        "    return urllib.parse.unquote_plus(str(values[0] or '')).strip() if values else ''",
+        "",
+        "def _recovery_host_key(url):",
+        "    try:",
+        "        parsed = urllib.parse.urlparse(str(url or '').strip())",
+        "    except ValueError:",
+        "        return ''",
+        "    labels = [label for label in str(parsed.netloc or '').lower().split('.') if label and label != 'www']",
+        "    if len(labels) >= 2:",
+        "        return '.'.join(labels[-2:])",
+        "    return str(parsed.netloc or '').lower()",
+        "",
+        "def _recovery_url_key(url):",
+        "    try:",
+        "        parsed = urllib.parse.urlparse(str(url or '').strip())",
+        "    except ValueError:",
+        "        return ''",
+        "    if not parsed.scheme or not parsed.netloc:",
+        "        return ''",
+        "    return urllib.parse.urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or '/', '', parsed.query, ''))",
+        "",
+        "def _is_search_engine_url(url):",
+        "    host = _recovery_host_key(url)",
+        "    return any(token in host for token in ('google', 'bing', 'duckduckgo', 'yahoo', 'naver', 'daum'))",
+        "",
+        "def _context_payload():",
+        "    return ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)",
+        "",
+        "def _context_list(payload, key):",
+        "    value = payload.get(key) if isinstance(payload, dict) else []",
+        "    return [str(item).strip().lower() for item in value if str(item).strip()] if isinstance(value, list) else []",
+        "",
+        "def _recovery_url_already_failed(url):",
+        "    payload = _context_payload()",
+        "    url_key = _recovery_url_key(url).lower()",
+        "    query_fingerprint = _search_query_fingerprint(_search_query_from_url(url))",
+        "    host_key = _recovery_host_key(url)",
+        "    failed_urls = set(_context_list(payload, 'failed_recovery_urls'))",
+        "    failed_queries = set(_context_list(payload, 'failed_recovery_search_queries'))",
+        "    failed_hosts = set(_context_list(payload, 'failed_recovery_hosts'))",
+        "    if url_key and url_key in failed_urls:",
+        "        return True",
+        "    if query_fingerprint and query_fingerprint in failed_queries:",
+        "        return True",
+        "    if host_key and not _is_search_engine_url(url) and host_key in failed_hosts:",
+        "        return True",
+        "    return False",
+        "",
+        "def _record_failed_recovery_url(url, reason):",
+        "    payload = _context_payload()",
+        "    failed_urls = _context_list(payload, 'failed_recovery_urls')",
+        "    failed_queries = _context_list(payload, 'failed_recovery_search_queries')",
+        "    failed_hosts = _context_list(payload, 'failed_recovery_hosts')",
+        "    url_key = _recovery_url_key(url).lower()",
+        "    query_fingerprint = _search_query_fingerprint(_search_query_from_url(url))",
+        "    host_key = _recovery_host_key(url)",
+        "    if url_key and url_key not in failed_urls:",
+        "        failed_urls.append(url_key)",
+        "    if query_fingerprint and query_fingerprint not in failed_queries:",
+        "        failed_queries.append(query_fingerprint)",
+        "    if host_key and not _is_search_engine_url(url) and host_key not in failed_hosts:",
+        "        failed_hosts.append(host_key)",
+        "    write_action_context(",
+        "        CONTEXT_PATH,",
+        "        prompt_key=CONTEXT_PROMPT_KEY,",
+        "        prompt_excerpt=CONTEXT_PROMPT_EXCERPT,",
+        "        phase='download_recovery_failed',",
+        "        target_keywords=TARGET_TERMS,",
+        "        failed_recovery_urls=failed_urls[-16:],",
+        "        failed_recovery_search_queries=failed_queries[-16:],",
+        "        failed_recovery_hosts=failed_hosts[-16:],",
+        "        last_failed_recovery_reason=str(reason)[-240:],",
+        "    )",
+        "",
+        "def _existing_context_download():",
+        "    payload = ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)",
+        "    candidate = str(payload.get('installer_path') or '').strip().strip('\"')",
+        "    if not candidate:",
+        "        return None",
+        "    if not _path_matches_reuse_target(candidate):",
+        "        print(f'ignoring continuity artifact that does not match target filename/path: {candidate}')",
+        "        return None",
+        "    try:",
+        "        ready = wait_for_stable_download(candidate, min_bytes=1_000_000, timeout_s=8.0)",
+        "        print(f'using previously downloaded artifact: {ready}')",
+        "        return ready",
+        "    except SystemExit as exc:",
+        "        print(f'ignoring stale continuity artifact: {exc}')",
+        "        return None",
+        "",
+        "def _candidate_identity(candidate):",
+        "    if not isinstance(candidate, dict):",
+        "        return {}",
+        "    identity = {",
+        "        'text': str(candidate.get('text') or '').strip(),",
+        "        'point': [int((candidate.get('point') or [0, 0])[0]), int((candidate.get('point') or [0, 0])[1])],",
+        "    }",
+        "    bbox = candidate.get('bbox') or []",
+        "    if isinstance(bbox, list) and len(bbox) >= 4:",
+        "        try:",
+        "            identity['bbox'] = [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]",
+        "        except (TypeError, ValueError):",
+        "            pass",
+        "    return identity",
+        "",
+        "def _same_candidate(candidate, remembered):",
+        "    if not isinstance(candidate, dict) or not isinstance(remembered, dict):",
+        "        return False",
+        "    candidate_text = str(candidate.get('text') or '').strip().lower()",
+        "    remembered_text = str(remembered.get('text') or '').strip().lower()",
+        "    if candidate_text and remembered_text and candidate_text != remembered_text:",
+        "        return False",
+        "    candidate_point = candidate.get('point') or []",
+        "    remembered_point = remembered.get('point') or []",
+        "    if isinstance(candidate_point, list) and len(candidate_point) >= 2 and isinstance(remembered_point, list) and len(remembered_point) >= 2:",
+        "        try:",
+        "            if abs(int(candidate_point[0]) - int(remembered_point[0])) <= 12 and abs(int(candidate_point[1]) - int(remembered_point[1])) <= 12:",
+        "                return True",
+        "        except (TypeError, ValueError):",
+        "            pass",
+        "    candidate_bbox = candidate.get('bbox') or []",
+        "    remembered_bbox = remembered.get('bbox') or []",
+        "    if isinstance(candidate_bbox, list) and len(candidate_bbox) >= 4 and isinstance(remembered_bbox, list) and len(remembered_bbox) >= 4:",
+        "        try:",
+        "            if abs(int(candidate_bbox[0]) - int(remembered_bbox[0])) <= 16 and abs(int(candidate_bbox[1]) - int(remembered_bbox[1])) <= 16:",
+        "                return True",
+        "        except (TypeError, ValueError):",
+        "            pass",
+        "    return bool(candidate_text and remembered_text and candidate_text == remembered_text)",
+        "",
+        "def _current_visible_signature(candidates):",
+        "    parts = []",
+        "    for candidate in list(candidates or [])[:6]:",
+        "        identity = _candidate_identity(candidate)",
+        "        point = identity.get('point') or [0, 0]",
+        "        bbox = identity.get('bbox') or []",
+        "        bbox_key = ''",
+        "        if isinstance(bbox, list) and len(bbox) >= 4:",
+        "            bbox_key = f\"{int(bbox[0]) // 12}:{int(bbox[1]) // 12}:{int(bbox[2]) // 12}:{int(bbox[3]) // 12}\"",
+        "        parts.append(f\"{str(identity.get('text') or '').strip().lower()}|{int(point[0]) // 12}:{int(point[1]) // 12}|{bbox_key}\")",
+        "    return '||'.join(parts)",
+        "",
+        "def _recent_attempted_candidates():",
+        "    payload = ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)",
+        "    installer_path = str(payload.get('installer_path') or '').strip()",
+        "    if installer_path and _path_matches_reuse_target(installer_path):",
+        "        return []",
+        "    history = payload.get('visible_click_history') or []",
+        "    if not isinstance(history, list):",
+        "        return []",
+        "    stored_signature = str(payload.get('visible_candidate_signature') or '').strip()",
+        "    current_signature = _current_visible_signature(VISIBLE_CANDIDATES)",
+        "    if stored_signature and current_signature and stored_signature != current_signature:",
+        "        return []",
+        "    recent = []",
+        "    now = time.time()",
+        "    for item in history:",
+        "        if not isinstance(item, dict):",
+        "            continue",
+        "        clicked_at = float(item.get('clicked_at') or 0.0)",
+        "        if clicked_at and (now - clicked_at) > 900.0:",
+        "            continue",
+        "        candidate = item.get('candidate')",
+        "        if isinstance(candidate, dict):",
+        "            recent.append(candidate)",
+        "    return recent",
+        "",
+        "def _candidate_text_key(candidate):",
+        "    return re.sub(r'\\s+', ' ', str((candidate or {}).get('text') or '').strip().lower())",
+        "",
+        "def _candidate_attempt_count(candidate, attempted_candidates):",
+        "    key = _candidate_text_key(candidate)",
+        "    if not key:",
+        "        return 0",
+        "    return sum(1 for attempted in attempted_candidates if _candidate_text_key(attempted) == key)",
+        "",
+        "def _record_clicked_candidate(candidate, point):",
+        "    payload = ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)",
+        "    history = payload.get('visible_click_history') or []",
+        "    if not isinstance(history, list):",
+        "        history = []",
+        "    history = [item for item in history if isinstance(item, dict)]",
+        "    history.append({'candidate': _candidate_identity(candidate), 'clicked_at': time.time()})",
+        "    write_action_context(",
+        "        CONTEXT_PATH,",
+        "        prompt_key=CONTEXT_PROMPT_KEY,",
+        "        prompt_excerpt=CONTEXT_PROMPT_EXCERPT,",
+        "        phase='download_click_attempted',",
+        "        visible_click_history=history[-8:],",
+        "        visible_candidate_signature=_current_visible_signature(VISIBLE_CANDIDATES),",
+        "        target_keywords=TARGET_TERMS,",
+        "        source_url=(PROMPT_URL or FALLBACK_SEARCH_URL),",
+        "    )",
+        "",
+        "def _candidate_points(candidate):",
+        "    point = candidate.get('point') or [0, 0]",
+        "    x, y = int(point[0]), int(point[1])",
+        "    tags = [str(tag) for tag in candidate.get('tags') or []]",
+        "    bbox = candidate.get('bbox') or []",
+        "    points = []",
+        "    if isinstance(bbox, list) and len(bbox) >= 4:",
+        "        left, top, right, bottom = [int(value) for value in bbox[:4]]",
+        "        center_x = int((left + right) / 2)",
+        "        center_y = int((top + bottom) / 2)",
+        "        lower_y = min(max(5, bottom - 6), center_y + min(20, max(8, int((bottom - top) * 0.25))))",
+        "        quarter_left = int(left + max(10, (right - left) * 0.25))",
+        "        quarter_right = int(right - max(10, (right - left) * 0.25))",
+        "        points.extend([",
+        "            (center_x, center_y),",
+        "            (quarter_left, center_y),",
+        "            (quarter_right, center_y),",
+        "            (center_x, lower_y),",
+        "        ])",
+        "    else:",
+        "        points.append((x, y))",
+        "    if any(tag in tags for tag in ('button_shape', 'download_like', 'installer_filename')) and len(points) < 6:",
+        "        for delta_x in (-80, 80):",
+        "            adjusted = (max(5, x + delta_x), y)",
+        "            if adjusted not in points:",
+        "                points.append(adjusted)",
+        "    deduped = []",
+        "    for adjusted in points:",
+        "        if adjusted not in deduped:",
+        "            deduped.append(adjusted)",
+        "    return deduped[:4]",
+        "",
+        "def _record_download(path_value, *, source_url=None):",
+        "    if not _path_matches_reuse_target(path_value):",
+        "        raise SystemExit(f'downloaded artifact does not match target filename/path: {path_value}')",
+        "    write_action_context(",
+        "        CONTEXT_PATH,",
+        "        prompt_key=CONTEXT_PROMPT_KEY,",
+        "        prompt_excerpt=CONTEXT_PROMPT_EXCERPT,",
+        "        phase='downloaded',",
+        "        installer_path=str(path_value),",
+        "        target_keywords=TARGET_TERMS,",
+        "        source_url=(source_url or PROMPT_URL or FALLBACK_SEARCH_URL),",
+        "    )",
+        "",
+        "def _wait_for_download_progress(since_ts, timeout_s=6.0):",
+        "    deadline = time.time() + max(2.0, float(timeout_s))",
+        "    downloads = Path.home() / 'Downloads'",
+        "    patterns = ('*.crdownload', '*.part', '*.partial', '*.tmp', '*.exe', '*.msi', '*.zip', '*.alz')",
+        "    while time.time() < deadline:",
+        "        recent = []",
+        "        for pattern in patterns:",
+        "            for path in downloads.glob(pattern):",
+        "                try:",
+        "                    stat = path.stat()",
+        "                except OSError:",
+        "                    continue",
+        "                if stat.st_mtime < float(since_ts) - 1.0 or stat.st_size <= 0:",
+        "                    continue",
+        "                recent.append((stat.st_mtime, path))",
+        "        if recent:",
+        "            recent.sort(key=lambda item: item[0], reverse=True)",
+        "            return recent[0][1]",
+        "        time.sleep(0.5)",
+        "    return None",
+        "",
+        "def _is_success_exit(exc):",
+        "    code = getattr(exc, 'code', exc)",
+        "    return code in (0, None)",
+        "",
+        "def _is_partial_progress_exit(exc):",
+        "    code = str(getattr(exc, 'code', exc) or '').lower()",
+        "    return 'continue with latest screenshot and model-visible ui candidates' in code",
+        "",
+        "def _isolated_recovery_urls():",
+        "    urls = []",
+        "    for candidate in [PROMPT_URL, FALLBACK_SEARCH_URL, *FALLBACK_ALTERNATE_SEARCH_URLS]:",
+        "        cleaned = str(candidate or '').strip()",
+        "        if cleaned and _recovery_url_already_failed(cleaned):",
+        "            print(f'skipping previously failed recovery URL/query/host: {cleaned}')",
+        "            continue",
+        "        if cleaned and cleaned not in urls:",
+        "            urls.append(cleaned)",
+        "    return urls[:2]",
+        "",
+        "def _try_download_from_isolated_recovery_page():",
+        "    retry_source_urls = _isolated_recovery_urls()",
+        "    if not retry_source_urls:",
+        "        return None",
+        "    for retry_source_url in retry_source_urls:",
+        "        if retry_source_url in RECOVERY_URL_ATTEMPTS:",
+        "            print(f'skipping repeated isolated recovery page: {retry_source_url}')",
+        "            continue",
+        "        RECOVERY_URL_ATTEMPTS.add(retry_source_url)",
+        "        try:",
+        "            open_url_and_wait(retry_source_url, expected_title_tokens=TARGET_TERMS[:3], timeout_s=18.0, settle_time_s=1.5)",
+        "            print(f'opened isolated recovery page: {retry_source_url}')",
+        "            time.sleep(1.0)",
+        "        except SystemExit as exc:",
+        "            print(f'isolated recovery page open failed: {exc}')",
+        "            _record_failed_recovery_url(retry_source_url, exc)",
+        "            continue",
+        "        try:",
+        "            download = download_official_installer_from_page(retry_source_url, extra_targets=TARGET_TERMS, min_bytes=1_000_000)",
+        "            print(f'download recovered from isolated recovery page: {download}')",
+        "            _record_download(download, source_url=retry_source_url)",
+        "            return download",
+        "        except SystemExit as exc:",
+        "            print(f'isolated recovery page did not find a stable installer: {exc}')",
+        "            _record_failed_recovery_url(retry_source_url, exc)",
+        "            raise SystemExit('continue with latest screenshot and model-visible UI candidates after opening isolated recovery page')",
+        "        except Exception as exc:",
+        "            print(f'isolated recovery page recovery failed: {exc}')",
+        "            _record_failed_recovery_url(retry_source_url, exc)",
+        "            raise SystemExit('continue with latest screenshot and model-visible UI candidates after opening isolated recovery page')",
+        "    return None",
+        "",
+        "def _colored_cta_points():",
+        "    try:",
+        "        image = pyautogui.screenshot().convert('RGB')",
+        "    except Exception as exc:",
+        "        print(f'colored CTA screenshot failed: {exc}')",
+        "        return []",
+        "    width, height = image.size",
+        "    step = 10",
+        "    grid_w = max(1, width // step)",
+        "    grid_h = max(1, height // step)",
+        "    pixels = image.load()",
+        "    mask = set()",
+        "    for gy in range(10, grid_h - 8):",
+        "        y = gy * step",
+        "        if y < 120 or y > int(height * 0.88):",
+        "            continue",
+        "        for gx in range(0, grid_w):",
+        "            x = gx * step",
+        "            if x < int(width * 0.18):",
+        "                continue",
+        "            if x > int(width * 0.86) and y > int(height * 0.68):",
+        "                continue",
+        "            r, g, b = pixels[min(x, width - 1), min(y, height - 1)]",
+        "            bright = max(r, g, b)",
+        "            dark = min(r, g, b)",
+        "            saturated = bright >= 120 and (bright - dark) >= 45",
+        "            cta_color = (b >= 130 and g >= 90 and b >= r + 25) or (r >= 145 and r >= g + 35 and r >= b + 35) or (g >= 135 and g >= r + 25 and g >= b + 10)",
+        "            if saturated and cta_color:",
+        "                mask.add((gx, gy))",
+        "    visited = set()",
+        "    components = []",
+        "    for start in list(mask):",
+        "        if start in visited:",
+        "            continue",
+        "        stack = [start]",
+        "        visited.add(start)",
+        "        xs = []",
+        "        ys = []",
+        "        while stack:",
+        "            gx, gy = stack.pop()",
+        "            xs.append(gx)",
+        "            ys.append(gy)",
+        "            for neighbor in ((gx + 1, gy), (gx - 1, gy), (gx, gy + 1), (gx, gy - 1)):",
+        "                if neighbor in mask and neighbor not in visited:",
+        "                    visited.add(neighbor)",
+        "                    stack.append(neighbor)",
+        "        if not xs or not ys:",
+        "            continue",
+        "        left, right = min(xs) * step, (max(xs) + 1) * step",
+        "        top, bottom = min(ys) * step, (max(ys) + 1) * step",
+        "        comp_w = right - left",
+        "        comp_h = bottom - top",
+        "        area = comp_w * comp_h",
+        "        if comp_w < 120 or comp_h < 28 or area < 8000:",
+        "            continue",
+        "        if comp_h > 140 or area > 60000:",
+        "            continue",
+        "        if top < 130 or bottom > int(height * 0.90):",
+        "            continue",
+        "        center_x = int((left + right) / 2)",
+        "        center_y = int((top + bottom) / 2)",
+        "        centrality = -abs(center_x - int(width * 0.62))",
+        "        components.append((area, centrality, center_x, center_y, (left, top, right, bottom)))",
+        "    components.sort(reverse=True)",
+        "    points = []",
+        "    for _area, _centrality, x, y, bbox in components[:4]:",
+        "        point = (int(x), int(y))",
+        "        if point not in points:",
+        "            points.append(point)",
+        "            print(f'colored CTA candidate: point={point} bbox={bbox}')",
+        "    return points",
+        "",
+        "def _try_colored_cta_download(since_ts):",
+        "    for index, (x, y) in enumerate(_colored_cta_points(), start=1):",
+        "        print(f'click colored CTA candidate[{index}] at {(x, y)}')",
+        "        pyautogui.click(x, y)",
+        "        time.sleep(1.0)",
+        "        try:",
+        "            progress = _wait_for_download_progress(since_ts, timeout_s=4.0)",
+        "            if progress is None:",
+        "                raise SystemExit('recent installer download did not appear')",
+        "            print(f'download progress detected after colored CTA click: {progress}')",
+        "            download = wait_for_recent_download_artifact(extra_targets=TARGET_TERMS, min_bytes=1_000_000, timeout_s=45.0, since_ts=since_ts, require_target_match=True)",
+        "            _record_download(download)",
+        "            return download",
+        "        except SystemExit as exc:",
+        "            if _is_success_exit(exc):",
+        "                raise",
+        "            print(f'colored CTA candidate did not finish download: {exc}')",
+        "            raise SystemExit('continue with latest screenshot and model-visible UI candidates after clicking a colored download CTA candidate')",
+        "    return None",
+        "",
+        "download = _existing_context_download()",
+        "if download is not None:",
+        "    _record_download(download)",
+        "    raise SystemExit(0)",
+        "",
+        "try:",
+        "    download = wait_for_recent_download_artifact(",
+        "        extra_targets=TARGET_TERMS,",
+        "        min_bytes=1_000_000,",
+        "        timeout_s=6.0,",
+        "        since_ts=(time.time() - 30.0),",
+        "        require_target_match=True,",
+        "    )",
+        "    print(f'recent download already present: {download}')",
+        "    _record_download(download)",
+        "    raise SystemExit(0)",
+        "except SystemExit as exc:",
+        "    if _is_success_exit(exc):",
+        "        raise",
+        "    print(f'no recent downloaded artifact yet: {exc}')",
+        "",
+        "ATTEMPTED_CANDIDATES = _recent_attempted_candidates()",
+        "CLICK_CANDIDATES = [candidate for candidate in VISIBLE_CANDIDATES if not any(_same_candidate(candidate, attempted) for attempted in ATTEMPTED_CANDIDATES)]",
+        "if not CLICK_CANDIDATES and VISIBLE_CANDIDATES:",
+        "    CLICK_CANDIDATES = sorted(VISIBLE_CANDIDATES, key=lambda candidate: (_candidate_attempt_count(candidate, ATTEMPTED_CANDIDATES), -int(candidate.get('score') or 0)))",
+        "else:",
+        "    CLICK_CANDIDATES = sorted(CLICK_CANDIDATES, key=lambda candidate: (_candidate_attempt_count(candidate, ATTEMPTED_CANDIDATES), -int(candidate.get('score') or 0)))",
+        "CLICK_CANDIDATES = [candidate for candidate in CLICK_CANDIDATES if _candidate_attempt_count(candidate, ATTEMPTED_CANDIDATES) < 2] or CLICK_CANDIDATES",
+        "download_started_at = time.time()",
+        "if CLICK_CANDIDATES:",
+        "    last_error = None",
+        "    for candidate_index, candidate in enumerate(CLICK_CANDIDATES[:3], start=1):",
+        "        points = _candidate_points(candidate)",
+        "        if not points:",
+        "            continue",
+        "        _record_clicked_candidate(candidate, points[0])",
+        "        for point_index, (x, y) in enumerate(points, start=1):",
+        "            print(f\"click visible download candidate[{candidate_index}/{min(3, len(CLICK_CANDIDATES))}]: {candidate.get('text')} at {(x, y)} point={point_index}/{len(points)} tags={candidate.get('tags')}\")",
+        "            pyautogui.click(x, y)",
+        "            time.sleep(0.8)",
+        "            try:",
+        "                progress = _wait_for_download_progress(download_started_at, timeout_s=3.0)",
+        "                if progress is None:",
+        "                    raise SystemExit('recent installer download did not appear')",
+        "                print(f'download progress detected: {progress}')",
+        "                download = wait_for_recent_download_artifact(",
+        "                    extra_targets=TARGET_TERMS,",
+        "                    min_bytes=1_000_000,",
+        "                    timeout_s=45.0,",
+        "                    since_ts=download_started_at,",
+        "                    require_target_match=True,",
+        "                )",
+        "                print(f'download ready after visible click: {download}')",
+        "                _record_download(download)",
+        "                raise SystemExit(0)",
+        "            except SystemExit as exc:",
+        "                if _is_success_exit(exc):",
+        "                    raise",
+        "                if _is_partial_progress_exit(exc):",
+        "                    raise",
+        "                last_error = exc",
+        "                print(f'candidate point {point_index} did not finish download yet: {exc}')",
+        "                if SEARCH_RESULTS_FOCUS and point_index == 1:",
+        "                    print('search result candidate was clicked; stop for a fresh screenshot of the opened page before trying stale search-result coordinates')",
+        "                    raise SystemExit('continue with latest screenshot and model-visible UI candidates after opening a search result candidate')",
+        "        cta_download = _try_colored_cta_download(download_started_at)",
+        "        if cta_download is not None:",
+        "            raise SystemExit(0)",
+        "    recovered = _try_download_from_isolated_recovery_page()",
+        "    if recovered is not None:",
+        "        raise SystemExit(0)",
+        "    raise SystemExit(f'clicked all grounded points for all visible candidates without a stable download: {last_error}')",
+        "elif ATTEMPTED_CANDIDATES and VISIBLE_CANDIDATES:",
+        "    raise SystemExit('the current visible download controls were already attempted on this screen; inspect the updated screenshot for a newly visible continuation control or a different download path')",
+        "elif not VISIBLE_CANDIDATES:",
+        "    raise SystemExit('no visible download-related control remains on the current screen; stop this helper so the next agent step can re-evaluate')",
+        "",
+        "raise SystemExit('no new visible download-related control is available on the current screen; stop this helper so the next agent step can re-evaluate')",
+    ]
+    return "\n".join(lines)
+
+
+def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
+    candidates = _model_ui_candidates_from_observation(request.observation_text)
+    target_terms = _visible_flow_extra_targets(request, limit=8)
+    reject_terms = ("cancel", "취소", "close", "닫기", "no", "아니")
+    installer_control_terms_en = {
+        "ok",
+        "yes",
+        "next",
+        "install",
+        "finish",
+        "agree",
+        "accept",
+        "continue",
+        "run",
+    }
+    installer_control_terms_ko = {
+        "확인",
+        "예",
+        "다음",
+        "설치",
+        "완료",
+        "동의",
+        "계속",
+        "실행",
+    }
+    click_points: list[dict[str, Any]] = []
+    for item in candidates:
+        text = str(item.get("text") or "")
+        tags = [str(tag) for tag in item.get("reason_tags") or []]
+        point = item.get("click_point")
+        if not isinstance(point, list) or len(point) < 2:
+            continue
+        lowered = text.lower()
+        if any(term in lowered for term in reject_terms):
+            continue
+        english_tokens = set(re.findall(r"[a-zA-Z]+", lowered))
+        korean_tokens = set(re.findall(r"[가-힣]+", text))
+        if not (
+            english_tokens.intersection(installer_control_terms_en)
+            or korean_tokens.intersection(installer_control_terms_ko)
+        ):
+            continue
+        if len(text.strip()) > 48 and any(term in lowered for term in target_terms):
+            continue
+        if re.search(r"\bv?\d+(?:\.\d+)+\b", lowered):
+            continue
+        try:
+            x, y = int(point[0]), int(point[1])
+        except (TypeError, ValueError):
+            continue
+        click_points.append({"text": text[:80], "point": [x, y], "tags": tags})
+    click_points = click_points[:5]
+    install_marker = _extract_prompt_install_marker_path(request.user_prompt)
+    lines = [
+        "from pathlib import Path",
+        "import json",
+        "import os",
+        "import re",
+        "import shutil",
+        "import subprocess",
+        "import time",
+        "import zipfile",
+        "",
+        "import pyautogui",
+        "",
+        f"TARGET_TERMS = {json.dumps(target_terms, ensure_ascii=False)}",
+        f"VISIBLE_CLICKS = {json.dumps(click_points, ensure_ascii=False)}",
+        (
+            f"INSTALL_MARKER = Path({json.dumps(install_marker, ensure_ascii=False)}).expanduser()"
+            if install_marker
+            else "INSTALL_MARKER = Path.home() / 'Downloads' / 'install-success.json'"
+        ),
+        "CONTEXT_MARKER = Path.home() / 'Downloads' / 'computer-use-agent-context.json'",
+        "DOWNLOADS = Path.home() / 'Downloads'",
+        "ARCHIVE_SUFFIXES = ('.zip', '.alz')",
+        "INSTALLER_SUFFIXES = ('.exe', '.msi')",
+        "INSTALL_MARKER.parent.mkdir(parents=True, exist_ok=True)",
+        "CONTEXT_MARKER.parent.mkdir(parents=True, exist_ok=True)",
+        "",
+        "def _target_terms():",
+        "    raw_terms = []",
+        "    for raw in TARGET_TERMS:",
+        "        lowered = str(raw or '').lower().strip()",
+        "        if lowered and lowered not in raw_terms:",
+        "            raw_terms.append(lowered)",
+        "    strong_terms = [term for term in raw_terms if re.search(r'[가-힣]', term) or len(term) >= 4]",
+        "    return strong_terms or raw_terms",
+        "",
+        "def _contains_target(text, term):",
+        "    lowered = str(text or '').lower()",
+        "    term = str(term or '').lower().strip()",
+        "    if not term:",
+        "        return False",
+        "    if len(term) < 4 and re.fullmatch(r'[a-z0-9]+', term):",
+        "        return term in re.findall(r'[a-z0-9]+', lowered)",
+        "    return term in lowered",
+        "",
+        "def _read_json(path):",
+        "    try:",
+        "        return json.loads(path.read_text(encoding='utf-8'))",
+        "    except Exception:",
+        "        return {}",
+        "",
+        "def _matches_target(path):",
+        "    terms = _target_terms()",
+        "    lowered = str(path).lower()",
+        "    return not terms or any(_contains_target(lowered, term) for term in terms)",
+        "",
+        "def _package_score(path):",
+        "    lowered = str(path).lower()",
+        "    name = path.name.lower()",
+        "    score = 0",
+        "    matched_terms = 0",
+        "    for term in _target_terms():",
+        "        if _contains_target(lowered, term):",
+        "            score += 30 if _contains_target(name, term) else 14",
+        "            matched_terms += 1",
+        "    if path.suffix.lower() in INSTALLER_SUFFIXES:",
+        "        score += 30",
+        "    elif path.suffix.lower() in ARCHIVE_SUFFIXES:",
+        "        score += 18",
+        "    if 'portable' in lowered:",
+        "        score -= 45",
+        "    if any(token in lowered for token in ('unins', 'uninstall', 'update', 'updater')):",
+        "        score -= 60",
+        "    if any(token in lowered for token in ('setup', 'installer', 'install', 'msi')):",
+        "        score += 16",
+        "    try:",
+        "        mtime = float(path.stat().st_mtime)",
+        "    except OSError:",
+        "        mtime = 0.0",
+        "    return score, matched_terms, mtime",
+        "",
+        "def _candidate_packages():",
+        "    terms = _target_terms()",
+        "    candidates = []",
+        "    seen = set()",
+        "",
+        "    def _append(path):",
+        "        if path is None:",
+        "            return",
+        "        candidate = Path(os.path.expandvars(os.path.expanduser(str(path).strip().strip('\"'))))",
+        "        key = str(candidate).lower()",
+        "        if not candidate.exists() or not candidate.is_file() or key in seen:",
+        "            return",
+        "        if candidate.suffix.lower() not in INSTALLER_SUFFIXES + ARCHIVE_SUFFIXES:",
+        "            return",
+        "        if terms and not _matches_target(candidate):",
+        "            return",
+        "        seen.add(key)",
+        "        candidates.append(candidate)",
+        "",
+        "    context_payload = _read_json(CONTEXT_MARKER)",
+        "    _append(context_payload.get('installer_path'))",
+        "    install_payload = _read_json(INSTALL_MARKER)",
+        "    _append(install_payload.get('installer_path'))",
+        "    for suffix in ('*.exe', '*.msi', '*.zip', '*.alz'):",
+        "        for path in DOWNLOADS.glob(suffix):",
+        "            _append(path)",
+        "    candidates.sort(key=lambda p: _package_score(p), reverse=True)",
+        "    return candidates",
+        "",
+        "def _candidate_installers(root):",
+        "    root = Path(root)",
+        "    if not root.exists():",
+        "        return []",
+        "    candidates = []",
+        "    for suffix in ('*.exe', '*.msi'):",
+        "        candidates.extend(path for path in root.rglob(suffix) if path.is_file())",
+        "    candidates = [path for path in candidates if _matches_target(path) or any(token in path.name.lower() for token in ('setup', 'installer', 'install', 'msi'))]",
+        "    candidates.sort(key=lambda p: _package_score(p), reverse=True)",
+        "    return candidates",
+        "",
+        "def _extract_archive(package):",
+        "    package = Path(package)",
+        "    extract_root = DOWNLOADS / f'{package.stem}_extracted'",
+        "    extract_root.mkdir(parents=True, exist_ok=True)",
+        "    suffix = package.suffix.lower()",
+        "    if suffix == '.zip':",
+        "        with zipfile.ZipFile(package) as archive:",
+        "            archive.extractall(extract_root)",
+        "        return extract_root",
+        "    seven_zip = shutil.which('7z') or shutil.which('7za')",
+        "    if seven_zip and suffix in ARCHIVE_SUFFIXES:",
+        "        completed = subprocess.run([seven_zip, 'x', '-y', f'-o{extract_root}', str(package)], capture_output=True, text=True, errors='replace', check=False, timeout=180)",
+        "        if int(completed.returncode or 0) == 0:",
+        "            return extract_root",
+        "    raise SystemExit(f'unsupported archive extraction for {package}')",
+        "",
+        "def _resolve_installer_target(package):",
+        "    package = Path(package)",
+        "    if package.suffix.lower() in INSTALLER_SUFFIXES:",
+        "        return package",
+        "    extracted_root = _extract_archive(package)",
+        "    installers = _candidate_installers(extracted_root)",
+        "    if installers:",
+        "        return installers[0]",
+        "    portable_targets = [path for path in extracted_root.rglob('*.exe') if path.is_file() and _matches_target(path)]",
+        "    portable_targets = [path for path in portable_targets if not any(token in path.name.lower() for token in ('unins', 'uninstall', 'update', 'updater'))]",
+        "    portable_targets.sort(key=lambda p: _package_score(p), reverse=True)",
+        "    if portable_targets:",
+        "        return portable_targets[0]",
+        "    raise SystemExit(f'no installer or target executable found after extracting {package}')",
+        "",
+        "def _find_installed_exe():",
+        "    terms = _target_terms()",
+        "    roots = [Path(os.environ.get('LOCALAPPDATA', '')), Path(os.environ.get('ProgramFiles', '')), Path(os.environ.get('ProgramFiles(x86)', ''))]",
+        "    matches = []",
+        "    for root in roots:",
+        "        if not str(root) or not root.exists():",
+        "            continue",
+        "        for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=lambda exc: None):",
+        "            lowered_dir = str(dirpath).lower()",
+        "            if any(skip in lowered_dir for skip in ('\\\\temp\\\\', '\\\\cache\\\\', '\\\\installer\\\\')):",
+        "                dirnames[:] = []",
+        "                continue",
+        "            for filename in filenames:",
+        "                if not filename.lower().endswith('.exe'):",
+        "                    continue",
+        "                name = filename.lower()",
+        "                if any(skip in name for skip in ('unins', 'uninstall', 'update', 'updater')):",
+        "                    continue",
+        "                path = Path(dirpath) / filename",
+        "                full = str(path).lower()",
+        "                if terms and not any(_contains_target(name, term) or _contains_target(full, term) for term in terms):",
+        "                    continue",
+        "                matches.append(path)",
+        "    return sorted(matches, key=lambda p: len(str(p)))[0] if matches else None",
+        "",
+        "def _write_marker(exe, *, installer_path=None):",
+        "    previous_context = _read_json(CONTEXT_MARKER)",
+        "    previous_install = _read_json(INSTALL_MARKER)",
+        "    preserved_installer = installer_path or previous_context.get('installer_path') or previous_install.get('installer_path')",
+        "    preserved_source_url = previous_context.get('source_url') or previous_install.get('source_url')",
+        "    payload = {'installed_exe': str(exe), 'target_keywords': TARGET_TERMS}",
+        "    if preserved_installer:",
+        "        payload['installer_path'] = str(preserved_installer)",
+        "    if preserved_source_url:",
+        "        payload['source_url'] = str(preserved_source_url)",
+        "    INSTALL_MARKER.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')",
+        "    context_payload = {'installed_exe': str(exe), 'target_keywords': TARGET_TERMS}",
+        "    if preserved_installer:",
+        "        context_payload['installer_path'] = str(preserved_installer)",
+        "    if preserved_source_url:",
+        "        context_payload['source_url'] = str(preserved_source_url)",
+        "    CONTEXT_MARKER.write_text(json.dumps(context_payload, ensure_ascii=False, indent=2), encoding='utf-8')",
+        "    print(f'install marker written: {INSTALL_MARKER} -> {exe}')",
+        "",
+        "def _process_exists(name):",
+        "    lowered = str(name or '').lower().strip()",
+        "    if not lowered:",
+        "        return False",
+        "    try:",
+        "        completed = subprocess.run(['tasklist'], capture_output=True, text=True, errors='replace', check=False, timeout=20)",
+        "        return lowered in str(completed.stdout or '').lower()",
+        "    except Exception:",
+        "        return False",
+        "",
+        "def _avoid_failsafe():",
+        "    try:",
+        "        width, height = pyautogui.size()",
+        "        x, y = pyautogui.position()",
+        "        margin = 4",
+        "        if x <= margin or y <= margin or x >= width - margin or y >= height - margin:",
+        "            pyautogui.moveTo(max(120, int(width * 0.5)), max(120, int(height * 0.5)), duration=0.08)",
+        "    except Exception:",
+        "        return",
+        "",
+        "def _launch_installed_exe(exe):",
+        "    exe = Path(exe)",
+        "    try:",
+        "        os.startfile(str(exe))",
+        "    except AttributeError:",
+        "        subprocess.Popen([str(exe)])",
+        "    except Exception:",
+        "        subprocess.Popen([str(exe)], shell=False)",
+        "    time.sleep(3.0)",
+        "    running = _process_exists(exe.name)",
+        "    print(f'launch installed executable: {exe} running={running}')",
+        "    return running",
+        "",
+        "existing = _find_installed_exe()",
+        "if existing:",
+        "    _write_marker(existing)",
+        "    if _launch_installed_exe(existing):",
+        "        raise SystemExit(0)",
+        "",
+        "packages = _candidate_packages()",
+        "if not packages and VISIBLE_CLICKS:",
+        "    pyautogui.PAUSE = 0.15",
+        "    for item in VISIBLE_CLICKS:",
+        "        x, y = item['point']",
+        "        _avoid_failsafe()",
+        "        print(f\"click visible installer control: {item.get('text')} at {(x, y)}\")",
+        "        pyautogui.click(x, y)",
+        "        time.sleep(1.5)",
+        "    packages = _candidate_packages()",
+        "",
+        "installer = _resolve_installer_target(packages[0]) if packages else None",
+        "if installer:",
+        "    print(f'launch installer target: {installer}')",
+        "    if installer.suffix.lower() == '.msi':",
+        "        subprocess.Popen(['msiexec.exe', '/i', str(installer), '/passive', '/norestart'])",
+        "        time.sleep(6.0)",
+        "    elif installer.suffix.lower() == '.exe':",
+        "        try:",
+        "            os.startfile(str(installer))",
+        "        except AttributeError:",
+        "            subprocess.Popen([str(installer)])",
+        "        time.sleep(3.0)",
+        "    else:",
+        "        raise SystemExit(f'unexpected installer target: {installer}')",
+        "else:",
+        "    raise SystemExit('no installer package available for installer recovery')",
+        "",
+        "for index in range(14):",
+        "    current = _find_installed_exe()",
+        "    if current:",
+        "        _write_marker(current, installer_path=installer)",
+        "        if _launch_installed_exe(current):",
+        "            raise SystemExit(0)",
+        "    _avoid_failsafe()",
+        "    pyautogui.press('enter')",
+        "    time.sleep(1.5)",
+        "    if index in (2, 5, 8):",
+        "        _avoid_failsafe()",
+        "        pyautogui.hotkey('alt', 'n')",
+        "        time.sleep(1.0)",
+        "",
+        "final = _find_installed_exe()",
+        "if not final:",
+        "    raise SystemExit('installer UI recovery did not verify installed executable')",
+        "_write_marker(final, installer_path=installer)",
+        "if not _launch_installed_exe(final):",
+        "    raise SystemExit('installed executable detected but process did not stay running')",
+    ]
+    return "\n".join(lines)
+
+
+def _synthesized_model_ui_launch_recovery_code(request: StepRequest) -> str:
+    target_terms = _visible_flow_extra_targets(request, limit=8)
+    install_marker = _extract_prompt_install_marker_path(request.user_prompt)
+    launch_marker = _extract_prompt_launch_marker_path(request.user_prompt)
+    lines = [
+        "from pathlib import Path",
+        "import json",
+        "import os",
+        "import re",
+        "import subprocess",
+        "import time",
+        "",
+        f"TARGET_TERMS = {json.dumps(target_terms, ensure_ascii=False)}",
+        (
+            f"INSTALL_MARKER = Path({json.dumps(install_marker, ensure_ascii=False)}).expanduser()"
+            if install_marker
+            else "INSTALL_MARKER = Path.home() / 'Downloads' / 'install-success.json'"
+        ),
+        (
+            f"LAUNCH_MARKER = Path({json.dumps(launch_marker, ensure_ascii=False)}).expanduser()"
+            if launch_marker
+            else "LAUNCH_MARKER = Path.home() / 'Downloads' / 'launch-success.json'"
+        ),
+        "CONTEXT_MARKER = Path.home() / 'Downloads' / 'computer-use-agent-context.json'",
+        "LAUNCH_MARKER.parent.mkdir(parents=True, exist_ok=True)",
+        "CONTEXT_MARKER.parent.mkdir(parents=True, exist_ok=True)",
+        "",
+        "GENERIC_TERMS = {",
+        "    'setup', 'install', 'installer', 'download', 'downloads', 'windows', 'win32', 'win64',",
+        "    'x64', 'x86', 'launcher', 'launch', 'desktop', 'client', 'program', '프로그램', '설치',",
+        "}",
+        "",
+        "def _read_json(path):",
+        "    try:",
+        "        return json.loads(path.read_text(encoding='utf-8'))",
+        "    except Exception:",
+        "        return {}",
+        "",
+        "def _normalized_terms(*sources):",
+        "    raw_terms = []",
+        "    for source in sources:",
+        "        if isinstance(source, (list, tuple, set)):",
+        "            values = source",
+        "        else:",
+        "            values = [source]",
+        "        for raw in values:",
+        "            lowered = str(raw or '').lower().strip()",
+        "            if not lowered or lowered in GENERIC_TERMS or lowered in raw_terms:",
+        "                continue",
+        "            raw_terms.append(lowered)",
+        "    strong_terms = [term for term in raw_terms if re.search(r'[가-힣]', term) or len(term) >= 4]",
+        "    return strong_terms or raw_terms",
+        "",
+        "def _contains_target(text, term):",
+        "    lowered = str(text or '').lower()",
+        "    term = str(term or '').lower().strip()",
+        "    if not term:",
+        "        return False",
+        "    if len(term) < 4 and re.fullmatch(r'[a-z0-9]+', term):",
+        "        return term in re.findall(r'[a-z0-9]+', lowered)",
+        "    return term in lowered",
+        "",
+        "install_payload = _read_json(INSTALL_MARKER)",
+        "context_payload = _read_json(CONTEXT_MARKER)",
+        "ACTIVE_TERMS = _normalized_terms(TARGET_TERMS)",
+        "MARKER_TERMS = _normalized_terms(install_payload.get('target_keywords'), context_payload.get('target_keywords'))",
+        "MARKER_HAYSTACK = ' '.join(str(item).lower() for item in [*(install_payload.get('target_keywords') or []), *(context_payload.get('target_keywords') or [])])",
+        "TERMS = list(ACTIVE_TERMS)",
+        "if ACTIVE_TERMS and any(active in MARKER_HAYSTACK for active in ACTIVE_TERMS):",
+        "    for term in MARKER_TERMS:",
+        "        if term not in TERMS:",
+        "            TERMS.append(term)",
+        "elif not TERMS:",
+        "    TERMS = MARKER_TERMS",
+        "",
+        "def _candidate_paths():",
+        "    paths = []",
+        "    for payload in (install_payload, context_payload):",
+        "        for field in ('installed_exe', 'launch_exe', 'launched_exe'):",
+        "            raw = str((payload or {}).get(field) or '').strip().strip('\"')",
+        "            if raw:",
+        "                paths.append(Path(os.path.expandvars(os.path.expanduser(raw))))",
+        "    return paths",
+        "",
+        "def _is_valid_launch_exe(path):",
+        "    try:",
+        "        resolved = path.resolve()",
+        "    except OSError:",
+        "        resolved = path",
+        "    lowered = str(resolved).lower().replace('\\\\', '/')",
+        "    name = resolved.name.lower()",
+        "    if not resolved.exists() or not resolved.is_file() or resolved.suffix.lower() != '.exe':",
+        "        return False",
+        "    if '/windows/' in lowered or '/temp/' in lowered or '/tmp/' in lowered:",
+        "        return False",
+        "    if any(token in name for token in ('setup', 'installer', 'install', 'unins', 'uninstall', 'update', 'updater')):",
+        "        return False",
+        "    if TERMS and not any(_contains_target(lowered, term) for term in TERMS):",
+        "        return False",
+        "    return True",
+        "",
+        "def _find_launch_exe():",
+        "    for candidate in _candidate_paths():",
+        "        if _is_valid_launch_exe(candidate):",
+        "            return candidate",
+        "    raise SystemExit('no valid installed executable in install/context marker')",
+        "",
+        "def _launch(path):",
+        "    try:",
+        "        os.startfile(str(path))",
+        "    except AttributeError:",
+        "        subprocess.Popen([str(path)])",
+        "    except OSError:",
+        "        subprocess.Popen([str(path)])",
+        "",
+        "def _process_exists(name):",
+        "    lowered = str(name or '').lower().strip()",
+        "    if not lowered:",
+        "        return False",
+        "    try:",
+        "        completed = subprocess.run(['tasklist'], capture_output=True, text=True, errors='replace', check=False, timeout=20)",
+        "        return lowered in str(completed.stdout or '').lower()",
+        "    except Exception:",
+        "        return False",
+        "",
+        "exe = _find_launch_exe()",
+        "print(f'launch installed executable from marker/context: {exe}')",
+        "_launch(exe)",
+        "deadline = time.time() + 10.0",
+        "while time.time() < deadline and not _process_exists(exe.name):",
+        "    time.sleep(1.0)",
+        "running = _process_exists(exe.name)",
+        "print(f'launched process running={running}: {exe.name}')",
+        "if not running:",
+        "    raise SystemExit(f'launched app process did not appear: {exe.name}')",
+        "payload = {'launched_exe': str(exe), 'installed_exe': str(exe), 'target_keywords': TERMS}",
+        "LAUNCH_MARKER.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')",
+        "if CONTEXT_MARKER.parent.exists():",
+        "    context_payload.update({'launch_exe': str(exe), 'installed_exe': str(exe), 'target_keywords': TERMS})",
+        "    CONTEXT_MARKER.write_text(json.dumps(context_payload, ensure_ascii=False, indent=2), encoding='utf-8')",
+        "print(f'launch marker written: {LAUNCH_MARKER} -> {exe}')",
+    ]
+    return "\n".join(lines)
+
+
+def _should_use_model_ui_browser_prelude(request: StepRequest) -> bool:
+    if not _MODEL_UI_CANDIDATES_ENABLED:
+        return False
+    if int(request.step_index or 0) != 0:
+        return False
+    if request.request_kind != "task_step":
+        return False
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    if not _looks_like_download_or_install_task(request.user_prompt):
+        return False
+    if _looks_like_launch_app_chunk_task(request.user_prompt):
+        return False
+    if _looks_like_existing_installer_launch_task(request.user_prompt):
+        return False
+    if _has_visible_gui_continuation_cues(request):
+        return False
+    extra_targets = _visible_flow_extra_targets(request, limit=3)
+    return bool(
+        _select_request_prompt_browser_url(request)
+        or _fallback_browser_search_url_for_request(request, extra_targets=extra_targets)
+    )
+
+
+def _synthesized_model_ui_browser_prelude_code(request: StepRequest) -> str:
+    extra_targets = _visible_flow_extra_targets(request, limit=3)
+    context_prompt_key, context_prompt_excerpt = _context_prompt_key_for_target_terms(request, extra_targets)
+    prompt_url = _select_request_prompt_browser_url(request)
+    if not prompt_url:
+        prompt_url = _fallback_browser_search_url_for_request(request, extra_targets=extra_targets)
+    title_tokens = extra_targets
+    lines = [
+        "from pathlib import Path",
+        "import json",
+        "import re",
+        "import time",
+        "",
+        f"TARGET_TERMS = {repr(extra_targets)}",
+        f"target_url = {json.dumps(prompt_url, ensure_ascii=False)}",
+        f"expected_title_tokens = {json.dumps(title_tokens, ensure_ascii=False)}",
+        "CONTEXT_PATH = Path.home() / 'Downloads' / 'computer-use-agent-context.json'",
+        f"CONTEXT_PROMPT_KEY = {json.dumps(context_prompt_key, ensure_ascii=False)}",
+        f"CONTEXT_PROMPT_EXCERPT = {json.dumps(context_prompt_excerpt, ensure_ascii=False)}",
+        "",
+        "def _path_matches_reuse_target(path_text):",
+        "    strict_terms = []",
+        "    for raw in TARGET_TERMS:",
+        "        term = str(raw or '').lower().strip()",
+        "        if len(term) >= 4 and re.fullmatch(r'[a-z0-9][a-z0-9._-]*', term):",
+        "            strict_terms.append(term)",
+        "    if not strict_terms:",
+        "        return True",
+        "    lowered = str(path_text or '').lower()",
+        "    return any(term in lowered for term in strict_terms)",
+        "",
+        "def _record_existing_download(path_value, *, source_url=None):",
+        "    write_action_context(",
+        "        CONTEXT_PATH,",
+        "        prompt_key=CONTEXT_PROMPT_KEY,",
+        "        prompt_excerpt=CONTEXT_PROMPT_EXCERPT,",
+        "        phase='downloaded',",
+        "        installer_path=str(path_value),",
+        "        target_keywords=TARGET_TERMS,",
+        "        source_url=(source_url or target_url),",
+        "    )",
+        "",
+        "def _existing_context_download():",
+        "    payload = ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)",
+        "    candidate = str(payload.get('installer_path') or '').strip().strip('\"')",
+        "    if not candidate:",
+        "        return None",
+        "    if not _path_matches_reuse_target(candidate):",
+        "        print(f'ignoring continuity artifact that does not match target filename/path: {candidate}')",
+        "        return None",
+        "    try:",
+        "        ready = wait_for_stable_download(candidate, min_bytes=1_000_000, timeout_s=8.0)",
+        "        print(f'using previously downloaded artifact before opening browser: {ready}')",
+        "        return ready",
+        "    except SystemExit as exc:",
+        "        print(f'ignoring stale continuity artifact before opening browser: {exc}')",
+        "        return None",
+        "",
+        "existing_download = _existing_context_download()",
+        "if existing_download is not None:",
+        "    _record_existing_download(existing_download)",
+        "    raise SystemExit(0)",
+        "",
+        "try:",
+        "    existing_download = wait_for_recent_download_artifact(",
+        "        extra_targets=TARGET_TERMS,",
+        "        min_bytes=1_000_000,",
+        "        timeout_s=3.0,",
+        "        since_ts=0,",
+        "        require_target_match=True,",
+        "    )",
+        "    print(f'using existing installer from Downloads before opening browser: {existing_download}')",
+        "    _record_existing_download(existing_download)",
+        "    raise SystemExit(0)",
+        "except SystemExit as exc:",
+        "    if getattr(exc, 'code', exc) in (0, None):",
+        "        raise",
+        "    print(f'no reusable installer before opening browser: {exc}')",
+        "",
+        "open_url_and_wait(target_url, expected_title_tokens=expected_title_tokens, timeout_s=25.0, settle_time_s=3.0)",
+        "time.sleep(2)",
+        'print("opened browser page for screenshot-grounded UI continuation")',
+        'raise SystemExit("continue with latest screenshot and model-visible UI candidates")',
+    ]
+    return "\n".join(lines)
+
+
 def generate_step_response(
     runtime: AgentRuntime,
     request: StepRequest,
@@ -9072,6 +13564,43 @@ def generate_step_response(
     max_new_tokens: int,
     generation_context: dict[str, Any] | None = None,
 ) -> StepResponse:
+    if _should_use_model_ui_browser_prelude(request):
+        code = _synthesized_model_ui_browser_prelude_code(request)
+        return StepResponse(
+            python_code=code,
+            raw_text=code,
+            model_id="framework:model-ui-browser-prelude",
+            step_index=request.step_index,
+            done=False,
+            notes=["framework_model_ui_browser_prelude_used"],
+        )
+    if _should_use_model_ui_candidates(request):
+        request = _request_with_model_ui_candidates(
+            runtime=runtime,
+            request=request,
+            max_new_tokens=max_new_tokens,
+            generation_context=generation_context,
+        )
+    if _should_use_model_ui_download_recovery(request):
+        code = _synthesized_model_ui_download_recovery_code(request)
+        return StepResponse(
+            python_code=code,
+            raw_text=code,
+            model_id="framework:model-ui-download-recovery",
+            step_index=request.step_index,
+            done=False,
+            notes=["framework_model_ui_download_recovery_used"],
+        )
+    if _should_use_model_ui_installer_recovery(request):
+        code = _synthesized_model_ui_installer_recovery_code(request)
+        return StepResponse(
+            python_code=code,
+            raw_text=code,
+            model_id="framework:model-ui-installer-recovery",
+            step_index=request.step_index,
+            done=False,
+            notes=["framework_model_ui_installer_recovery_used"],
+        )
     if _should_use_framework_official_download_recovery(request):
         code = _synthesized_official_download_recovery_code(user_prompt=request.user_prompt)
         return StepResponse(
@@ -9095,7 +13624,10 @@ def generate_step_response(
     if _should_use_framework_visible_download_flow(request):
         payload_metadata = dict(request.last_execution.get("payload_metadata") or {})
         last_execution_code = str(payload_metadata.get("executed_python_code") or "")
-        prompt_url = _select_prompt_browser_url(request.user_prompt) or _select_prompt_browser_url(last_execution_code)
+        prompt_url = _select_request_prompt_browser_url(request) or _select_prompt_browser_url(
+            last_execution_code,
+            excluded_queries=_failed_search_queries_for_request(request),
+        )
         if not prompt_url and not _has_visible_gui_continuation_cues(request):
             prompt_url = _fallback_browser_search_url_for_request(
                 request,
@@ -9116,6 +13648,16 @@ def generate_step_response(
             step_index=request.step_index,
             done=False,
             notes=["framework_visible_download_flow_used"],
+        )
+    if _should_use_model_ui_launch_recovery(request):
+        code = _synthesized_model_ui_launch_recovery_code(request)
+        return StepResponse(
+            python_code=code,
+            raw_text=code,
+            model_id="framework:model-ui-launch-recovery",
+            step_index=request.step_index,
+            done=True,
+            notes=["framework_model_ui_launch_recovery_used"],
         )
     if _should_use_framework_visible_launch_recovery(request):
         code = _synthesized_visible_launch_recovery_code(request)
@@ -9615,6 +14157,38 @@ def run_agent_control_loop(
             step_index=step_index,
         )
         step_id = f"step-{step_index:03d}"
+        if (
+            request.replan_requested
+            and _looks_like_download_or_install_task(request.user_prompt)
+            and any(
+                reason in {
+                    "no_visible_download_candidates",
+                    "download_url_404",
+                    "guessed_artifact_url_404",
+                    "installer_url_not_found",
+                }
+                for reason in request.replan_reasons
+            )
+            and "partial_progress_opened_page_only" not in request.replan_reasons
+            and "same_page_click_retry_required" not in request.replan_reasons
+            and not _select_validated_replan_search_url(request.user_prompt)
+        ):
+            target_terms = _visible_flow_extra_targets(request, limit=4)
+            validated_search_url = _generate_validated_replan_search_url(
+                runtime=runtime,
+                request=request,
+                target_terms=target_terms,
+                root=root,
+                step_id=step_id,
+            )
+            if validated_search_url:
+                request.user_prompt = (
+                    request.user_prompt.rstrip()
+                    + "\n\nValidated replan retry URL to use if a new browser search is needed: "
+                    + validated_search_url
+                    + "\nUse this exact URL for the next browser search if you abandon the current page."
+                )
+                history.append(f"{step_id}_validated_replan_search_url={validated_search_url}")
         if web_search_enabled and request.request_kind == "task_step" and searxng_client is not None:
             web_search_context, web_search_uses, web_search_queries = _maybe_perform_web_search(
                 runtime=runtime,
@@ -9718,6 +14292,9 @@ def run_agent_control_loop(
             request,
             response.python_code,
         )
+        framework_official_download_recovery_generation = (
+            str(response.model_id or "") == "framework:official-download-recovery"
+        )
         gui_first_download_chunk_install_mix = _looks_like_gui_first_download_chunk_install_mix(request, response.python_code)
         soft_allowed_gui_first_download_bypass = _should_soft_allow_gui_first_download_bypass_for_auto_open(
             request,
@@ -9731,19 +14308,38 @@ def run_agent_control_loop(
             _uses_deprecated_ocr_helper(response.python_code)
             and not str(response.model_id or "").startswith("framework:")
         )
+        missing_image_template_generation = (
+            _looks_like_missing_image_template_generation(response.python_code)
+            and not str(response.model_id or "").startswith("framework:")
+        )
+        installer_wait_without_ui_generation = (
+            _looks_like_gui_first_installer_wait_without_ui_action(request, response.python_code)
+            and not str(response.model_id or "").startswith("framework:")
+        )
+        bottom_strip_click_generation = (
+            _looks_like_gui_first_bottom_strip_click_generation(request, response.python_code)
+            and not str(response.model_id or "").startswith("framework:")
+        )
         invalid_generation = (
             not _is_compilable_python_code(response.python_code)
             or _looks_like_non_executing_task_script(response.python_code)
             or _looks_like_missing_install_progress_generation(response.python_code, user_prompt)
             or duplicate_generation
             or prompt_url_violation
-            or gui_first_visible_ui_violation
+            or (gui_first_visible_ui_violation and not framework_official_download_recovery_generation)
             or (guessed_artifact_url_generation and not soft_allowed_gui_first_download_bypass)
-            or (gui_first_download_chunk_network_bypass and not soft_allowed_gui_first_download_bypass)
+            or (
+                gui_first_download_chunk_network_bypass
+                and not soft_allowed_gui_first_download_bypass
+                and not framework_official_download_recovery_generation
+            )
             or gui_first_download_chunk_install_mix
             or gui_first_silent_install_shortcut
-            or store_detour_generation
+            or (store_detour_generation and not framework_official_download_recovery_generation)
             or deprecated_ocr_helper_generation
+            or missing_image_template_generation
+            or installer_wait_without_ui_generation
+            or bottom_strip_click_generation
         )
         if invalid_generation:
             invalid_attempt_path = root / "responses" / f"step-{step_index:03d}.invalid-attempt-00.response.json"
@@ -9761,7 +14357,7 @@ def run_agent_control_loop(
                 response.notes.append("gui_first_visible_ui_violation_detected")
             if guessed_artifact_url_generation:
                 response.notes.append("guessed_artifact_url_generation_detected")
-            if gui_first_download_chunk_network_bypass:
+            if gui_first_download_chunk_network_bypass and not framework_official_download_recovery_generation:
                 response.notes.append("gui_first_download_chunk_network_bypass_detected")
             if gui_first_download_chunk_install_mix:
                 response.notes.append("gui_first_download_chunk_install_mix_detected")
@@ -9771,6 +14367,12 @@ def run_agent_control_loop(
                 response.notes.append("store_detour_generation_detected")
             if deprecated_ocr_helper_generation:
                 response.notes.append("deprecated_ocr_helper_generation_detected")
+            if missing_image_template_generation:
+                response.notes.append("missing_image_template_generation_detected")
+            if installer_wait_without_ui_generation:
+                response.notes.append("installer_wait_without_ui_generation_detected")
+            if bottom_strip_click_generation:
+                response.notes.append("bottom_strip_click_generation_detected")
             _write_json(invalid_attempt_path, response.to_dict())
             if _should_use_framework_visible_installer_recovery(request) and gui_first_silent_install_shortcut:
                 recovery_code = _synthesized_visible_installer_recovery_code(request)
@@ -9787,6 +14389,46 @@ def run_agent_control_loop(
                 )
                 invalid_generation_retries_used += 1
                 retry_response_path = root / "responses" / f"step-{step_index:03d}.framework-visible-installer-00.response.json"
+                _write_json(retry_response_path, retry_response.to_dict())
+                response = retry_response
+                normalized_code = _normalize_python_code(response.python_code)
+            elif _should_use_model_ui_installer_recovery(request) and (
+                gui_first_silent_install_shortcut
+                or installer_wait_without_ui_generation
+                or duplicate_generation
+            ):
+                recovery_code = _synthesized_model_ui_installer_recovery_code(request)
+                retry_response = StepResponse(
+                    python_code=recovery_code,
+                    raw_text=recovery_code,
+                    model_id="framework:model-ui-installer-recovery",
+                    step_index=step_index,
+                    done=True,
+                    notes=[
+                        "retry_due_to_model_ui_installer_recovery",
+                        "framework_model_ui_installer_recovery_used",
+                    ],
+                )
+                invalid_generation_retries_used += 1
+                retry_response_path = root / "responses" / f"step-{step_index:03d}.framework-model-ui-installer-00.response.json"
+                _write_json(retry_response_path, retry_response.to_dict())
+                response = retry_response
+                normalized_code = _normalize_python_code(response.python_code)
+            elif _should_use_model_ui_download_recovery(request) and bottom_strip_click_generation:
+                recovery_code = _synthesized_model_ui_download_recovery_code(request)
+                retry_response = StepResponse(
+                    python_code=recovery_code,
+                    raw_text=recovery_code,
+                    model_id="framework:model-ui-download-recovery",
+                    step_index=step_index,
+                    done=False,
+                    notes=[
+                        "retry_due_to_bottom_strip_click_generation",
+                        "framework_model_ui_download_recovery_used",
+                    ],
+                )
+                invalid_generation_retries_used += 1
+                retry_response_path = root / "responses" / f"step-{step_index:03d}.framework-model-ui-download-00.response.json"
                 _write_json(retry_response_path, retry_response.to_dict())
                 response = retry_response
                 normalized_code = _normalize_python_code(response.python_code)
@@ -9829,7 +14471,25 @@ def run_agent_control_loop(
                 _write_json(retry_response_path, retry_response.to_dict())
                 response = retry_response
                 normalized_code = _normalize_python_code(response.python_code)
-            elif prompt_url_violation and _should_use_framework_official_download_recovery(request):
+            elif _should_use_framework_official_download_retry_for_invalid_generation(
+                request,
+                prompt_url_violation=prompt_url_violation,
+                gui_first_visible_ui_violation=gui_first_visible_ui_violation,
+                guessed_artifact_url_generation=guessed_artifact_url_generation,
+                gui_first_download_chunk_network_bypass=gui_first_download_chunk_network_bypass,
+                gui_first_download_chunk_install_mix=gui_first_download_chunk_install_mix,
+            ):
+                retry_reason = "invalid_download_retry"
+                if prompt_url_violation:
+                    retry_reason = "prompt_url_violation"
+                elif gui_first_download_chunk_network_bypass:
+                    retry_reason = "gui_first_download_chunk_network_bypass"
+                elif gui_first_download_chunk_install_mix:
+                    retry_reason = "gui_first_download_chunk_install_mix"
+                elif guessed_artifact_url_generation:
+                    retry_reason = "guessed_artifact_url_generation"
+                elif gui_first_visible_ui_violation:
+                    retry_reason = "gui_first_visible_ui_violation"
                 retry_response = StepResponse(
                     python_code=_synthesized_official_download_recovery_code(user_prompt=user_prompt),
                     raw_text=_synthesized_official_download_recovery_code(user_prompt=user_prompt),
@@ -9837,7 +14497,7 @@ def run_agent_control_loop(
                     step_index=step_index,
                     done=False,
                     notes=[
-                        "retry_due_to_prompt_url_violation",
+                        f"retry_due_to_{retry_reason}",
                         "framework_official_download_recovery_used",
                     ],
                 )
@@ -9874,6 +14534,9 @@ def run_agent_control_loop(
                         gui_first_silent_install_shortcut=gui_first_silent_install_shortcut,
                         store_detour_generation=store_detour_generation,
                         deprecated_ocr_helper_generation=deprecated_ocr_helper_generation,
+                        missing_image_template_generation=missing_image_template_generation,
+                        installer_wait_without_ui_generation=installer_wait_without_ui_generation,
+                        bottom_strip_click_generation=bottom_strip_click_generation,
                     ),
                     last_execution=last_execution,
                     step_index=step_index,
@@ -9912,6 +14575,9 @@ def run_agent_control_loop(
                     request,
                     retry_response.python_code,
                 )
+                retry_framework_official_download_recovery_generation = (
+                    str(retry_response.model_id or "") == "framework:official-download-recovery"
+                )
                 retry_gui_first_download_chunk_install_mix = _looks_like_gui_first_download_chunk_install_mix(
                     request,
                     retry_response.python_code,
@@ -9928,19 +14594,44 @@ def run_agent_control_loop(
                     _uses_deprecated_ocr_helper(retry_response.python_code)
                     and not str(retry_response.model_id or "").startswith("framework:")
                 )
+                retry_missing_image_template_generation = (
+                    _looks_like_missing_image_template_generation(retry_response.python_code)
+                    and not str(retry_response.model_id or "").startswith("framework:")
+                )
+                retry_installer_wait_without_ui_generation = (
+                    _looks_like_gui_first_installer_wait_without_ui_action(request, retry_response.python_code)
+                    and not str(retry_response.model_id or "").startswith("framework:")
+                )
+                retry_bottom_strip_click_generation = (
+                    _looks_like_gui_first_bottom_strip_click_generation(request, retry_response.python_code)
+                    and not str(retry_response.model_id or "").startswith("framework:")
+                )
                 retry_invalid_generation = (
                     not _is_compilable_python_code(retry_response.python_code)
                     or _looks_like_non_executing_task_script(retry_response.python_code)
                     or _looks_like_missing_install_progress_generation(retry_response.python_code, user_prompt)
                     or retry_duplicate_generation
                     or retry_prompt_url_violation
-                    or retry_gui_first_visible_ui_violation
+                    or (
+                        retry_gui_first_visible_ui_violation
+                        and not retry_framework_official_download_recovery_generation
+                    )
                     or (retry_guessed_artifact_url_generation and not retry_soft_allowed_gui_first_download_bypass)
-                    or (retry_gui_first_download_chunk_network_bypass and not retry_soft_allowed_gui_first_download_bypass)
+                    or (
+                        retry_gui_first_download_chunk_network_bypass
+                        and not retry_soft_allowed_gui_first_download_bypass
+                        and not retry_framework_official_download_recovery_generation
+                    )
                     or retry_gui_first_download_chunk_install_mix
                     or retry_gui_first_silent_install_shortcut
-                    or retry_store_detour_generation
+                    or (
+                        retry_store_detour_generation
+                        and not retry_framework_official_download_recovery_generation
+                    )
                     or retry_deprecated_ocr_helper_generation
+                    or retry_missing_image_template_generation
+                    or retry_installer_wait_without_ui_generation
+                    or retry_bottom_strip_click_generation
                 )
                 if retry_invalid_generation:
                     if not _is_compilable_python_code(retry_response.python_code):
@@ -9957,7 +14648,10 @@ def run_agent_control_loop(
                         retry_response.notes.append("stopped_due_to_gui_first_visible_ui_violation")
                     if retry_guessed_artifact_url_generation:
                         retry_response.notes.append("stopped_due_to_guessed_artifact_url_generation")
-                    if retry_gui_first_download_chunk_network_bypass:
+                    if (
+                        retry_gui_first_download_chunk_network_bypass
+                        and not retry_framework_official_download_recovery_generation
+                    ):
                         retry_response.notes.append("stopped_due_to_gui_first_download_chunk_network_bypass")
                     if retry_gui_first_download_chunk_install_mix:
                         retry_response.notes.append("stopped_due_to_gui_first_download_chunk_install_mix")
@@ -9967,6 +14661,12 @@ def run_agent_control_loop(
                         retry_response.notes.append("stopped_due_to_store_detour_generation")
                     if retry_deprecated_ocr_helper_generation:
                         retry_response.notes.append("stopped_due_to_deprecated_ocr_helper_generation")
+                    if retry_missing_image_template_generation:
+                        retry_response.notes.append("stopped_due_to_missing_image_template_generation")
+                    if retry_installer_wait_without_ui_generation:
+                        retry_response.notes.append("stopped_due_to_installer_wait_without_ui_generation")
+                    if retry_bottom_strip_click_generation:
+                        retry_response.notes.append("stopped_due_to_bottom_strip_click_generation")
                     final_response = retry_response.to_dict()
                     _write_json(retry_response_path, retry_response.to_dict())
                     _write_json(response_path, retry_response.to_dict())
@@ -10047,9 +14747,13 @@ def run_agent_control_loop(
 
         current_visual_hash = _state_visual_hash(state)
         replan_reasons: list[str] = []
+        partial_page_navigation = _looks_like_partial_download_page_navigation(last_execution)
         if previous_executed_code and normalized_code and normalized_code == previous_executed_code:
             replan_reasons.append("repeated_code_execution")
-        if _looks_like_download_or_install_task(user_prompt) and _looks_like_opened_page_only_step(response.python_code):
+        if _looks_like_download_or_install_task(user_prompt) and (
+            _looks_like_opened_page_only_step(response.python_code)
+            or partial_page_navigation
+        ):
             replan_reasons.append("partial_progress_opened_page_only")
         dependency_error_handled = repairable_missing_module and dependency_repairs_used > repair_attempt_index if repairable_missing_module else False
         installer_timeout = _looks_like_installer_timeout(last_execution, response.python_code, user_prompt)
@@ -10062,6 +14766,7 @@ def run_agent_control_loop(
                 or incomplete_install_attempt
             )
             and not dependency_error_handled
+            and not partial_page_navigation
         ):
             if installer_timeout:
                 replan_reasons.append("installer_timeout")
@@ -10077,17 +14782,23 @@ def run_agent_control_loop(
             replan_reasons.append("download_url_403")
         if _looks_like_installer_url_discovery_failure(last_execution, response.python_code):
             replan_reasons.append("installer_url_not_found")
+        if _looks_like_no_visible_download_candidates(last_execution):
+            replan_reasons.append("no_visible_download_candidates")
         if previous_visual_hash and current_visual_hash and previous_visual_hash == current_visual_hash:
             replan_reasons.append("no_visual_change")
         if (
             str(execution_style or "python_first").lower() == "gui_first"
             and _looks_like_download_or_install_task(user_prompt)
             and not _looks_like_existing_installer_launch_task(user_prompt)
-            and _last_execution_opened_browser_for_gui_flow(last_execution)
+            and (
+                _last_execution_opened_browser_for_gui_flow(last_execution)
+                or partial_page_navigation
+            )
             and (
                 "download_url_404" in replan_reasons
                 or "download_url_403" in replan_reasons
                 or "no_visual_change" in replan_reasons
+                or partial_page_navigation
             )
         ):
             replan_reasons.append("same_page_click_retry_required")
@@ -10144,6 +14855,13 @@ def run_agent_control_loop(
                         "system_hint=the prompt already lists official URL candidates; start from those exact pages and follow only official links discovered there: "
                         + ", ".join(prompt_urls[:4])
                     )
+            if "no_visible_download_candidates" in unique_reasons:
+                history.append(
+                    "system_hint=the previous page produced no usable download candidates; discard that page and change the search terms or move to a different relevant vendor/product page on retry"
+                )
+                history.append(
+                    "system_hint=preserve the target product keywords but refresh the query/page so the next attempt can discover a different clickable download candidate"
+                )
             if "installer_timeout" in unique_reasons:
                 history.append(
                     "system_hint=previous installer launch timed out; do not rerun the same silent installer command again on the next step"

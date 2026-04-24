@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import base64
+import json
+import urllib.parse
+
 import computer_use_raw_python_agent.service as service_module
 from computer_use_raw_python_agent.service import (
     _dependency_repair_user_prompt,
@@ -8,27 +12,41 @@ from computer_use_raw_python_agent.service import (
     _extract_prompt_download_glob,
     _extract_prompt_install_marker_path,
     _extract_prompt_launch_marker_path,
+    _extract_prompt_urls,
     _fallback_browser_search_url,
+    _fallback_browser_search_url_from_parts,
     _fallback_browser_search_url_for_request,
+    _fallback_official_domain_urls,
     _generated_code_ignores_prompt_urls,
     _has_visible_gui_continuation_cues,
     _history_for_invalid_python_retry_with_prompt,
     _infer_response_done,
+    _installer_filename_keywords,
+    _coerce_model_bbox,
+    _model_ui_candidates_observation,
+    _model_ui_ocr_elements_from_text,
+    _model_ui_candidates_from_observation,
+    _score_model_ui_candidate,
     _looks_like_guessed_artifact_url_generation,
     _looks_like_gui_first_download_chunk_network_bypass,
     _looks_like_gui_first_download_chunk_install_mix,
     _looks_like_gui_first_silent_install_shortcut,
+    _looks_like_gui_first_bottom_strip_click_generation,
     _looks_like_gui_first_visible_ui_bypass,
     _looks_like_duplicate_generation,
     _looks_like_missing_install_progress_generation,
+    _looks_like_missing_image_template_generation,
+    _looks_like_gui_first_installer_wait_without_ui_action,
     _is_compilable_python_code,
     _looks_like_direct_download_url_404,
+    _looks_like_exhausted_visible_download_recovery,
     _looks_like_existing_installer_launch_task,
     _looks_like_launch_app_chunk_task,
     _looks_like_incomplete_install_attempt,
     _looks_like_installer_launched_but_app_not_found,
     _looks_like_installer_timeout,
     _looks_like_installer_url_discovery_failure,
+    _looks_like_partial_download_page_navigation,
     _looks_like_visible_installer_observation,
     _looks_like_non_executing_task_script,
     _looks_like_opened_page_only_step,
@@ -39,8 +57,13 @@ from computer_use_raw_python_agent.service import (
     _prompt_keyword_candidates,
     _rewrite_user_prompt_for_replan,
     _retry_token_budget,
+    _registrable_host_from_url,
     _select_prompt_browser_url,
+    _select_request_prompt_browser_url,
+    _select_validated_replan_search_url,
     _sanitize_observation_text_for_model,
+    _search_url_matches_excluded_query,
+    _search_url_validation_error,
     _step_token_budget,
     _synthesized_framework_visible_download_recovery_code,
     _synthesized_visible_download_completion_code,
@@ -52,8 +75,20 @@ from computer_use_raw_python_agent.service import (
     _should_use_framework_visible_launch_recovery,
     _should_use_framework_visible_installer_recovery,
     _should_use_framework_visible_download_flow,
+    _should_use_model_ui_browser_prelude,
+    _should_use_model_ui_candidates,
+    _should_use_model_ui_download_recovery,
+    _should_use_model_ui_installer_recovery,
+    _should_use_model_ui_launch_recovery,
+    _synthesized_model_ui_download_recovery_code,
+    _synthesized_model_ui_installer_recovery_code,
+    _synthesized_model_ui_launch_recovery_code,
+    _synthesized_model_ui_browser_prelude_code,
+    _synthesized_official_download_recovery_code,
     _should_use_framework_official_download_recovery,
+    _should_use_framework_official_download_retry_for_invalid_generation,
     _should_omit_screenshot_for_generation,
+    _url_looks_like_search_results,
     _visible_flow_extra_targets,
 )
 from computer_use_raw_python_agent.models import StepRequest
@@ -65,6 +100,1556 @@ import webbrowser
 webbrowser.open("https://example.com/download")
 """
     assert _infer_response_done(python_code=code, raw_text=code) is False
+
+
+def test_model_ui_candidate_bbox_maps_qwen_grounding_grid() -> None:
+    assert _coerce_model_bbox([500, 500, 600, 600], image_size=(1920, 1080)) == (960, 540, 1152, 648)
+
+
+def test_model_ui_candidate_bbox_accepts_large_absolute_coordinates() -> None:
+    assert _coerce_model_bbox([1200, 200, 1460, 250], image_size=(1920, 1080)) == (1200, 200, 1460, 250)
+
+
+def test_model_ui_search_result_bbox_keeps_qwen_grid_for_both_axes() -> None:
+    assert _coerce_model_bbox([268, 312, 526, 338], image_size=(2560, 1440)) == (686, 449, 1347, 487)
+    assert _coerce_model_bbox([282, 456, 376, 482], image_size=(2560, 1440)) == (722, 657, 963, 694)
+
+
+def test_search_result_observation_clears_after_opened_result_candidate() -> None:
+    request = StepRequest(
+        user_prompt="filezilla 설치해줘",
+        execution_style="gui_first",
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'FALLBACK_SEARCH_URL = "https://www.google.com/search?q=filezilla%20kr"',
+            },
+            "stderr_tail": "continue with latest screenshot and model-visible UI candidates after opening a search result candidate",
+        },
+    )
+    assert service_module._looks_like_search_results_observation(request) is False
+
+
+def test_model_ui_candidate_scoring_prefers_download_target_text() -> None:
+    request = StepRequest(
+        user_prompt="sampleapp 프로그램을 설치해줘",
+        execution_style="gui_first",
+    )
+    score, tags = _score_model_ui_candidate(
+        "SampleApp Download for Windows",
+        "button",
+        (300, 240, 650, 300),
+        request=request,
+    )
+    assert score >= 70
+    assert "download_like" in tags
+    assert "target_like" in tags
+
+
+def test_model_ui_candidate_scoring_prefers_body_download_button_over_header_link() -> None:
+    request = StepRequest(
+        user_prompt="mobaxterm 설치해줘",
+        execution_style="gui_first",
+    )
+    body_score, body_tags = _score_model_ui_candidate(
+        "Download now",
+        "button",
+        (1044, 1253, 1229, 1310),
+        request=request,
+        screen_size=(2560, 1440),
+    )
+    header_score, header_tags = _score_model_ui_candidate(
+        "Download",
+        "link",
+        (1254, 230, 1408, 288),
+        request=request,
+        screen_size=(2560, 1440),
+    )
+    assert body_score > header_score
+    assert "button_kind" in body_tags
+    assert "generic_header_download_penalty" in header_tags
+
+
+def test_model_ui_candidate_scoring_penalizes_browser_url_text_regardless_of_position() -> None:
+    request = StepRequest(
+        user_prompt="filezilla 설치해줘",
+        execution_style="gui_first",
+    )
+    body_score, _ = _score_model_ui_candidate(
+        "Download FileZilla Client",
+        "button",
+        (920, 700, 1250, 780),
+        request=request,
+        screen_size=(1920, 1080),
+    )
+    url_score, url_tags = _score_model_ui_candidate(
+        "https://filezilla-project.org/download.php?type=client",
+        "input",
+        (680, 460, 1540, 520),
+        request=request,
+        screen_size=(1920, 1080),
+    )
+    chrome_fragment_score, chrome_fragment_tags = _score_model_ui_candidate(
+        "Download",
+        "button",
+        (990, 100, 1060, 130),
+        request=request,
+        screen_size=(2560, 1440),
+    )
+    assert body_score > url_score
+    assert "browser_url_penalty" in url_tags
+    assert chrome_fragment_score <= 0
+    assert "browser_chrome_fragment_penalty" in chrome_fragment_tags
+    assert service_module._looks_like_browser_url_text("https://filezilla-project.org/download.php?type=client") is True
+    assert service_module._looks_like_browser_url_text("Download FileZilla Client") is False
+
+
+def test_model_ui_candidate_scoring_penalizes_blog_search_results() -> None:
+    request = StepRequest(
+        user_prompt="mobaxterm을 설치해줘",
+        execution_style="gui_first",
+    )
+    official_score, official_tags = _score_model_ui_candidate(
+        "Download MobaXterm Home Edition (current version) - MobaXterm",
+        "link",
+        (300, 240, 900, 300),
+        request=request,
+    )
+    blog_score, blog_tags = _score_model_ui_candidate(
+        "[T00] MobaXterm 설치 및 MobaXterm 사용법 - 네이버 블로그",
+        "link",
+        (300, 360, 900, 420),
+        request=request,
+    )
+    assert official_score > blog_score
+    assert "community_article_penalty" in blog_tags
+
+
+def test_model_ui_candidate_scoring_penalizes_korean_howto_download_results() -> None:
+    request = StepRequest(
+        user_prompt="메모잇 설치해줘",
+        execution_style="gui_first",
+        observation_text="search results | 공식 다운로드 windows",
+    )
+    direct_score, _ = _score_model_ui_candidate(
+        "메모잇 PC 다운로드",
+        "link",
+        (300, 240, 760, 300),
+        request=request,
+    )
+    howto_score, howto_tags = _score_model_ui_candidate(
+        "메모잇 다운로드 방법, 사용자별 윈도우 설치법",
+        "link",
+        (300, 360, 900, 420),
+        request=request,
+    )
+    assert direct_score > howto_score
+    assert "community_article_penalty" in howto_tags
+
+
+def test_model_ui_candidate_scoring_penalizes_install_buttons_during_download_only_step() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "This is a download-only step. Do not launch, silently install, or run the installer in this step.\n"
+            "End this step only when the installer file exists in Downloads."
+        ),
+        execution_style="gui_first",
+    )
+    score, tags = _score_model_ui_candidate(
+        "설치",
+        "button",
+        (850, 160, 870, 180),
+        request=request,
+        screen_size=(2560, 1440),
+    )
+    assert score <= 0
+    assert "download_chunk_install_penalty" in tags
+
+
+def test_model_ui_candidate_scoring_prefers_installer_dialog_controls() -> None:
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+    )
+    ok_score, ok_tags = _score_model_ui_candidate("OK", "button", (1200, 720, 1320, 780), request=request)
+    download_score, download_tags = _score_model_ui_candidate("Download", "button", (1600, 700, 1850, 780), request=request)
+    assert ok_score > download_score
+    assert "installer_dialog_control" in ok_tags
+    assert "install_chunk_download_penalty" in download_tags
+
+
+def test_model_ui_candidate_scoring_penalizes_taskbar_strip() -> None:
+    request = StepRequest(
+        user_prompt="메모잇 설치해줘",
+        execution_style="gui_first",
+    )
+    page_score, page_tags = _score_model_ui_candidate(
+        "메모잇 다운로드 (v1.93)",
+        "button",
+        (680, 460, 1240, 530),
+        request=request,
+        screen_size=(1920, 1080),
+    )
+    taskbar_score, taskbar_tags = _score_model_ui_candidate(
+        "Microsoft Edge",
+        "button",
+        (820, 1010, 1100, 1060),
+        request=request,
+        screen_size=(1920, 1080),
+    )
+    assert page_score > taskbar_score
+    assert "taskbar_penalty" in taskbar_tags
+    assert "taskbar_penalty" not in page_tags
+
+
+def test_model_ui_candidate_scoring_penalizes_store_results_for_non_store_task() -> None:
+    request = StepRequest(
+        user_prompt="메모잇 설치해줘",
+        execution_style="gui_first",
+    )
+    official_score, official_tags = _score_model_ui_candidate(
+        "메모잇 다운로드 (v1.93)",
+        "button",
+        (680, 460, 1240, 530),
+        request=request,
+        screen_size=(1920, 1080),
+    )
+    store_score, store_tags = _score_model_ui_candidate(
+        "Microsoft Store",
+        "link",
+        (620, 180, 910, 230),
+        request=request,
+        screen_size=(1920, 1080),
+    )
+    assert official_score > store_score
+    assert "store_result_penalty" in store_tags
+    assert "store_result_penalty" not in official_tags
+
+
+def test_model_ui_candidate_scoring_penalizes_browser_brand_panels_for_non_browser_task() -> None:
+    request = StepRequest(
+        user_prompt="메모잇 설치해줘",
+        execution_style="gui_first",
+    )
+    official_score, official_tags = _score_model_ui_candidate(
+        "메모잇 다운로드 (v1.93)",
+        "button",
+        (680, 460, 1240, 530),
+        request=request,
+        screen_size=(1920, 1080),
+    )
+    edge_score, edge_tags = _score_model_ui_candidate(
+        "Microsoft Edge",
+        "link",
+        (1400, 180, 1840, 260),
+        request=request,
+        screen_size=(1920, 1080),
+    )
+    assert official_score > edge_score
+    assert "browser_brand_penalty" in edge_tags
+    assert "browser_brand_penalty" not in official_tags
+
+
+def test_model_ui_candidate_scoring_penalizes_offtarget_search_results() -> None:
+    request = StepRequest(
+        user_prompt="메모잇 설치해줘",
+        execution_style="gui_first",
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=%EB%A9%94%EB%AA%A8%EC%9E%87%20%EA%B3%B5%EC%8B%9D%20%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C%20pc%20windows", expected_title_tokens=["메모잇"])',
+            }
+        },
+    )
+    official_score, official_tags = _score_model_ui_candidate(
+        "메모잇 다운로드 (v1.93)",
+        "link",
+        (680, 460, 1240, 530),
+        request=request,
+        screen_size=(1920, 1080),
+    )
+    offtarget_score, offtarget_tags = _score_model_ui_candidate(
+        "메모장 - Windows 에서 다운로드 및 설치",
+        "link",
+        (680, 560, 1240, 630),
+        request=request,
+        screen_size=(1920, 1080),
+    )
+    assert official_score > offtarget_score
+    assert "offtarget_search_result_penalty" in offtarget_tags
+    assert "offtarget_search_result_penalty" not in official_tags
+
+
+def test_model_ui_candidate_parser_recovers_truncated_json_text() -> None:
+    raw = '''```json
+{
+  "elements": [
+    {"text": "Download", "kind": "button", "bbox": [100, 200, 220, 240]},
+    {"text": "Install for Windows", "kind": "link", "bbox": [300, 260, 520, 310]},
+    {"text": "unfinished'''
+    elements = _model_ui_ocr_elements_from_text(raw)
+    assert [item["text"] for item in elements] == ["Download", "Install for Windows"]
+    assert elements[1]["bbox"] == [300.0, 260.0, 520.0, 310.0]
+
+
+def test_model_ui_installer_recovery_uses_visible_candidates(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    observation = """MODEL_VISIBLE_UI_CANDIDATES:
+These candidates come from local model visual extraction of the latest screenshot, not Windows OCR.
+{"screenshot_size":[1920,1080],"candidates":[{"text":"확인","click_point":[960,700],"reason_tags":["installer_dialog_control"]},{"text":"취소","click_point":[1100,700],"reason_tags":["installer_dialog_control"]}]}"""
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        observation_text=observation,
+    )
+    assert len(_model_ui_candidates_from_observation(observation)) == 2
+    assert _should_use_model_ui_installer_recovery(request) is True
+    code = _synthesized_model_ui_installer_recovery_code(request)
+    assert "pyautogui.click(x, y)" in code
+    assert "os.walk(root" in code
+    assert "_extract_archive(" in code
+    assert "msiexec.exe" in code
+    assert "CONTEXT_MARKER.write_text" in code
+    assert "def _process_exists(name):" in code
+    assert "def _avoid_failsafe():" in code
+    assert "def _launch_installed_exe(exe):" in code
+    assert "launch installed executable:" in code
+    assert "if _launch_installed_exe(existing):" in code
+    assert "if _launch_installed_exe(current):" in code
+    assert "if not _launch_installed_exe(final):" in code
+    assert "no installer package available for installer recovery" in code
+    assert "확인" in code
+    assert "취소" not in code
+    assert "/VERYSILENT" not in code
+
+
+def test_visible_flow_extra_targets_ignores_continuity_instruction_words() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Use executable Python only. "
+            "First read the soft continuity file `~/Downloads/computer-use-agent-context.json`; "
+            "if it exists, reuse it. "
+            "Source task: 메모잇 설치해줘. "
+            "Do not trust unrelated installers."
+        ),
+        execution_style="gui_first",
+    )
+    keywords = _visible_flow_extra_targets(request, limit=6)
+    assert "메모잇" in keywords
+    assert "reading" not in keywords
+    assert "soft" not in keywords
+    assert "continuity" not in keywords
+    assert "file" not in keywords
+    assert "they" not in keywords
+    assert "exist" not in keywords
+
+
+def test_registrable_host_ignores_malformed_url() -> None:
+    assert _registrable_host_from_url("http://[not-a-valid-ipv6") == ""
+
+
+def test_url_looks_like_search_results_ignores_malformed_url() -> None:
+    assert _url_looks_like_search_results("http://[not-a-valid-ipv6") is False
+
+
+def test_fallback_browser_search_url_from_parts_ignores_malformed_url() -> None:
+    url = _fallback_browser_search_url_from_parts(["kakaotalk"], ["http://[not-a-valid-ipv6"])
+
+    assert url is not None
+    assert "kakaotalk" in url
+
+
+def test_fallback_browser_search_url_from_parts_avoids_exact_failed_query() -> None:
+    url = _fallback_browser_search_url_from_parts(
+        ["filezilla"],
+        [],
+        excluded_queries=["filezilla windows"],
+    )
+
+    decoded = urllib.parse.unquote(url or "")
+    assert decoded
+    assert "filezilla" in decoded
+    assert "q=filezilla+windows" not in decoded
+
+
+def test_fallback_browser_search_url_for_request_avoids_exact_failed_query_sentence() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Original task target terms to preserve: filezilla.\n"
+            "Previous stdout summary: search failed at https://www.google.com/search?q=filezilla+windows\n"
+            "Previous stderr summary: no visible download candidates.\n"
+        ),
+        execution_style="gui_first",
+        replan_requested=True,
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=filezilla+windows", expected_title_tokens=["filezilla"])',
+            },
+        },
+    )
+
+    url = _fallback_browser_search_url_for_request(request, extra_targets=["filezilla"])
+    decoded = urllib.parse.unquote(url or "")
+
+    assert decoded
+    assert "filezilla" in decoded
+    assert "q=filezilla+windows" not in decoded
+
+
+def test_model_ui_browser_prelude_opens_prompt_url_without_ocr_helper(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Open https://vendor.example/download and download the Windows installer.",
+        execution_style="gui_first",
+    )
+    assert _should_use_model_ui_browser_prelude(request) is True
+    code = _synthesized_model_ui_browser_prelude_code(request)
+    assert "open_url_and_wait(" in code
+    assert "using existing installer from Downloads before opening browser" in code
+    assert "using previously downloaded artifact before opening browser" in code
+    assert "def _path_matches_reuse_target(path_text):" in code
+    assert "import re" in code
+    assert "ignoring continuity artifact that does not match target filename/path" in code
+    assert "require_target_match=True" in code
+    assert "if getattr(exc, 'code', exc) in (0, None):" in code
+    assert code.index("wait_for_recent_download_artifact(") < code.index("open_url_and_wait(")
+    assert code.index("write_action_context(") < code.index("open_url_and_wait(")
+    assert "click_text_targets(" not in code
+    assert "ocr_screen_text_regions(" not in code
+
+
+def test_model_ui_browser_prelude_only_runs_on_first_step(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Open https://vendor.example/download and download the Windows installer.",
+        execution_style="gui_first",
+        step_index=1,
+    )
+    assert _should_use_model_ui_browser_prelude(request) is False
+
+
+def test_model_ui_browser_prelude_fallback_search_uses_task_tokens(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt=(
+            "Use executable Python only. Do not download anything in this chunk. "
+            "If no installer UI is visible yet, find the existing installer `.exe` or `.msi` in `%USERPROFILE%\\\\Downloads\\\\`, "
+            "launch it once, and then continue from the resulting installer UI. "
+            "Use executable Python on the Windows machine to locate the already-installed app executable "
+            "for the target app from this task: mobaxterm을 설치해줘, prefer reading `~/Downloads/install-success.json` first."
+        ),
+        execution_style="gui_first",
+    )
+    url = _fallback_browser_search_url_for_request(request, extra_targets=["mobaxterm"])
+    assert url is not None
+    assert "mobaxterm" in url
+    assert "execution" not in url
+    assert "download-like" not in url
+
+
+def test_model_ui_browser_prelude_not_selected_for_install_chunk(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt=(
+            "Use executable Python only. Do not download anything in this chunk. "
+            "First inspect the current screenshot and desktop state for an installer wizard, UAC prompt, license dialog, "
+            "destination dialog, or completion dialog, and drive that visible UI forward if present. "
+            "If no installer UI is visible yet, find the existing installer `.exe` or `.msi` in `%USERPROFILE%\\\\Downloads\\\\`, "
+            "launch it once, and then continue from the resulting installer UI. "
+            "Do only this chunk. Do not skip ahead to later chunks."
+        ),
+        execution_style="gui_first",
+    )
+    assert _looks_like_existing_installer_launch_task(request.user_prompt) is True
+    assert _should_use_model_ui_browser_prelude(request) is False
+
+
+def test_model_ui_browser_prelude_not_selected_for_verified_installer_chunk(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt=(
+            "Use Python to locate the FileZilla installer in Downloads, start it with subprocess.Popen, "
+            "and complete the Windows setup using default options unless the installer requires a straightforward confirmation. "
+            "After installation, launch FileZilla Client and confirm it starts successfully without errors.\n\n"
+            "Current chunk success target: FileZilla is installed and the client process starts successfully.\n\n"
+            "Preconditions expected before or during this chunk:\n"
+            "- A valid FileZilla installer .exe already exists in ~/Downloads.\n\n"
+            "Previously verified installer artifacts on the target machine. Prefer these exact installer paths before searching Downloads broadly again:\n"
+            "- `C:\\Users\\user\\Downloads\\FileZilla_3.70.4_win64_sponsored2-setup.exe`"
+        ),
+        execution_style="gui_first",
+    )
+    assert _looks_like_existing_installer_launch_task(request.user_prompt) is True
+    assert _should_use_model_ui_browser_prelude(request) is False
+
+
+def test_model_ui_download_recovery_uses_visible_candidates(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    observation = """MODEL_VISIBLE_UI_CANDIDATES:
+These candidates come from local model visual extraction of the latest screenshot, not Windows OCR.
+{"screenshot_size":[1920,1080],"candidates":[
+  {"text":"Memoit 다운로드 (v1.93)","click_point":[920,540],"reason_tags":["download_like","target_like"],"score":92},
+  {"text":"북마크","click_point":[120,80],"reason_tags":["toolbar_text_penalty"],"score":12}
+]}"""
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        observation_text=observation,
+    )
+    assert _should_use_model_ui_download_recovery(request) is True
+    code = _synthesized_model_ui_download_recovery_code(request)
+    assert "pyautogui.click(x, y)" in code
+    assert "pyautogui.FAILSAFE = False" in code
+    assert "def _candidate_points(candidate):" in code
+    assert "for delta_x in (-80, 80):" in code
+    assert "return deduped[:4]" in code
+    assert "def _candidate_identity(candidate):" in code
+    assert "def _same_candidate(candidate, remembered):" in code
+    assert "if abs(int(candidate_point[0]) - int(remembered_point[0])) <= 12" in code
+    assert "return bool(candidate_text and remembered_text and candidate_text == remembered_text)" in code
+    assert "def _path_matches_reuse_target(path_text):" in code
+    assert "def _current_visible_signature(candidates):" in code
+    assert "def _recent_attempted_candidates():" in code
+    assert "if installer_path and _path_matches_reuse_target(installer_path):" in code
+    assert "def _candidate_attempt_count(candidate, attempted_candidates):" in code
+    assert "def _record_clicked_candidate(candidate, point):" in code
+    assert "visible_click_history=history[-8:]" in code
+    assert "visible_candidate_signature=_current_visible_signature(VISIBLE_CANDIDATES)" in code
+    assert "CLICK_CANDIDATES = [candidate for candidate in VISIBLE_CANDIDATES if not any(_same_candidate(candidate, attempted) for attempted in ATTEMPTED_CANDIDATES)]" in code
+    assert "_candidate_attempt_count(candidate, ATTEMPTED_CANDIDATES) < 2" in code
+    assert "for candidate_index, candidate in enumerate(CLICK_CANDIDATES[:3], start=1):" in code
+    assert "for point_index, (x, y) in enumerate(points, start=1):" in code
+    assert "points = _candidate_points(candidate)" in code
+    assert "_record_clicked_candidate(candidate, points[0])" in code
+    assert "wait_for_recent_download_artifact(" in code
+    assert "def _wait_for_download_progress(since_ts, timeout_s=6.0):" in code
+    assert "def _is_success_exit(exc):" in code
+    assert "download progress detected:" in code
+    assert "extra_targets=None" not in code
+    assert "require_target_match=True" in code
+    assert "downloaded artifact does not match target filename/path" in code
+    assert "recent download already present" in code
+    assert "since_ts=(time.time() - 30.0)" in code
+    assert "timeout_s=3.0" in code
+    assert "timeout_s=45.0" in code
+    assert "if _is_success_exit(exc):" in code
+    assert "def _is_partial_progress_exit(exc):" in code
+    assert "clicked all grounded points for all visible candidates without a stable download" in code
+    assert "FALLBACK_ALTERNATE_SEARCH_URLS = " in code
+    assert "def _isolated_recovery_urls():" in code
+    assert "def _try_download_from_isolated_recovery_page():" in code
+    assert "retry_source_urls = _isolated_recovery_urls()" in code
+    assert "for candidate in [PROMPT_URL, FALLBACK_SEARCH_URL, *FALLBACK_ALTERNATE_SEARCH_URLS]:" in code
+    assert "return urls[:2]" in code
+    assert "RECOVERY_URL_ATTEMPTS = set()" in code
+    assert "def _search_query_fingerprint(query):" in code
+    assert "failed_recovery_search_queries=failed_queries[-16:]" in code
+    assert "failed_recovery_hosts=failed_hosts[-16:]" in code
+    assert "skipping previously failed recovery URL/query/host:" in code
+    assert "_record_failed_recovery_url(retry_source_url, exc)" in code
+    assert "if retry_source_url in RECOVERY_URL_ATTEMPTS:" in code
+    assert "skipping repeated isolated recovery page:" in code
+    assert "open_url_and_wait(retry_source_url" in code
+    assert "opened isolated recovery page:" in code
+    assert "download_official_installer_from_page(retry_source_url, extra_targets=TARGET_TERMS" in code
+    assert "download recovered from isolated recovery page" in code
+    assert "isolated recovery page recovery failed:" in code
+    assert (
+        "raise SystemExit('continue with latest screenshot and model-visible UI candidates after opening isolated recovery page')"
+        in code
+    )
+    assert "\n    recovered = _try_download_from_isolated_recovery_page()" in code
+    assert "\n        recovered = _try_download_from_isolated_recovery_page()" not in code
+    assert "def _colored_cta_points():" in code
+    assert "def _try_colored_cta_download(since_ts):" in code
+    assert "click colored CTA candidate" in code
+    assert "continue with latest screenshot and model-visible UI candidates after clicking a colored download CTA candidate" in code
+    assert "pyautogui.hotkey('ctrl', 'l')" not in code
+    assert "no visible download-related control remains on the current screen" in code
+    assert "no new visible download-related control is available on the current screen" in code
+    assert "Memoit 다운로드" in code
+    assert "CONTEXT_PROMPT_KEY = null" not in code
+    assert "CONTEXT_PROMPT_KEY = \"\"" not in code
+    assert "CONTEXT_PROMPT_EXCERPT = \"target_terms=" in code
+    assert "북마크" not in code
+    assert "null" not in code
+
+
+def test_search_url_exclusion_treats_platform_only_variants_as_repeated() -> None:
+    assert _search_url_matches_excluded_query(
+        "https://www.google.com/search?q=filezilla%20windows%20pc",
+        excluded_queries=["filezilla windows"],
+    )
+    assert _search_url_validation_error(
+        "https://www.google.com/search?q=filezilla%20pc%20desktop%20x64",
+        ["filezilla"],
+        excluded_queries=["filezilla windows"],
+    ) == "repeated_query"
+    assert _fallback_browser_search_url_from_parts(
+        ["filezilla"],
+        [],
+        excluded_queries=["filezilla windows"],
+    ) == "https://www.google.com/search?q=filezilla%20windows%20kr"
+
+
+def test_model_ui_download_recovery_excludes_browser_url_candidate(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    observation = """MODEL_VISIBLE_UI_CANDIDATES:
+These candidates come from local model visual extraction of the latest screenshot, not Windows OCR.
+{"screenshot_size":[1920,1080],"candidates":[
+  {"text":"https://filezilla-project.org/download.php?type=client","click_point":[980,92],"reason_tags":["download_like","browser_url_penalty"],"score":88},
+  {"text":"Download FileZilla Client","click_point":[1110,754],"reason_tags":["download_like","target_like","button_shape"],"score":93}
+]}"""
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        observation_text=observation,
+    )
+    code = _synthesized_model_ui_download_recovery_code(request)
+    assert "Download FileZilla Client" in code
+    assert "https://filezilla-project.org/download.php?type=client" not in code
+
+
+def test_model_ui_download_recovery_keeps_target_only_backup_candidate_when_download_candidate_visible(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    observation = """MODEL_VISIBLE_UI_CANDIDATES:
+These candidates come from local model visual extraction of the latest screenshot, not Windows OCR.
+{"screenshot_size":[2560,1440],"candidates":[
+  {"text":"Download FileZilla Client for Windows (64bit x64)","click_point":[1027,666],"reason_tags":["download_like","target_like","button_shape"],"score":83},
+  {"text":"FileZilla - The free FTP solution","click_point":[942,436],"reason_tags":["clickable_kind","target_like","button_shape"],"score":48},
+  {"text":"How to Install FileZilla on Windows","click_point":[1198,1026],"reason_tags":["download_like","install_like","target_like","community_article_penalty","button_shape"],"score":38}
+]}"""
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        observation_text=observation,
+    )
+    code = _synthesized_model_ui_download_recovery_code(request)
+    assert "'text': 'Download FileZilla Client for Windows (64bit x64)'" in code
+    assert "'text': 'FileZilla - The free FTP solution'" in code
+
+
+def test_model_ui_download_recovery_avoids_reusing_current_page_url_when_no_candidates(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        observation_text="MODEL_VISIBLE_UI_CANDIDATES: []\nNo target-matching model-visible UI candidates were extracted from the latest search-results screenshot.",
+    )
+    code = _synthesized_model_ui_download_recovery_code(request)
+    assert "download_official_installer_from_page(current_url" not in code
+    assert "PROMPT_URL or FALLBACK_SEARCH_URL" in code
+
+
+def test_partial_download_page_navigation_detected_from_last_execution() -> None:
+    assert _looks_like_partial_download_page_navigation(
+        {
+            "stdout_tail": (
+                "visible candidate opened page: https://filezilla-project.org/download.php?type=client\n"
+                "opened browser page for screenshot-grounded UI continuation"
+            ),
+            "stderr_tail": "continue with latest screenshot and model-visible UI candidates",
+        }
+    ) is True
+
+
+def test_exhausted_visible_download_recovery_detected_from_grounded_click_exhaustion() -> None:
+    assert _looks_like_exhausted_visible_download_recovery(
+        {
+            "stdout_tail": (
+                "click visible download candidate[1/1]: Download FileZilla Client at (1110, 754)\n"
+                "candidate point 4 did not finish download yet: recent installer download did not appear\n"
+                "opened isolated recovery page: https://www.google.com/search?q=filezilla%20windows"
+            ),
+            "stderr_tail": "clicked all grounded points for all visible candidates without a stable download: recent installer download did not appear",
+        }
+    ) is True
+
+
+def test_model_ui_download_recovery_does_not_clear_click_history_for_stale_context_path() -> None:
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download the FileZilla Windows installer.",
+        execution_style="gui_first",
+        observation_text='MODEL_UI_ELEMENTS_JSON: {"elements":[{"text":"Download FileZilla Client","kind":"button","bbox":[800,700,1000,760]}]}',
+    )
+    code = _synthesized_model_ui_download_recovery_code(request)
+    assert "installer_path = str(payload.get('installer_path') or '').strip()" in code
+    assert "if installer_path and _path_matches_reuse_target(installer_path):" in code
+    assert "return []" in code
+
+
+def test_fallback_browser_search_url_ignores_previous_stdout_artifact_noise() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Use the current visible browser page for FileZilla.\n"
+            "Use these exact official page URLs first before any search engine result or inferred domain:\n"
+            "- https://filezilla-project.org/download.php?type=client\n"
+            "Previous stdout summary: ignoring continuity artifact that does not match target filename/path: "
+            "C:\\Users\\user\\Downloads\\npp.8.9.1.Installer.x64.exe\n"
+        ),
+        execution_style="gui_first",
+    )
+    url = _fallback_browser_search_url_for_request(request, extra_targets=["filezilla", "project"])
+    assert url is not None
+    assert "filezilla" in url
+    assert "npp" not in url
+
+
+def test_model_ui_download_recovery_merges_split_download_candidates(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    observation = """MODEL_VISIBLE_UI_CANDIDATES:
+These candidates come from local model visual extraction of the latest screenshot, not Windows OCR.
+{"screenshot_size":[2560,1440],"candidates":[
+  {"text":"다운로드","click_point":[1375,750],"bbox":[1350,740,1400,760],"reason_tags":["download_like","button_shape"],"score":61},
+  {"text":"다운로드","click_point":[1425,750],"bbox":[1400,740,1450,760],"reason_tags":["download_like","button_shape"],"score":61},
+  {"text":"다운로드","click_point":[1475,750],"bbox":[1450,740,1500,760],"reason_tags":["download_like","button_shape"],"score":61}
+]}"""
+    request = StepRequest(
+        user_prompt="This is a download-only step. End this step only when the installer file exists in Downloads.",
+        execution_style="gui_first",
+        observation_text=observation,
+    )
+    code = _synthesized_model_ui_download_recovery_code(request)
+    assert "'bbox': [1350, 740, 1500, 760]" in code
+    assert "'point': [1425, 750]" in code
+    assert code.count("'text': '다운로드'") == 1
+    assert "lower_y = min(max(5, bottom - 6), center_y + min(20, max(8, int((bottom - top) * 0.25))))" in code
+
+
+def test_model_ui_download_recovery_keeps_purchase_like_candidate_when_visible(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    observation = """MODEL_VISIBLE_UI_CANDIDATES:
+These candidates come from local model visual extraction of the latest screenshot, not Windows OCR.
+{"screenshot_size":[2560,1440],"candidates":[
+  {"text":"Buy FileZilla Pro Single Device","click_point":[979,540],"reason_tags":["clickable_kind","target_like","button_shape"],"score":48},
+  {"text":"Buy FileZilla Pro Multiple Devices","click_point":[2182,540],"reason_tags":["clickable_kind","target_like","button_shape"],"score":48},
+  {"text":"Windows","click_point":[1344,792],"reason_tags":["clickable_kind","download_like","button_shape"],"score":61}
+]}"""
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        observation_text=observation,
+    )
+    code = _synthesized_model_ui_download_recovery_code(request)
+    assert "'text': 'Windows'" in code
+
+
+def test_model_ui_candidates_search_results_retry_recovers_page_body_results(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_text(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            if self.calls == 1:
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "text": '{"elements":[{"text":"Microsoft Edge","kind":"link","bbox":[270,220,350,250],"confidence":0.95}]}',
+                        "model_id": "fake-model",
+                    },
+                )()
+            return type(
+                "Result",
+                (),
+                {
+                    "text": '{"elements":[{"text":"메모잇 - 바탕화면 메모장 포스트잇","kind":"link","bbox":[220,250,620,320],"confidence":0.98}]}',
+                    "model_id": "fake-model",
+                },
+            )()
+
+    screenshot_bytes = (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x07\x80"
+        b"\x00\x00\x04\x38"
+        b"\x08\x02\x00\x00\x00"
+        b"\x00\x00\x00\x00"
+    )
+    request = StepRequest(
+        user_prompt="메모잇 설치해줘",
+        execution_style="gui_first",
+        screenshot_base64=base64.b64encode(screenshot_bytes).decode("ascii"),
+        step_index=1,
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=%EB%A9%94%EB%AA%A8%EC%9E%87%20%EA%B3%B5%EC%8B%9D%20%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C%20pc%20windows", expected_title_tokens=["메모잇"])',
+            }
+        },
+    )
+    runtime = FakeRuntime()
+    observation = _model_ui_candidates_observation(
+        runtime=runtime,
+        request=request,
+        max_new_tokens=256,
+        generation_context=None,
+    )
+    assert runtime.calls == 2
+    assert observation is not None
+    assert "메모잇 - 바탕화면 메모장 포스트잇" in observation
+
+
+def test_model_ui_candidates_search_results_retry_runs_for_low_signal_candidates(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_text(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            if self.calls == 1:
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "text": '{"elements":[{"text":"Microsoft","kind":"link","bbox":[276,220,313,245],"confidence":0.95}]}',
+                        "model_id": "fake-model",
+                    },
+                )()
+            return type(
+                "Result",
+                (),
+                {
+                    "text": '{"elements":[{"text":"메모잇 다운로드","kind":"link","bbox":[220,250,420,320],"confidence":0.98}]}',
+                    "model_id": "fake-model",
+                },
+            )()
+
+    screenshot_bytes = (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x07\x80"
+        b"\x00\x00\x04\x38"
+        b"\x08\x02\x00\x00\x00"
+        b"\x00\x00\x00\x00"
+    )
+    request = StepRequest(
+        user_prompt="메모잇 설치해줘",
+        execution_style="gui_first",
+        screenshot_base64=base64.b64encode(screenshot_bytes).decode("ascii"),
+        step_index=1,
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=%EB%A9%94%EB%AA%A8%EC%9E%87%20%EA%B3%B5%EC%8B%9D%20%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C%20pc%20windows", expected_title_tokens=["메모잇"])',
+            }
+        },
+    )
+    runtime = FakeRuntime()
+    observation = _model_ui_candidates_observation(
+        runtime=runtime,
+        request=request,
+        max_new_tokens=256,
+        generation_context=None,
+    )
+    assert runtime.calls == 2
+    assert observation is not None
+    assert "메모잇 다운로드" in observation
+
+
+def test_model_ui_candidates_search_results_retry_runs_for_offtarget_download_candidates(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_text(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            if self.calls == 1:
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "text": '{"elements":[{"text":"파일질마 다운로드센터","kind":"link","bbox":[276,312,396,336],"confidence":0.95}]}',
+                        "model_id": "fake-model",
+                    },
+                )()
+            return type(
+                "Result",
+                (),
+                {
+                    "text": '{"elements":[{"text":"FileZilla - FTP Client filezilla.kr","kind":"link","bbox":[276,312,526,338],"confidence":0.98}]}',
+                    "model_id": "fake-model",
+                },
+            )()
+
+    screenshot_bytes = (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x0a\x00"
+        b"\x00\x00\x05\xa0"
+        b"\x08\x02\x00\x00\x00"
+        b"\x00\x00\x00\x00"
+    )
+    request = StepRequest(
+        user_prompt="filezilla 설치해줘",
+        execution_style="gui_first",
+        screenshot_base64=base64.b64encode(screenshot_bytes).decode("ascii"),
+        step_index=1,
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=filezilla%20pc%20desktop%20kr", expected_title_tokens=["filezilla"])',
+            }
+        },
+    )
+    runtime = FakeRuntime()
+    observation = _model_ui_candidates_observation(
+        runtime=runtime,
+        request=request,
+        max_new_tokens=256,
+        generation_context=None,
+    )
+    assert runtime.calls == 2
+    assert observation is not None
+    assert "FileZilla - FTP Client filezilla.kr" in observation
+
+
+def test_search_results_score_prefers_target_domain_over_side_panel_download() -> None:
+    request = StepRequest(
+        user_prompt="filezilla kr설치해줘",
+        execution_style="gui_first",
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=filezilla%20kr")',
+            }
+        },
+    )
+    assert _visible_flow_extra_targets(request, limit=8) == ["filezilla"]
+
+    side_panel_score, side_panel_tags = _score_model_ui_candidate(
+        "Download FileZilla Client for Windows (64-bit)",
+        "link",
+        (1715, 475, 2048, 518),
+        request=request,
+        screen_size=(2560, 1440),
+    )
+    domain_score, domain_tags = _score_model_ui_candidate(
+        "FileZilla - FTP Client filezilla.kr",
+        "link",
+        (707, 449, 1347, 487),
+        request=request,
+        screen_size=(2560, 1440),
+    )
+
+    assert "search_result_side_panel_penalty" in side_panel_tags
+    assert "search_result_domain_like" in domain_tags
+    assert domain_score > side_panel_score
+
+
+def test_model_ui_candidates_promotes_hangul_search_alias_when_direct_ascii_target_exists(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+
+    class FakeRuntime:
+        def generate_text(self, **kwargs):  # type: ignore[no-untyped-def]
+            return type(
+                "Result",
+                (),
+                {
+                    "text": (
+                        '{"elements":['
+                        '{"text":"FileZilla - FTP Client filezilla.kr","kind":"link","bbox":[276,312,526,338],"confidence":0.98},'
+                        '{"text":"파일질라 다운로드","kind":"link","bbox":[276,410,460,440],"confidence":0.95},'
+                        '{"text":"무료 다운로드","kind":"link","bbox":[276,500,420,530],"confidence":0.95}'
+                        "]}"
+                    ),
+                    "model_id": "fake-model",
+                },
+            )()
+
+    screenshot_bytes = (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x0a\x00"
+        b"\x00\x00\x05\xa0"
+        b"\x08\x02\x00\x00\x00"
+        b"\x00\x00\x00\x00"
+    )
+    request = StepRequest(
+        user_prompt="filezilla 설치해줘",
+        execution_style="gui_first",
+        screenshot_base64=base64.b64encode(screenshot_bytes).decode("ascii"),
+        step_index=1,
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=filezilla%20kr")',
+            }
+        },
+    )
+
+    observation = _model_ui_candidates_observation(
+        runtime=FakeRuntime(),
+        request=request,
+        max_new_tokens=256,
+        generation_context=None,
+    )
+    candidates = _model_ui_candidates_from_observation(observation)
+    alias = next(item for item in candidates if item["text"] == "파일질라 다운로드")
+    generic = next(item for item in candidates if item["text"] == "무료 다운로드")
+
+    assert "target_alias_like" in alias["reason_tags"]
+    assert "target_like" in alias["reason_tags"]
+    assert "offtarget_search_result_penalty" not in alias["reason_tags"]
+    assert "target_alias_like" not in generic["reason_tags"]
+    assert "offtarget_search_result_penalty" in generic["reason_tags"]
+    assert alias["score"] > generic["score"]
+
+
+def test_model_ui_candidates_promotes_latin_search_alias_when_direct_hangul_target_exists(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+
+    class FakeRuntime:
+        def generate_text(self, **kwargs):  # type: ignore[no-untyped-def]
+            return type(
+                "Result",
+                (),
+                {
+                    "text": (
+                        '{"elements":['
+                        '{"text":"파일질라 다운로드","kind":"link","bbox":[276,312,526,338],"confidence":0.98},'
+                        '{"text":"Download FileZilla Client for Windows","kind":"link","bbox":[276,410,620,440],"confidence":0.95},'
+                        '{"text":"Download for Windows","kind":"link","bbox":[276,500,520,530],"confidence":0.95}'
+                        "]}"
+                    ),
+                    "model_id": "fake-model",
+                },
+            )()
+
+    screenshot_bytes = (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x0a\x00"
+        b"\x00\x00\x05\xa0"
+        b"\x08\x02\x00\x00\x00"
+        b"\x00\x00\x00\x00"
+    )
+    request = StepRequest(
+        user_prompt="파일질라 설치해줘",
+        execution_style="gui_first",
+        screenshot_base64=base64.b64encode(screenshot_bytes).decode("ascii"),
+        step_index=1,
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=%ED%8C%8C%EC%9D%BC%EC%A7%88%EB%9D%BC")',
+            }
+        },
+    )
+
+    observation = _model_ui_candidates_observation(
+        runtime=FakeRuntime(),
+        request=request,
+        max_new_tokens=256,
+        generation_context=None,
+    )
+    candidates = _model_ui_candidates_from_observation(observation)
+    alias = next(item for item in candidates if item["text"] == "Download FileZilla Client for Windows")
+    generic = next(item for item in candidates if item["text"] == "Download for Windows")
+
+    assert "target_alias_like" in alias["reason_tags"]
+    assert "target_like" in alias["reason_tags"]
+    assert "offtarget_search_result_penalty" not in alias["reason_tags"]
+    assert "target_alias_like" not in generic["reason_tags"]
+    assert "offtarget_search_result_penalty" in generic["reason_tags"]
+    assert alias["score"] > generic["score"]
+
+
+def test_model_ui_candidates_drops_zero_confidence_dummy(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+
+    class FakeRuntime:
+        def generate_text(self, **kwargs):  # type: ignore[no-untyped-def]
+            return type(
+                "Result",
+                (),
+                {
+                    "text": '{"elements":[{"text":"filezilla","kind":"text","bbox":[1000,1000,1000,1000],"confidence":0.0}]}',
+                    "model_id": "fake-model",
+                },
+            )()
+
+    screenshot_bytes = (
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x0a\x00"
+        b"\x00\x00\x05\xa0"
+        b"\x08\x02\x00\x00\x00"
+        b"\x00\x00\x00\x00"
+    )
+    request = StepRequest(
+        user_prompt="filezilla 설치해줘",
+        execution_style="gui_first",
+        screenshot_base64=base64.b64encode(screenshot_bytes).decode("ascii"),
+        step_index=1,
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=filezilla%20kr")',
+            }
+        },
+    )
+    observation = _model_ui_candidates_observation(
+        runtime=FakeRuntime(),
+        request=request,
+        max_new_tokens=256,
+        generation_context=None,
+    )
+    assert observation is not None
+    assert "MODEL_VISIBLE_UI_CANDIDATES: []" in observation
+
+
+def test_model_ui_candidates_continue_after_first_step(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="sampleapp 프로그램을 설치해줘",
+        execution_style="gui_first",
+        screenshot_base64="iVBORw0KGgo=",
+        step_index=1,
+    )
+    assert _should_use_model_ui_candidates(request) is True
+
+
+def test_model_ui_download_recovery_not_selected_for_install_chunk(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        observation_text='MODEL_VISIBLE_UI_CANDIDATES: {"candidates":[{"text":"확인","click_point":[900,700],"reason_tags":["installer_dialog_control"]}]}',
+    )
+    assert _should_use_model_ui_download_recovery(request) is False
+
+
+def test_model_ui_download_recovery_not_selected_immediately_after_browser_open(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        step_index=1,
+        observation_text='MODEL_VISIBLE_UI_CANDIDATES: {"candidates":[{"text":"메모잇","click_point":[900,700],"reason_tags":["target_like"]}]}',
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=sampleapp", expected_title_tokens=["sampleapp"])',
+            }
+        },
+    )
+    assert _should_use_model_ui_download_recovery(request) is False
+
+
+def test_model_ui_download_recovery_selected_immediately_after_search_open_when_download_candidate_visible(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        step_index=1,
+        observation_text=(
+            'MODEL_VISIBLE_UI_CANDIDATES: {"candidates":['
+            '{"text":"Download FileZilla Client for Windows (64bit x64)","click_point":[1011,623],"reason_tags":["download_like","target_like","button_shape"]}'
+            "]} "
+        ),
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=filezilla%20windows", expected_title_tokens=["filezilla"])',
+            }
+        },
+    )
+    assert _should_use_model_ui_download_recovery(request) is True
+    code = _synthesized_model_ui_download_recovery_code(request)
+    assert "SEARCH_RESULTS_FOCUS = True" in code
+    assert "after opening a search result candidate" in code
+
+
+def test_model_ui_download_recovery_search_results_rank_target_above_generic_download(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="filezilla 설치해줘",
+        execution_style="gui_first",
+        step_index=1,
+        observation_text=(
+            'MODEL_VISIBLE_UI_CANDIDATES: {"candidates":['
+            '{"text":"파일전송 프로그램 다운로드","click_point":[860,300],"reason_tags":["download_like","offtarget_search_result_penalty"],"score":1},'
+            '{"text":"FileZilla - FTP 클라이언트","click_point":[860,468],"reason_tags":["target_like"],"score":48}'
+            "]} "
+        ),
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=filezilla%20pc%20desktop%20kr", expected_title_tokens=["filezilla"])',
+            }
+        },
+    )
+
+    code = _synthesized_model_ui_download_recovery_code(request)
+    assert code.index("'FileZilla - FTP 클라이언트'") < code.index("'파일전송 프로그램 다운로드'")
+
+
+def test_model_ui_download_recovery_allows_new_candidates_after_exhausted_attempt(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        step_index=3,
+        observation_text=(
+            'MODEL_VISIBLE_UI_CANDIDATES: {"candidates":['
+            '{"text":"Download FileZilla Client for Windows (64bit x86)","click_point":[1031,566],"reason_tags":["download_like","target_like"],"score":83},'
+            '{"text":"Download FileZilla Pro - Download and install on Windows","click_point":[1031,1113],"reason_tags":["download_like","install_like","target_like"],"score":108}'
+            "]} "
+        ),
+        last_execution={
+            "stdout_tail": (
+                "click visible download candidate[1/3]: Download at (486, 378)\n"
+                "candidate point 1 did not finish download yet: recent installer download did not appear\n"
+                "opened isolated recovery page: https://www.google.com/search?q=filezilla%20windows\n"
+                "isolated recovery page did not find a stable installer: no official Windows installer/archive candidate found on the current page\n"
+            ),
+            "stderr_tail": "continue with latest screenshot and model-visible UI candidates after opening isolated recovery page\n",
+            "payload_metadata": {
+                "agent_response": {
+                    "python_code": (
+                        "VISIBLE_CANDIDATES = ["
+                        "{'text': 'Download', 'point': [486, 378]}, "
+                        "{'text': 'FileZilla Server', 'point': [205, 378]}"
+                        "]\n"
+                        "print('previous recovery')"
+                    )
+                }
+            },
+        },
+    )
+    assert service_module._looks_like_exhausted_visible_download_recovery(request.last_execution) is True
+    assert _should_use_model_ui_download_recovery(request) is True
+
+
+def test_model_ui_download_recovery_blocks_same_candidates_after_exhausted_attempt(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        step_index=3,
+        observation_text=(
+            'MODEL_VISIBLE_UI_CANDIDATES: {"candidates":['
+            '{"text":"Download","click_point":[486,378],"reason_tags":["download_like"],"score":71},'
+            '{"text":"FileZilla Server","click_point":[205,378],"reason_tags":["target_like"],"score":48}'
+            "]} "
+        ),
+        last_execution={
+            "stdout_tail": (
+                "click visible download candidate[1/3]: Download at (486, 378)\n"
+                "candidate point 1 did not finish download yet: recent installer download did not appear\n"
+                "opened isolated recovery page: https://www.google.com/search?q=filezilla%20windows\n"
+                "isolated recovery page did not find a stable installer: no official Windows installer/archive candidate found on the current page\n"
+            ),
+            "stderr_tail": "continue with latest screenshot and model-visible UI candidates after opening isolated recovery page\n",
+            "payload_metadata": {
+                "agent_response": {
+                    "python_code": (
+                        "VISIBLE_CANDIDATES = ["
+                        "{'text': 'Download', 'point': [486, 378]}, "
+                        "{'text': 'FileZilla Server', 'point': [205, 378]}"
+                        "]\n"
+                        "print('previous recovery')"
+                    )
+                }
+            },
+        },
+    )
+    assert service_module._looks_like_exhausted_visible_download_recovery(request.last_execution) is True
+    assert _should_use_model_ui_download_recovery(request) is False
+
+
+def test_model_ui_download_recovery_allows_single_candidate_after_scroll_changed_candidates(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        step_index=6,
+        observation_text=(
+            'MODEL_VISIBLE_UI_CANDIDATES: {"candidates":['
+            '{"text":"Download FileZilla Server","click_point":[1455,300],"reason_tags":["download_like","target_like"],"score":83}'
+            "]} "
+        ),
+        last_execution={
+            "stdout_tail": (
+                "click visible download candidate[1/3]: Download FileZilla Server at (1561, 525)\n"
+                "candidate point 4 did not finish download yet: recent installer download did not appear\n"
+                "colored CTA candidate did not finish download: recent installer download did not appear\n"
+            ),
+            "stderr_tail": "continue with latest screenshot and model-visible UI candidates after clicking a colored download CTA candidate\n",
+            "payload_metadata": {
+                "agent_response": {
+                    "python_code": (
+                        "VISIBLE_CANDIDATES = ["
+                        "{'text': 'Download FileZilla Server', 'point': [1561, 525]}, "
+                        "{'text': '파일질라 서버 다운로드', 'point': [1459, 432]}, "
+                        "{'text': 'Free Download', 'point': [1484, 280]}"
+                        "]\n"
+                        "print('previous recovery')"
+                    )
+                }
+            },
+        },
+    )
+    assert _should_use_model_ui_download_recovery(request) is True
+
+
+def test_model_ui_download_recovery_blocks_same_single_candidate_after_repeated_failure(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        step_index=6,
+        observation_text=(
+            'MODEL_VISIBLE_UI_CANDIDATES: {"candidates":['
+            '{"text":"Download FileZilla Server","click_point":[1455,300],"reason_tags":["download_like","target_like"],"score":83}'
+            "]} "
+        ),
+        last_execution={
+            "stdout_tail": (
+                "click visible download candidate[1/1]: Download FileZilla Server at (1455, 300)\n"
+                "candidate point 4 did not finish download yet: recent installer download did not appear\n"
+            ),
+            "stderr_tail": "continue with latest screenshot and model-visible UI candidates after clicking a colored download CTA candidate\n",
+            "payload_metadata": {
+                "agent_response": {
+                    "python_code": (
+                        "VISIBLE_CANDIDATES = ["
+                        "{'text': 'Download FileZilla Server', 'point': [1455, 300]}"
+                        "]\n"
+                        "print('previous recovery')"
+                    )
+                }
+            },
+        },
+    )
+    assert _should_use_model_ui_download_recovery(request) is False
+
+
+def test_model_ui_download_recovery_selected_immediately_after_official_page_open(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        step_index=1,
+        observation_text='MODEL_VISIBLE_UI_CANDIDATES: {"candidates":[{"text":"다운로드","click_point":[1792,821],"reason_tags":["download_like"]}]}',
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://mydev.kr/", expected_title_tokens=["memoit","메모잇"])',
+            }
+        },
+    )
+    assert _should_use_model_ui_download_recovery(request) is True
+
+
+def test_model_ui_download_recovery_selected_for_target_only_candidates_after_search_recovery(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        step_index=2,
+        observation_text=(
+            'MODEL_VISIBLE_UI_CANDIDATES: {"candidates":['
+            '{"text":"SampleDesk - official downloads","click_point":[900,530],"reason_tags":["clickable_kind","target_like","button_shape"]}'
+            "]}"
+        ),
+        last_execution={
+            "stderr_tail": "No official Windows installer/archive candidate found from the prompt URLs.",
+        },
+    )
+
+    assert _should_use_model_ui_download_recovery(request) is True
+
+
+def test_model_ui_download_recovery_retries_target_only_candidates_before_late_stall(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible official page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        step_index=2,
+        observation_text=(
+            'MODEL_VISIBLE_UI_CANDIDATES: {"candidates":['
+            '{"text":"SampleDesk","click_point":[900,330],"reason_tags":["clickable_kind","target_like","button_shape"]},'
+            '{"text":"SampleDesk","click_point":[1200,330],"reason_tags":["clickable_kind","target_like","button_shape"]}'
+            "]}"
+        ),
+        last_execution={
+            "stdout_tail": (
+                "click visible download candidate: SampleDesk at (900, 330)\n"
+                "candidate did not finish download yet: recent installer download did not appear"
+            ),
+            "stderr_tail": "clicked a grounded download candidate",
+        },
+    )
+
+    assert _should_use_model_ui_download_recovery(request) is True
+
+
+def test_download_artifact_only_chunk_recognizes_replan_download_only_prompt() -> None:
+    prompt = (
+        "REPLAN OVERRIDE FOR THIS STEP:\n"
+        "Return executable Python only.\n"
+        "Use the screenshot to estimate the visible download/install control coordinates, then use Python GUI actions to focus the browser, click or keyboard-navigate that control, and wait for the download artifact to stabilize in Downloads.\n"
+        "This is a download-only step. Do not launch, silently install, or run the installer in this step.\n"
+        "End this step only when the installer file exists in Downloads."
+    )
+    assert service_module._looks_like_download_artifact_only_chunk(prompt) is True
+
+
+def test_download_chunk_completed_accepts_model_ui_recovery_markers() -> None:
+    prompt = "Current chunk success target: The official installer `.msi` exists in Downloads and is non-empty."
+    assert _looks_like_download_chunk_completed(
+        user_prompt=prompt,
+        last_execution={
+            "return_code": 0,
+            "stdout_tail": "download recovered from official page after stalled click: C:\\Users\\me\\Downloads\\app.msi",
+        },
+    )
+    assert _looks_like_download_chunk_completed(
+        user_prompt=prompt,
+        last_execution={
+            "return_code": 0,
+            "stdout_tail": "using previously downloaded artifact: C:\\Users\\me\\Downloads\\app.msi",
+        },
+    )
+    assert _looks_like_download_chunk_completed(
+        user_prompt=prompt,
+        last_execution={
+            "return_code": 0,
+            "stdout_tail": "download ready after visible click: C:\\Users\\me\\Downloads\\app.msi",
+        },
+    )
+
+
+def test_model_ui_download_recovery_selected_for_replan_download_only_prompt(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    prompt = (
+        "REPLAN OVERRIDE FOR THIS STEP:\n"
+        "Return executable Python only.\n"
+        "Use the screenshot to estimate the visible download/install control coordinates, then use Python GUI actions to focus the browser, click or keyboard-navigate that control, and wait for the download artifact to stabilize in Downloads.\n"
+        "This is a download-only step. Do not launch, silently install, or run the installer in this step.\n"
+        "End this step only when the installer file exists in Downloads."
+    )
+    request = StepRequest(
+        user_prompt=prompt,
+        execution_style="gui_first",
+        step_index=2,
+        observation_text='MODEL_VISIBLE_UI_CANDIDATES: {"candidates":[{"text":"다운로드","click_point":[1779,698],"reason_tags":["download_like","button_shape"]}]}',
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": "raise SystemExit('model-ui download recovery did not produce a stable downloaded artifact')",
+            },
+            "timed_out": True,
+        },
+    )
+    assert _should_use_model_ui_download_recovery(request) is True
+
+
+def test_model_ui_candidates_run_on_first_installer_step(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        screenshot_base64="iVBORw0KGgo=",
+        step_index=0,
+    )
+    assert _should_use_model_ui_candidates(request) is True
+
+
+def test_missing_image_template_generation_detects_guessed_locate_on_screen() -> None:
+    assert _looks_like_missing_image_template_generation("import pyautogui\npyautogui.locateOnScreen('download_button.png')") is True
+    assert _looks_like_missing_image_template_generation("import pyautogui\npyautogui.locateOnScreen('mobaxterm_home_edition.exe')") is True
+    assert _looks_like_missing_image_template_generation("import pyautogui\npyautogui.click(100, 200)") is False
+
+
+def test_gui_first_installer_wait_without_ui_action_detected() -> None:
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+    )
+    code = """import subprocess
+proc = subprocess.Popen(["C:/Users/me/Downloads/setup.exe"])
+while proc.poll() is None:
+    pass
+"""
+    assert _looks_like_gui_first_installer_wait_without_ui_action(request, code) is True
+
+
+def test_gui_first_installer_wait_allowed_with_ui_action() -> None:
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+    )
+    code = """import subprocess, pyautogui
+proc = subprocess.Popen(["C:/Users/me/Downloads/setup.exe"])
+pyautogui.press("enter")
+while proc.poll() is None:
+    break
+    """
+    assert _looks_like_gui_first_installer_wait_without_ui_action(request, code) is False
+
+
+def test_gui_first_download_network_bypass_ignores_launch_chunk() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Use executable Python on the Windows machine to locate the already-installed app executable, "
+            "launch the app once, write `~/Downloads/launch-success.json`, and do not redownload or reinstall the app."
+        ),
+        execution_style="gui_first",
+    )
+    code = "import json\nfrom pathlib import Path\nPath('~/Downloads/launch-success.json').expanduser().write_text(json.dumps({}))"
+    assert _looks_like_gui_first_download_chunk_network_bypass(request, code) is False
+
+
+def test_invalid_retry_history_discards_silent_installer_prefix() -> None:
+    history = _history_for_invalid_python_retry_with_prompt(
+        [],
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        step_index=0,
+        previous_code='subprocess.Popen(["setup.exe", "/VERYSILENT"])',
+        gui_first_silent_install_shortcut=True,
+    )
+    joined = "\n".join(history)
+    assert "previous_python_prefix=" not in joined
+    assert "discard the previous installer script shape entirely" in joined
+    assert "installer_dialog_control" in joined
+
+
+def test_invalid_retry_history_warns_about_bottom_strip_clicks() -> None:
+    history = _history_for_invalid_python_retry_with_prompt(
+        [],
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        step_index=1,
+        previous_code="import pyautogui\npyautogui.click(960, 1040)\n",
+        bottom_strip_click_generation=True,
+    )
+    joined = "\n".join(history)
+    assert "taskbar/dock strip" in joined
+    assert "pinned app icons" in joined
+
+
+def test_gui_first_bottom_strip_click_generation_detected(tmp_path) -> None:
+    screenshot = tmp_path / "screen.png"
+    screenshot.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x07\x80"
+        b"\x00\x00\x04\x38"
+        b"\x08\x02\x00\x00\x00"
+        b"\x00\x00\x00\x00"
+    )
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        screenshot_path=str(screenshot),
+        observation_text="Visible browser page with download results.",
+    )
+    assert _looks_like_gui_first_bottom_strip_click_generation(
+        request,
+        "import pyautogui\npyautogui.click(972, 1045)\n",
+    ) is True
+    assert _looks_like_gui_first_bottom_strip_click_generation(
+        request,
+        "import pyautogui\npyautogui.click(972, 540)\n",
+    ) is False
 
 
 def test_task_complete_marker_accepts_confirmation_script() -> None:
@@ -184,7 +1769,9 @@ def test_gui_first_download_retry_keeps_screenshot_for_generation() -> None:
     ) is False
 
 
-def test_prepare_python_code_for_execution_auto_clicks_download_control_for_gui_first_visible_ui() -> None:
+def test_prepare_python_code_for_execution_auto_clicks_download_control_for_gui_first_visible_ui(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", False)
     request = StepRequest(
         user_prompt="Use Python to open the official vendor page and download the Windows installer `.exe`.",
         execution_style="gui_first",
@@ -274,6 +1861,41 @@ for win in gw.getAllWindows():
     assert "gw = gw.getActiveWindow()" not in prepared
 
 
+def test_prepare_python_code_for_execution_replaces_risky_pygetwindow_installer_retry_with_visible_installer_recovery(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
+    request = StepRequest(
+        user_prompt=(
+            "Use Python to locate the FileZilla installer in Downloads, start it with subprocess.Popen, "
+            "and complete the Windows setup using default options unless the installer requires a straightforward confirmation. "
+            "After installation, launch FileZilla Client and confirm it starts successfully without errors.\n\n"
+            "Current chunk success target: FileZilla is installed and the client process starts successfully.\n\n"
+            "Preconditions expected before or during this chunk:\n"
+            "- A valid FileZilla installer .exe already exists in ~/Downloads.\n\n"
+            "Previously verified installer artifacts on the target machine. Prefer these exact installer paths before searching Downloads broadly again:\n"
+            "- `C:\\Users\\user\\Downloads\\FileZilla_3.70.4_win64_sponsored2-setup.exe`"
+        ),
+        execution_style="gui_first",
+        screenshot_base64="ZmFrZQ==",
+        observation_text="Visible browser or installer UI.",
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=filezilla%20official%20windows%20download", expected_title_tokens=["filezilla"])',
+            }
+        },
+    )
+    prepared = _prepare_python_code_for_execution(
+        request,
+        """import pygetwindow as gw
+gw.activateWindow()
+""",
+    )
+    assert "advance_visible_installer_flow(" in prepared
+    assert "gw.activateWindow()" not in prepared
+    assert "advance_visible_download_flow(" not in prepared
+
+
 def test_prepare_python_code_for_execution_replaces_single_coordinate_replan_click_with_visible_download_flow(monkeypatch) -> None:
     monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
     request = StepRequest(
@@ -318,7 +1940,9 @@ pyautogui.hotkey('ctrl', 's')
     assert "pyautogui.hotkey('ctrl', 's')" not in prepared
 
 
-def test_prepare_python_code_for_execution_opens_search_without_replacing_http_bypass_with_ocr_flow() -> None:
+def test_prepare_python_code_for_execution_opens_search_without_replacing_http_bypass_with_ocr_flow(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", False)
     request = StepRequest(
         user_prompt="카카오톡 pc버전 프로그램을 설치해줘",
         execution_style="gui_first",
@@ -337,7 +1961,9 @@ print(html[:100])
     assert "urllib.request.urlopen" not in prepared
 
 
-def test_prepare_python_code_for_execution_does_not_treat_file_write_as_gui_progress() -> None:
+def test_prepare_python_code_for_execution_does_not_treat_file_write_as_gui_progress(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", False)
     request = StepRequest(
         user_prompt="targetapp 설치 파일을 받아줘",
         execution_style="gui_first",
@@ -356,7 +1982,9 @@ print(dest)
     assert "urllib.request.urlopen" not in prepared
 
 
-def test_prepare_python_code_for_execution_uses_visible_download_flow_for_visible_search_results() -> None:
+def test_prepare_python_code_for_execution_uses_visible_download_flow_for_visible_search_results(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", False)
     request = StepRequest(
         user_prompt="Use Python to open the official vendor page and download the Windows installer `.exe`.",
         execution_style="gui_first",
@@ -386,7 +2014,8 @@ def test_ocr_observation_text_is_sanitized_when_framework_ocr_helpers_are_disabl
     assert _sanitize_observation_text_for_model("Visible installer wizard is open") == "Visible installer wizard is open"
 
 
-def test_ocr_observation_text_is_preserved_when_framework_ocr_helpers_are_enabled() -> None:
+def test_ocr_observation_text_is_preserved_when_framework_ocr_helpers_are_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
     assert _sanitize_observation_text_for_model("OCR visible text with download/install cues: 다운로드") == (
         "OCR visible text with download/install cues: 다운로드"
     )
@@ -439,7 +2068,9 @@ def test_synthesized_visible_installer_recovery_code_prefers_existing_visible_in
     assert 'print(f"already installed: {existing}")' not in code
 
 
-def test_framework_visible_installer_recovery_selected_for_gui_first_existing_installer_task() -> None:
+def test_framework_visible_installer_recovery_selected_for_gui_first_existing_installer_task(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", False)
     request = StepRequest(
         user_prompt=(
             "Use executable Python only. "
@@ -451,7 +2082,9 @@ def test_framework_visible_installer_recovery_selected_for_gui_first_existing_in
     assert _should_use_framework_visible_installer_recovery(request) is True
 
 
-def test_framework_visible_installer_recovery_selected_for_downloaded_msi_install_chunk() -> None:
+def test_framework_visible_installer_recovery_selected_for_downloaded_msi_install_chunk(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", False)
     request = StepRequest(
         user_prompt=(
             "Use Python to locate the downloaded MSI in `~/Downloads`, then install the app by "
@@ -465,7 +2098,9 @@ def test_framework_visible_installer_recovery_selected_for_downloaded_msi_instal
     assert _should_use_framework_visible_download_flow(request) is False
 
 
-def test_framework_visible_download_flow_selected_for_gui_first_download_only_chunk() -> None:
+def test_framework_visible_download_flow_selected_for_gui_first_download_only_chunk(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", False)
     request = StepRequest(
         user_prompt=(
             "Use Python to open the official vendor page and download only the Windows installer "
@@ -476,7 +2111,9 @@ def test_framework_visible_download_flow_selected_for_gui_first_download_only_ch
     assert _should_use_framework_visible_download_flow(request) is True
 
 
-def test_framework_visible_installer_recovery_selected_for_launch_downloaded_named_msi_chunk() -> None:
+def test_framework_visible_installer_recovery_selected_for_launch_downloaded_named_msi_chunk(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", False)
     request = StepRequest(
         user_prompt=(
             "Using Python automation, launch the downloaded DB Browser for SQLite MSI installer "
@@ -511,7 +2148,8 @@ def test_launch_chunk_task_detected() -> None:
     assert _looks_like_launch_app_chunk_task(prompt) is True
 
 
-def test_framework_visible_launch_recovery_selected_for_gui_first_launch_chunk() -> None:
+def test_framework_visible_launch_recovery_selected_for_gui_first_launch_chunk(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", False)
     request = StepRequest(
         user_prompt=(
             "Prefer reading `~/Downloads/computer-use-agent/targetapp/install-success.json` first, "
@@ -521,6 +2159,74 @@ def test_framework_visible_launch_recovery_selected_for_gui_first_launch_chunk()
         execution_style="gui_first",
     )
     assert _should_use_framework_visible_launch_recovery(request) is True
+
+
+def test_framework_visible_launch_recovery_disabled_for_model_ui_launch_chunk(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt=(
+            "Prefer reading `~/Downloads/computer-use-agent/targetapp/install-success.json` first, "
+            "launch the installed app once, and write "
+            "`~/Downloads/computer-use-agent/targetapp/launch-success.json` only after launch succeeded."
+        ),
+        execution_style="gui_first",
+    )
+    assert _should_use_framework_visible_launch_recovery(request) is False
+
+
+def test_model_ui_launch_recovery_selected_for_model_ui_launch_chunk(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt=(
+            "Use executable Python on the Windows machine to locate the already-installed app executable "
+            "for the target app from this task: targetapp 프로그램을 설치해줘, prefer reading "
+            "`~/Downloads/install-success.json`, launch the app once, and write "
+            "`~/Downloads/launch-success.json` only after launch succeeded."
+        ),
+        execution_style="gui_first",
+    )
+    assert _should_use_model_ui_launch_recovery(request) is True
+    code = _synthesized_model_ui_launch_recovery_code(request)
+    assert "INSTALL_MARKER" in code
+    assert "LAUNCH_MARKER" in code
+    assert "CONTEXT_MARKER" in code
+    assert "def _process_exists(name):" in code
+    assert "launched process running=" in code
+    assert "MARKER_HAYSTACK" in code
+    assert "TERMS.append(term)" in code
+    assert "Microsoft.Data" not in code
+
+
+def test_model_ui_launch_recovery_selected_for_verify_and_launch_prompt(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt=(
+            "Use Python to verify that Memoit is installed by checking for the installed executable or a running Memoit process, "
+            "then launch Memoit if it is not already running. Confirm the app window opens successfully."
+        ),
+        execution_style="gui_first",
+    )
+    assert _looks_like_launch_app_chunk_task(request.user_prompt) is True
+    assert _should_use_model_ui_launch_recovery(request) is True
+
+
+def test_install_prompt_with_verify_clause_is_not_treated_as_launch_chunk() -> None:
+    prompt = (
+        "Locate the most recent official FileZilla Windows installer from the Downloads folder, "
+        "launch it with Python using subprocess.Popen(), and complete the installation with default options. "
+        "If UAC appears, allow it. When installation finishes, verify that FileZilla is installed and launch the main app so its window opens."
+    )
+    assert _looks_like_existing_installer_launch_task(prompt) is True
+    assert _looks_like_launch_app_chunk_task(prompt) is False
+
+
+def test_framework_visible_launch_recovery_disabled_for_model_ui_install_chunk(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+    )
+    assert _should_use_framework_visible_launch_recovery(request) is False
 
 
 def test_framework_visible_launch_recovery_not_selected_during_installer_replan() -> None:
@@ -564,6 +2270,10 @@ def test_visible_flow_extra_targets_prefer_explicit_installer_filename() -> None
     assert _visible_flow_extra_targets(request, limit=3) == ["kakaotalk"]
 
 
+def test_installer_filename_keywords_drop_noise_tokens() -> None:
+    assert _installer_filename_keywords("FileZilla_3.70.4_win64_sponsored2-setup.exe", limit=6) == ["filezilla"]
+
+
 def test_synthesized_visible_launch_recovery_ignores_invalid_install_marker_and_writes_launch_marker() -> None:
     request = StepRequest(
         user_prompt=(
@@ -604,18 +2314,32 @@ def test_synthesized_visible_launch_recovery_defaults_to_downloads_marker_and_pr
     assert "if FILENAME_TARGET_KEYWORDS and not any(keyword in key for keyword in FILENAME_TARGET_KEYWORDS):" in code
 
 
-def test_fallback_browser_search_url_uses_korean_download_terms_for_hangul_tasks() -> None:
+def test_fallback_browser_search_url_keeps_hangul_queries_compact_for_install_tasks() -> None:
     url = _fallback_browser_search_url("카카오톡 pc버전 프로그램을 설치해줘")
     assert url is not None
-    assert "%EA%B3%B5%EC%8B%9D" in url
-    assert "%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C" in url
+    assert "%EA%B3%B5%EC%8B%9D" not in url
+    assert "-blog" not in url
+    assert "-tistory" not in url
+    decoded = urllib.parse.unquote(url)
+    assert "다운로드" not in decoded
+    assert "pc" in decoded
+
+
+def test_fallback_browser_search_url_adds_only_minimal_windows_hint_for_ascii_tasks() -> None:
+    url = _fallback_browser_search_url("filezilla 설치해줘")
+    assert url is not None
+    decoded = urllib.parse.unquote(url)
+    assert "filezilla" in decoded
+    assert "windows" in decoded
+    assert "download" not in decoded
+    assert "official" not in decoded
 
 
 def test_fallback_browser_search_url_adds_vendor_domain_filters_from_prompt_urls() -> None:
     url = _fallback_browser_search_url("Use the official page https://pc.example.com/download and continue.")
     assert url is not None
     assert "site%3Aexample.com" in url
-    assert "site%3Aexamplecorp.com" in url
+    assert "site%3Aexamplecorp.com" not in url
 
 
 def test_replan_fallback_browser_search_url_does_not_use_workflow_noise() -> None:
@@ -649,6 +2373,29 @@ def test_replan_fallback_browser_search_url_does_not_use_workflow_noise() -> Non
     assert "logic" not in url
 
 
+def test_replan_fallback_browser_search_url_prioritizes_explicit_retry_target_keywords() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "The current page did not produce usable download candidates.\n"
+            "If you must abandon the current page and run a new browser search, keep these exact task/product keywords in the query: filezilla.\n"
+            "Do not replace those task/product keywords with generic retry wording, verifier artifact names, or unrelated product names.\n"
+            "Verifier evidence mentioned C:\\Users\\user\\Downloads\\DB.Browser.for.SQLite-win64.exe and other unrelated noise."
+        ),
+        execution_style="gui_first",
+        replan_requested=True,
+    )
+
+    url = _fallback_browser_search_url_for_request(
+        request,
+        extra_targets=["browser", "sqlite"],
+    )
+    assert url is not None
+    assert "filezilla" in url
+    assert "sqlite" not in url
+    assert "browser" not in url
+
+
 def test_select_prompt_browser_url_prefers_korean_locale_for_hangul_task() -> None:
     prompt = (
         "카카오톡 pc버전 프로그램을 설치해줘. "
@@ -657,6 +2404,82 @@ def test_select_prompt_browser_url_prefers_korean_locale_for_hangul_task() -> No
         "https://www.example.com/page/service/app?lang=ko"
     )
     assert _select_prompt_browser_url(prompt) == "https://www.example.com/page/service/app?lang=ko"
+
+
+def test_select_prompt_browser_url_accepts_bare_domain_with_korean_particle() -> None:
+    prompt = "filezilla.kr에서 filezilla 설치해줘"
+    assert _extract_prompt_urls(prompt) == ["https://filezilla.kr"]
+    assert _select_prompt_browser_url(prompt) == "https://filezilla.kr"
+    request = StepRequest(user_prompt=prompt, execution_style="gui_first")
+    assert _visible_flow_extra_targets(request, limit=8) == ["filezilla"]
+
+
+def test_select_prompt_browser_url_accepts_http_url_with_korean_particle() -> None:
+    prompt = "https://www.filezilla.kr/theme/filezilla/download/FileZilla_3.67.0_win64-setup.exe에서 filezilla 설치해줘"
+    expected = "https://www.filezilla.kr/theme/filezilla/download/FileZilla_3.67.0_win64-setup.exe"
+    assert _extract_prompt_urls(prompt) == [expected]
+    assert _select_prompt_browser_url(prompt) == expected
+
+
+def test_model_ui_candidate_scores_hangul_download_as_target_on_matching_prompt_domain() -> None:
+    request = StepRequest(
+        user_prompt="filezilla.kr에서 filezilla 설치해줘",
+        execution_style="gui_first",
+    )
+    score, tags = _score_model_ui_candidate(
+        "파일질라 다운로드",
+        "button",
+        (1120, 980, 1780, 1060),
+        request=request,
+        screen_size=(2560, 1440),
+    )
+    assert "target_page_download_like" in tags
+    assert "target_like" in tags
+    assert score >= 85
+
+
+def test_model_ui_candidate_penalizes_server_variant_when_task_does_not_ask_for_server() -> None:
+    request = StepRequest(
+        user_prompt="filezilla.kr에서 filezilla 설치해줘",
+        execution_style="gui_first",
+    )
+    client_score, client_tags = _score_model_ui_candidate(
+        "Download FileZilla Client",
+        "button",
+        (1120, 980, 1780, 1060),
+        request=request,
+        screen_size=(2560, 1440),
+    )
+    server_score, server_tags = _score_model_ui_candidate(
+        "Download FileZilla Server",
+        "button",
+        (1120, 980, 1780, 1060),
+        request=request,
+        screen_size=(2560, 1440),
+    )
+    assert "server_variant_penalty" in server_tags
+    assert "server_variant_penalty" not in client_tags
+    assert client_score > server_score
+
+
+def test_model_ui_browser_prelude_uses_bare_domain_prompt_url(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="filezilla.kr에서 filezilla 설치해줘",
+        execution_style="gui_first",
+    )
+    code = _synthesized_model_ui_browser_prelude_code(request)
+    assert 'target_url = "https://filezilla.kr"' in code
+    assert "google.com/search" not in code
+
+
+def test_extract_prompt_urls_does_not_treat_installer_filename_as_bare_domain() -> None:
+    assert _extract_prompt_urls("Downloads/FileZilla_3.69.3_win64-setup.exe 파일을 실행해줘") == []
+
+
+def test_extract_prompt_urls_does_not_treat_python_dotted_names_as_bare_domains() -> None:
+    code = 'import urllib.request\nurllib.request.urlopen("https://cdn.vendor.example/releases/app.zip")'
+    assert _extract_prompt_urls(code) == ["https://cdn.vendor.example/releases/app.zip"]
 
 
 def test_select_prompt_browser_url_canonicalizes_variant_download_page_to_root_download_page() -> None:
@@ -776,6 +2599,27 @@ def test_existing_installer_launch_task_does_not_match_download_chunk_prompt() -
         "Use executable Python on the Windows machine to obtain the official Windows installer `.exe` "
         "and save it to Downloads. If an installer already exists in Downloads you may reuse it instead "
         "of downloading again, but this chunk is still the download step."
+    )
+    assert _looks_like_existing_installer_launch_task(prompt) is False
+
+
+def test_existing_installer_launch_task_does_not_match_download_chunk_with_downloaded_filename_language() -> None:
+    prompt = (
+        "Return executable Python only for this chunk. Use executable Python on the Windows machine to obtain "
+        "the official Windows installer `.exe` or `.msi` for the target app and download it into "
+        "`%USERPROFILE%\\\\Downloads\\\\`. Do not require the final downloaded filename to contain the app name. "
+        "Current chunk success target: A target-app installer `.exe` or `.msi` exists in "
+        "`%USERPROFILE%\\\\Downloads\\\\` and is non-empty."
+    )
+    assert _looks_like_existing_installer_launch_task(prompt) is False
+
+
+def test_existing_installer_launch_task_does_not_match_download_only_replan_prompt() -> None:
+    prompt = (
+        "REPLAN OVERRIDE FOR THIS STEP:\n"
+        "Continue from the visible browser/download UI.\n"
+        "This is a download-only step. Do not launch, silently install, or run the installer in this step.\n"
+        "End this step only when the installer file exists in Downloads with a plausible non-trivial size."
     )
     assert _looks_like_existing_installer_launch_task(prompt) is False
 
@@ -956,25 +2800,50 @@ def test_synthesized_visible_download_completion_uses_prompt_scoped_global_conte
 
 def test_action_context_resets_when_prompt_key_changes(tmp_path) -> None:
     context_path = tmp_path / "computer-use-agent-context.json"
+    old_installer = tmp_path / "old.exe"
+    new_installer = tmp_path / "new.exe"
+    old_installer.write_bytes(b"old")
+    new_installer.write_bytes(b"new")
     code = _expand_runtime_helpers(
         """
-payload1 = write_action_context(path, prompt_key="prompt-a", prompt_excerpt="first", installer_path="old.exe")
+payload1 = write_action_context(path, prompt_key="prompt-a", prompt_excerpt="first", installer_path=str(old_installer))
 payload2 = read_action_context(path, prompt_key="prompt-b")
 payload_started = ensure_action_context(path, prompt_key="prompt-b", prompt_excerpt="second")
-payload3 = write_action_context(path, prompt_key="prompt-b", prompt_excerpt="second", installer_path="new.exe")
+payload3 = write_action_context(path, prompt_key="prompt-b", prompt_excerpt="second", installer_path=str(new_installer))
 payload4 = read_action_context(path, prompt_key="prompt-b")
 """
     )
-    namespace = {"path": context_path}
+    namespace = {"path": context_path, "old_installer": old_installer, "new_installer": new_installer}
     exec(code, namespace)
-    assert namespace["payload1"]["installer_path"] == "old.exe"
+    assert namespace["payload1"]["installer_path"] == str(old_installer)
     assert namespace["payload2"]["_prompt_mismatch"] is True
     assert "installer_path" not in namespace["payload2"]
     assert namespace["payload_started"]["phase"] == "context_started"
     assert "installer_path" not in namespace["payload_started"]
-    assert namespace["payload3"]["installer_path"] == "new.exe"
+    assert namespace["payload3"]["installer_path"] == str(new_installer)
     assert namespace["payload4"]["prompt_key"] == "prompt-b"
-    assert namespace["payload4"]["installer_path"] == "new.exe"
+    assert namespace["payload4"]["installer_path"] == str(new_installer)
+
+
+def test_action_context_keeps_started_state_but_prunes_missing_installer(tmp_path) -> None:
+    context_path = tmp_path / "computer-use-agent-context.json"
+    missing_installer = tmp_path / "missing.exe"
+    code = _expand_runtime_helpers(
+        """
+started = ensure_action_context(path, prompt_key="prompt-a", prompt_excerpt="first")
+with_installer = write_action_context(path, prompt_key="prompt-a", prompt_excerpt="first", installer_path=str(missing_installer), source_url="https://example.test/file.exe")
+after_prune = read_action_context(path, prompt_key="prompt-a")
+"""
+    )
+    namespace = {"path": context_path, "missing_installer": missing_installer}
+    exec(code, namespace)
+
+    assert namespace["started"]["phase"] == "context_started"
+    assert namespace["started"]["_exists"] is True
+    assert "installer_path" not in namespace["with_installer"]
+    assert "source_url" not in namespace["with_installer"]
+    assert namespace["after_prune"]["_exists"] is True
+    assert "installer_path" not in namespace["after_prune"]
 
 
 def test_existing_installer_launch_task_detected_for_generic_downloaded_installer_prompt() -> None:
@@ -987,6 +2856,7 @@ def test_existing_installer_launch_task_detected_for_generic_downloaded_installe
 
 def test_visible_installer_recovery_selected_for_generic_installer_prompt_when_ocr_helpers_enabled(monkeypatch) -> None:
     monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", False)
     request = StepRequest(
         user_prompt=(
             "Locate the downloaded installer `.exe` in Downloads, verify it is the Windows installer, "
@@ -1168,13 +3038,14 @@ def test_expand_runtime_helpers_includes_responsive_header_menu_flow() -> None:
     assert "context_match_scope=download_context_scope" in expanded
     assert "def click_download_related_fallback(" in expanded
     assert "download_related_window_fallback_skipped" in expanded
-    assert "clear_download_page_or_target_context_required" in expanded
+    assert "isolated_recovery_url_required" in expanded
     assert "max_same_page_fallback_candidates = 16" in expanded
     assert "for candidate_index in range(1, max_same_page_fallback_candidates + 1)" in expanded
     assert "download_action_text" in expanded
     assert "candidate_index" in expanded
     assert "skip_click_points=clicked_points" in expanded
     assert "download_related_window_fallback_page_open" in expanded
+    assert "keybd_event(vk_l" not in expanded
     related_fallback_section = expanded.split("def click_download_related_fallback(", 1)[1].split("def click_search_result_like_target(", 1)[0]
     assert "targets.extend(str(item).strip().lower() for item in extra_targets" in related_fallback_section
     assert "context_targets=context" in related_fallback_section
@@ -1375,6 +3246,32 @@ def test_existing_installer_launch_task_detected() -> None:
     assert _looks_like_existing_installer_launch_task(prompt) is True
 
 
+def test_existing_installer_launch_task_detected_when_chunk_says_do_not_skip_ahead() -> None:
+    prompt = (
+        "Use executable Python only. Do not download anything in this chunk. "
+        "First inspect the current screenshot and desktop state for an installer wizard, UAC prompt, license dialog, "
+        "destination dialog, or completion dialog, and drive that visible UI forward if present. "
+        "If no installer UI is visible yet, find the existing installer `.exe` or `.msi` in `%USERPROFILE%\\\\Downloads\\\\`, "
+        "launch it once, and then continue from the resulting installer UI. "
+        "Do only this chunk. Do not skip ahead to later chunks."
+    )
+    assert _looks_like_existing_installer_launch_task(prompt) is True
+
+
+def test_existing_installer_launch_task_detected_for_verified_installer_artifact_prompt() -> None:
+    prompt = (
+        "Use Python to locate the FileZilla installer in Downloads, start it with subprocess.Popen, "
+        "and complete the Windows setup using default options unless the installer requires a straightforward confirmation. "
+        "After installation, launch FileZilla Client and confirm it starts successfully without errors.\n\n"
+        "Current chunk success target: FileZilla is installed and the client process starts successfully.\n\n"
+        "Preconditions expected before or during this chunk:\n"
+        "- A valid FileZilla installer .exe already exists in ~/Downloads.\n\n"
+        "Previously verified installer artifacts on the target machine. Prefer these exact installer paths before searching Downloads broadly again:\n"
+        "- `C:\\Users\\user\\Downloads\\FileZilla_3.70.4_win64_sponsored2-setup.exe`"
+    )
+    assert _looks_like_existing_installer_launch_task(prompt) is True
+
+
 def test_installer_timeout_detected() -> None:
     execution = {
         "timed_out": True,
@@ -1499,6 +3396,96 @@ def test_prompt_keyword_candidates_include_url_host_tokens_for_korean_task() -> 
     assert "kakao" in keywords
 
 
+def test_prompt_keyword_candidates_preserve_product_phrase_tokens() -> None:
+    keywords = _prompt_keyword_candidates(
+        'source_task": "DB Browser for SQLite 프로그램을 설치해줘"',
+        limit=4,
+    )
+
+    assert keywords[:3] == ["db", "browser", "sqlite"]
+    assert "for" not in keywords
+
+
+def test_visible_flow_extra_targets_preserve_product_phrase_browser_token() -> None:
+    request = StepRequest(
+        user_prompt="Use executable Python for the target app from this task: DB Browser for SQLite 설치해줘.",
+        execution_style="gui_first",
+    )
+
+    assert _visible_flow_extra_targets(request, limit=4)[:3] == ["db", "browser", "sqlite"]
+    assert "db%20browser%20sqlite" in _fallback_browser_search_url_for_request(
+        request,
+        extra_targets=_visible_flow_extra_targets(request, limit=4),
+    )
+    assert "https://sqlitebrowser.org/dl/" in _fallback_official_domain_urls(
+        _visible_flow_extra_targets(request, limit=4),
+        limit=12,
+    )
+
+
+def test_fallback_browser_search_url_adds_kr_query_hint_for_korean_task() -> None:
+    url = _fallback_browser_search_url("filezilla 설치해줘")
+    decoded = urllib.parse.unquote(url or "")
+
+    assert "filezilla" in decoded
+    assert "kr" in decoded
+    assert "site:filezilla.kr" not in decoded
+
+
+def test_fallback_browser_search_url_for_request_adds_kr_query_hint_without_exact_domain_guess() -> None:
+    request = StepRequest(
+        user_prompt="filezilla 설치해줘",
+        execution_style="gui_first",
+    )
+
+    url = _fallback_browser_search_url_for_request(request, extra_targets=["filezilla"])
+    decoded = urllib.parse.unquote(url or "")
+
+    assert "filezilla" in decoded
+    assert "kr" in decoded
+    assert "site:filezilla.kr" not in decoded
+
+
+def test_fallback_alternate_search_urls_include_localized_query_not_guessed_domain() -> None:
+    urls = service_module._fallback_alternate_search_urls_from_parts(["filezilla"])
+    decoded = [urllib.parse.unquote(url) for url in urls]
+
+    assert decoded[0] == "https://www.google.com/search?q=filezilla kr"
+    assert all("filezilla.kr" not in url for url in urls)
+
+
+def test_fallback_official_domain_urls_include_generic_project_domain_variant() -> None:
+    urls = _fallback_official_domain_urls(["filezilla"])
+
+    assert "https://filezilla.org/download/" in urls
+    assert "https://filezilla-project.org/download/" in urls
+
+
+def test_fallback_search_url_does_not_invent_corp_sibling_domain_from_prompt_url() -> None:
+    url = _fallback_browser_search_url_from_parts(
+        ["filezilla"],
+        ["https://filezilla.org/download.php?type=client"],
+    )
+    decoded = urllib.parse.unquote(url or "")
+
+    assert "filezilla" in decoded
+    assert "filezillacorp" not in decoded
+
+
+def test_visible_flow_extra_targets_preserve_replan_comma_target_terms() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Original task target terms to preserve: db, browser, sqlite.\n"
+            "End this step only when the installer file exists in Downloads."
+        ),
+        execution_style="gui_first",
+        replan_requested=True,
+    )
+
+    assert _visible_flow_extra_targets(request, limit=4)[:3] == ["db", "browser", "sqlite"]
+
+
 def test_prompt_keyword_candidates_drop_replan_words() -> None:
     text = (
         "REPLAN OVERRIDE FOR THIS STEP: Previous attempt failed. "
@@ -1509,6 +3496,23 @@ def test_prompt_keyword_candidates_drop_replan_words() -> None:
     assert "override" not in keywords
     assert "previous" not in keywords
     assert "attempt" not in keywords
+
+
+def test_visible_flow_extra_targets_prefers_replan_preserved_target_terms() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Return executable Python only.\n"
+            "Continue from the visible browser/download UI before trying any new network fetch.\n"
+            "Original task target terms to preserve: 카카오톡.\n"
+            "This is a download-only step. Do not launch, silently install, or run the installer in this step.\n"
+            "End this step only when the installer file exists in Downloads with a plausible non-trivial size."
+        ),
+        execution_style="gui_first",
+        replan_requested=True,
+    )
+
+    assert _visible_flow_extra_targets(request, limit=8) == ["카카오톡"]
 
 
 def test_visible_flow_extra_targets_use_observation_text_keywords_when_replan_prompt_is_generic() -> None:
@@ -1568,6 +3572,21 @@ def test_visible_flow_extra_targets_use_last_execution_prompt_url_on_retry() -> 
     assert "테스트만" not in keywords
 
 
+def test_visible_flow_extra_targets_use_search_query_from_retry_url() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Return executable Python only.\n"
+            "The previous attempt already opened the relevant browser page.\n"
+            "Current page: https://www.google.com/search?q=%EB%A9%94%EB%AA%A8%EC%9E%87%20%EA%B3%B5%EC%8B%9D%20%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C%20pc%20windows\n"
+        ),
+        execution_style="gui_first",
+    )
+    keywords = _visible_flow_extra_targets(request, limit=4)
+    assert "메모잇" in keywords
+    assert "google" not in keywords
+
+
 def test_visible_flow_extra_targets_keep_installer_prefix_and_task_keywords() -> None:
     request = StepRequest(
         user_prompt=(
@@ -1582,6 +3601,164 @@ def test_visible_flow_extra_targets_keep_installer_prefix_and_task_keywords() ->
     assert "메모잇" in keywords
 
 
+def test_visible_flow_targets_prefer_product_text_over_official_url_host() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Use Python automation on Windows to open the official MobaXterm Home Edition download page at "
+            "https://mobaxterm.mobatek.net/download-home-edition.html, then download the official installer package."
+        ),
+        execution_style="gui_first",
+    )
+    assert _visible_flow_extra_targets(request, limit=4)[0] == "mobaxterm"
+
+
+def test_visible_flow_extra_targets_filters_download_flow_prompt_noise() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "On the Windows machine, use Python to open the official FileZilla download flow starting at "
+            "https://filezilla.net/. If you confirm or obtain a valid installer, write "
+            "`~/Downloads/computer-use-agent-context.json` with `installer_path`, `source_url`, and `target_keywords`."
+        ),
+        execution_style="gui_first",
+    )
+    keywords = _visible_flow_extra_targets(request, limit=6)
+    assert "filezilla" in keywords
+    assert "flow" not in keywords
+    assert "starting" not in keywords
+    assert "installer_path" not in keywords
+    assert "source_url" not in keywords
+    assert "target_keywords" not in keywords
+
+
+def test_visible_flow_extra_targets_filters_model_ui_prompt_noise() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n"
+            "MODEL_VISIBLE_UI_CANDIDATES below come from the current screenshot.\n"
+            "Open the FileZilla Project download page at https://filezilla-project.org/download.php?type=client.\n"
+            "If you confirm a valid installer, write `target_keywords`."
+        ),
+        execution_style="gui_first",
+    )
+
+    keywords = _visible_flow_extra_targets(request, limit=6)
+
+    assert keywords == ["filezilla"]
+
+
+def test_runtime_helper_download_official_installer_allows_keyword_matched_official_cross_domain() -> None:
+    helper = service_module._RUNTIME_HELPERS["download_official_installer_from_page"]
+    assert "def _host_matches_keyword_domain(host):" in helper
+    assert "if registrable != allowed_registrable and not _host_matches_keyword_domain(parsed.netloc):" in helper
+    assert "and not _host_matches_keyword_domain(urlparse(current_page).netloc)" in helper
+
+
+def test_visible_flow_extra_targets_keep_previous_target_terms_over_replan_stdout_noise() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Return executable Python only.\n"
+            "Previous stdout summary: install marker written: C:\\Program Files\\Git\\usr\\bin\\stdbuf.exe\n"
+            "Previous stderr summary: no installer package available for installer recovery\n"
+            "Use the existing installer already present in Downloads; do not add download logic."
+        ),
+        execution_style="gui_first",
+        replan_requested=True,
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'TARGET_TERMS = ["db", "browser", "sqlite"]\nprint("run installer")',
+            },
+            "stdout_tail": "install marker written: C:\\Program Files\\Git\\usr\\bin\\stdbuf.exe",
+        },
+    )
+    keywords = _visible_flow_extra_targets(request, limit=4)
+    assert keywords[:3] == ["db", "browser", "sqlite"]
+    assert "stdbuf" not in keywords
+
+
+def test_visible_flow_extra_targets_prefer_task_keywords_over_noisy_installer_filename_and_prior_terms() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Using the downloaded FileZilla Windows 64-bit `.exe` installer in Downloads, launch the installer with Python "
+            "and complete setup using default options.\n"
+            "Previously verified installer artifacts on the target machine:\n"
+            "- `C:\\Users\\user\\Downloads\\FileZilla_3.70.4_win64_sponsored2-setup.exe`"
+        ),
+        execution_style="gui_first",
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'TARGET_TERMS = ["filezilla", "sponsored2", "sponsored", "bit"]\nprint("run installer")',
+            }
+        },
+    )
+    keywords = _visible_flow_extra_targets(request, limit=6)
+    assert keywords[0] == "filezilla"
+    assert "sponsored2" not in keywords
+    assert "sponsored" not in keywords
+    assert "bit" not in keywords
+
+
+def test_visible_flow_extra_targets_ignore_replan_failure_noise_words() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Original task target terms to preserve: filezilla.\n"
+            "Previous stderr summary: clicked all grounded points for all visible candidates without a stable download"
+        ),
+        execution_style="gui_first",
+        replan_requested=True,
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'TARGET_TERMS = ["filezilla"]\nprint("retry download")',
+            }
+        },
+    )
+    assert _visible_flow_extra_targets(request, limit=8) == ["filezilla"]
+
+
+def test_model_ui_installer_recovery_uses_strong_target_matching_for_short_tokens() -> None:
+    request = StepRequest(
+        user_prompt="Use Python to run the downloaded MSI installer `~/Downloads/DB.Browser.for.SQLite-v3.13.1-win64.msi`.",
+        execution_style="gui_first",
+    )
+    code = _synthesized_model_ui_installer_recovery_code(request)
+    assert 'strong_terms = [term for term in raw_terms' in code
+    assert "def _contains_target(text, term):" in code
+    assert "any(term in name or term in full for term in terms)" not in code
+
+
+def test_model_ui_installer_recovery_preserves_context_installer_path() -> None:
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish installation, and launch the installed app.",
+        execution_style="gui_first",
+    )
+    code = _synthesized_model_ui_installer_recovery_code(request)
+    assert "preserved_installer = installer_path or previous_context.get('installer_path')" in code
+    assert "payload['installer_path'] = str(preserved_installer)" in code
+    assert "context_payload['installer_path'] = str(preserved_installer)" in code
+
+
+def test_recent_download_helper_rejects_portable_when_not_requested() -> None:
+    expanded = _expand_runtime_helpers("wait_for_recent_download_artifact(extra_targets=['mobaxterm'])")
+    assert '"portable" in lowered and not any("portable" in token for token in normalized_targets)' in expanded
+
+
+def test_recent_download_helper_can_require_target_match_for_reuse() -> None:
+    expanded = _expand_runtime_helpers("wait_for_recent_download_artifact(extra_targets=['filezilla'], require_target_match=True)")
+    assert "require_target_match=False" in expanded
+    assert "if require_target_match and normalized_targets and score[0] <= 0:" in expanded
+
+
+def test_download_page_helper_unwraps_search_result_links_and_prioritizes_distinct_tlds() -> None:
+    expanded = _expand_runtime_helpers("download_official_installer_from_page('https://www.google.com/search?q=filezilla%20kr', extra_targets=['filezilla'])")
+    assert "from urllib.parse import parse_qs, urljoin, urlparse, unquote" in expanded
+    assert "def _normalize_link(base_url, raw):" in expanded
+    assert 'for key in ("q", "url", "u"):' in expanded
+    assert "def _prioritize_page_links(page_candidates, *, base_is_search_engine, limit=8):" in expanded
+    assert 'if tld == "kr" and any(root in compact_url for root in keyword_roots):' in expanded
+    assert "return _prioritize_page_links(" in expanded
+
+
 def test_prompt_keyword_candidates_ignore_percent_encoded_fragments() -> None:
     text = (
         "Open https://pc.example.com/talk/notices/en%3Fagent%3Dwin32 and continue the official flow."
@@ -1589,6 +3766,204 @@ def test_prompt_keyword_candidates_ignore_percent_encoded_fragments() -> None:
     keywords = _prompt_keyword_candidates(text)
     assert "3fagent" not in keywords
     assert "3dwin32" not in keywords
+
+
+def test_prompt_keyword_candidates_prefer_search_query_terms_over_search_host() -> None:
+    text = "Open https://www.google.com/search?q=%EB%A9%94%EB%AA%A8%EC%9E%87%20%EA%B3%B5%EC%8B%9D%20%EB%8B%A4%EC%9A%B4%EB%A1%9C%EB%93%9C%20pc%20windows and continue."
+    keywords = _prompt_keyword_candidates(text)
+    assert "메모잇" in keywords
+    assert "google" not in keywords
+
+
+def test_prompt_keyword_candidates_filter_replan_and_korean_boilerplate_noise() -> None:
+    assert _prompt_keyword_candidates("not execution path download-like official windows download") == []
+    assert (
+        _prompt_keyword_candidates(
+            "이 chunk는 실행 가능한 Python 코드만으로 수행하세요. 현재 스크린샷에 브라우저 검색 결과가 보입니다."
+        )
+        == []
+    )
+    assert _fallback_browser_search_url("not execution path download-like official windows download") is None
+    keywords = _prompt_keyword_candidates("filezilla 설치파일을 다운로드해줘")
+    assert "filezilla" in keywords
+    assert "다운로드해줘" not in keywords
+
+
+def test_replan_search_url_validation_rejects_generic_or_long_queries() -> None:
+    assert (
+        _search_url_validation_error(
+            "https://www.bing.com/search?q=not+execution+path+download-like+official+windows+download",
+            ["filezilla"],
+        )
+        == "missing_target_keyword"
+    )
+    assert (
+        _search_url_validation_error(
+            "https://www.google.com/search?q=filezilla+official+windows+download+installer+client+setup+latest",
+            ["filezilla"],
+        )
+        == "query_too_long"
+    )
+    assert _search_url_validation_error("https://www.google.com/search?q=filezilla+windows", ["filezilla"]) is None
+
+
+def test_replan_search_url_validation_rejects_exact_failed_query_sentence() -> None:
+    assert (
+        _search_url_validation_error(
+            "https://www.google.com/search?q=filezilla+windows",
+            ["filezilla"],
+            excluded_queries=["filezilla windows"],
+        )
+        == "repeated_query"
+    )
+
+
+def test_replan_search_url_prefers_alternate_query_after_download_candidate_failure(tmp_path) -> None:
+    class RuntimeShouldNotBeCalled:
+        def generate_text(self, **_: object) -> object:
+            raise AssertionError("deterministic alternate replan search should be selected before model retry")
+
+    request = StepRequest(
+        user_prompt="filezilla 설치해줘",
+        execution_style="gui_first",
+        replan_requested=True,
+        replan_reasons=["no_visible_download_candidates"],
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=filezilla%20windows")',
+            },
+            "stderr_tail": "download related fallback found no clickable candidates",
+        },
+    )
+
+    selected = service_module._generate_validated_replan_search_url(
+        runtime=RuntimeShouldNotBeCalled(),
+        request=request,
+        target_terms=["filezilla"],
+        root=tmp_path,
+        step_id="step-001",
+    )
+
+    assert selected == "https://www.google.com/search?q=filezilla%20kr"
+    payload = json.loads((tmp_path / "responses" / "step-001.replan-search-url.json").read_text(encoding="utf-8"))
+    assert payload["attempts"][0]["attempt"] == "preferred_alternate_search"
+    assert payload["selected"] == "https://www.google.com/search?q=filezilla%20kr"
+
+
+def test_replan_search_url_generation_limits_model_attempts(tmp_path) -> None:
+    class AlwaysInvalidRuntime:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_text(self, **_: object) -> object:
+            self.calls += 1
+            return type(
+                "Result",
+                (),
+                {
+                    "text": '{"search_url":"https://www.google.com/search?q=not+execution+path+download-like+official+windows+download"}',
+                    "model_id": "fake-model",
+                },
+            )()
+
+    runtime = AlwaysInvalidRuntime()
+    request = StepRequest(
+        user_prompt="filezilla 설치해줘",
+        execution_style="gui_first",
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+    )
+
+    selected = service_module._generate_validated_replan_search_url(
+        runtime=runtime,
+        request=request,
+        target_terms=["filezilla"],
+        root=tmp_path,
+        step_id="step-001",
+    )
+
+    assert runtime.calls == 2
+    assert selected is not None
+    payload = json.loads((tmp_path / "responses" / "step-001.replan-search-url.json").read_text(encoding="utf-8"))
+    model_attempts = [item for item in payload["attempts"] if isinstance(item.get("attempt"), int)]
+    assert len(model_attempts) == 2
+
+
+def test_replan_search_url_not_generated_for_same_page_search_result_processing(tmp_path) -> None:
+    request = StepRequest(
+        user_prompt="filezilla 설치해줘",
+        execution_style="gui_first",
+        replan_requested=True,
+        replan_reasons=["partial_progress_opened_page_only", "same_page_click_retry_required"],
+    )
+
+    should_generate = (
+        request.replan_requested
+        and service_module._looks_like_download_or_install_task(request.user_prompt)
+        and any(
+            reason
+            in {
+                "no_visible_download_candidates",
+                "download_url_404",
+                "guessed_artifact_url_404",
+                "installer_url_not_found",
+            }
+            for reason in request.replan_reasons
+        )
+        and "partial_progress_opened_page_only" not in request.replan_reasons
+        and "same_page_click_retry_required" not in request.replan_reasons
+        and not _select_validated_replan_search_url(request.user_prompt)
+    )
+
+    assert should_generate is False
+
+
+def test_select_prompt_browser_url_prefers_validated_replan_search_url() -> None:
+    text = (
+        "Open https://example.com/download first.\n"
+        "Validated replan search URL to use if a new browser search is needed: "
+        "https://www.google.com/search?q=filezilla+windows"
+    )
+    assert _select_validated_replan_search_url(text) == "https://www.google.com/search?q=filezilla+windows"
+    assert _select_prompt_browser_url(text) == "https://www.google.com/search?q=filezilla+windows"
+
+
+def test_select_prompt_browser_url_prefers_validated_replan_retry_url() -> None:
+    text = (
+        "Open https://example.com/download first.\n"
+        "Validated replan retry URL to use if a new browser search is needed: "
+        "https://www.google.com/search?q=filezilla+windows+kr"
+    )
+    assert _select_validated_replan_search_url(text) == "https://www.google.com/search?q=filezilla+windows+kr"
+    assert _select_prompt_browser_url(text) == "https://www.google.com/search?q=filezilla+windows+kr"
+
+
+def test_select_prompt_browser_url_skips_excluded_failed_search_query() -> None:
+    text = (
+        "Open https://example.com/download first.\n"
+        "Validated replan search URL to use if a new browser search is needed: "
+        "https://www.google.com/search?q=filezilla+windows"
+    )
+    assert (
+        _select_prompt_browser_url(text, excluded_queries=["filezilla windows"])
+        == "https://example.com/download"
+    )
+
+
+def test_select_request_prompt_browser_url_rejects_repeated_failed_search_query() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Previous stdout summary: opened isolated recovery page: "
+            "https://www.google.com/search?q=filezilla%20windows\n"
+            "Validated replan search URL to use if a new browser search is needed: "
+            "https://www.google.com/search?q=filezilla%20windows"
+        ),
+        execution_style="gui_first",
+        replan_requested=True,
+        last_execution={"payload_metadata": {"executed_python_code": ""}},
+    )
+    assert _select_request_prompt_browser_url(request) is None
 
 
 def test_visible_gui_continuation_cues_detected_for_gui_first_request() -> None:
@@ -1632,7 +4007,7 @@ def test_framework_official_download_recovery_disabled_for_gui_first_visible_ui(
     assert _should_use_framework_official_download_recovery(request) is False
 
 
-def test_framework_official_download_recovery_disabled_for_gui_first_even_without_visible_ui_cues() -> None:
+def test_framework_official_download_recovery_enabled_for_gui_first_after_visible_download_stalls() -> None:
     request = StepRequest(
         user_prompt=(
             "Use Python to continue downloading the Windows installer from the official page. "
@@ -1640,11 +4015,267 @@ def test_framework_official_download_recovery_disabled_for_gui_first_even_withou
         ),
         execution_style="gui_first",
         observation_text=None,
+        last_execution={"stderr_tail": "no visible download-related control remains on the current screen"},
         replan_requested=True,
         replan_reasons=["execution_error"],
         step_index=2,
     )
+    assert _should_use_framework_official_download_recovery(request) is True
+
+
+def test_framework_official_download_recovery_can_use_target_search_without_prompt_url() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Original task target terms to preserve: sampledesk, vendorcorp.\n"
+            "End this step only when the installer file exists in Downloads."
+        ),
+        execution_style="gui_first",
+        last_execution={
+            "stdout_tail": "click visible download candidate: Download at (1000, 700)\n"
+            "candidate did not finish download yet: recent installer download did not appear",
+            "stderr_tail": "clicked a grounded download candidate",
+        },
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+        step_index=4,
+    )
+
+    assert _should_use_framework_official_download_recovery(request) is True
+
+
+def test_framework_official_download_recovery_does_not_repeat_after_no_candidate_failure() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Original task target terms to preserve: filezilla.\n"
+            "End this step only when the installer file exists in Downloads."
+        ),
+        execution_style="gui_first",
+        last_execution={
+            "stdout_tail": "Failed to fetch page https://filezilla.org/: HTTP Error 410: Gone",
+            "stderr_tail": "No official Windows installer/archive candidate found from the prompt URLs.",
+        },
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+        step_index=4,
+    )
+
     assert _should_use_framework_official_download_recovery(request) is False
+
+
+def test_framework_official_download_recovery_defers_to_model_visible_candidates() -> None:
+    request = StepRequest(
+        user_prompt="Download the Windows installer for filezilla.",
+        execution_style="gui_first",
+        observation_text=(
+            'MODEL_VISIBLE_UI_CANDIDATES: {"candidates":['
+            '{"text":"Download FileZilla Client for Windows","point":[1216,482],"tags":["download_like","target_like"]}'
+            "]}"
+        ),
+        last_execution={
+            "stdout_tail": "opened browser page for screenshot-grounded UI continuation",
+            "stderr_tail": "continue with latest screenshot and model-visible UI candidates",
+        },
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+        step_index=1,
+    )
+
+    assert _should_use_framework_official_download_recovery(request) is False
+
+
+def test_official_download_recovery_follows_search_results_without_prompt_url() -> None:
+    code = _synthesized_official_download_recovery_code(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Original task target terms to preserve: sampledesk.\n"
+            "End this step only when the installer file exists in Downloads."
+        )
+    )
+
+    assert 'FALLBACK_SEARCH_URL = "https://www.google.com/search?' in code
+    assert "FALLBACK_DOMAIN_URLS = " in code
+    assert "allow_external_search_result = not base_registrables and current_is_search_engine" in code
+    assert "not allow_external_search_result" in code
+    assert "resolved_is_download_catalog" in code
+    assert code.index("enqueue_page(page_queue, FALLBACK_SEARCH_URL)") < code.index(
+        "enqueue_page(page_queue, FALLBACK_LUCKY_URL)"
+    )
+    assert code.index("enqueue_page(page_queue, FALLBACK_LUCKY_URL)") < code.index(
+        "for fallback_domain_url in FALLBACK_DOMAIN_URLS:"
+    )
+    assert "def prioritize_page_links(page_links: list[str], *, base_is_search_engine: bool, limit: int = 8) -> list[str]:" in code
+    assert 'if tld == "kr" and any(root in compact_url for root in keyword_roots):' in code
+    assert "score += 40" in code
+    assert "def record_failed_url(url: str, reason: str) -> None:" in code
+    assert "def previously_failed_url(url: str) -> bool:" in code
+    assert "Skipping previously failed source URL" in code
+    assert "record_failed_url(page_url, str(exc))" in code
+    assert "record_failed_url(exe_url, str(exc))" in code
+    assert "failed_source_urls" not in code
+    assert "failed_source_hosts" not in code
+    assert "failed_source_scope" not in code
+
+
+def test_official_download_recovery_allows_target_named_catalog_search_results() -> None:
+    code = _synthesized_official_download_recovery_code(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Original task target terms to preserve: sampledesk.\n"
+            "End this step only when the installer file exists in Downloads."
+        )
+    )
+
+    assert "resolved_has_target_keyword" in code
+    assert "(not resolved_is_download_catalog or resolved_has_target_keyword)" in code
+
+
+def test_official_download_recovery_disables_lucky_search_for_hangul_targets() -> None:
+    code = _synthesized_official_download_recovery_code(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Original task target terms to preserve: 메모잇.\n"
+            "End this step only when the installer file exists in Downloads."
+        )
+    )
+
+    assert "FALLBACK_LUCKY_URL = null" in code
+    assert "FALLBACK_SEARCH_URL = \"https://www.google.com/search?" in code
+
+
+def test_model_ui_download_recovery_stops_after_repeated_visible_click_stall_with_prompt_url() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Use Python to download the official installer from https://pc.kakao.com/ "
+            "and save it to Downloads."
+        ),
+        execution_style="gui_first",
+        observation_text='MODEL_VISIBLE_UI_CANDIDATES: {"candidates":[{"text":"Download","point":[2200,345],"tags":["download_like"]}]}',
+        last_execution={
+            "stdout_tail": "click visible download candidate: Download at (2201, 345)\ncandidate did not finish download yet: recent installer download did not appear",
+            "stderr_tail": "clicked a grounded download candidate; inspect the updated screenshot",
+        },
+        step_index=4,
+    )
+    assert _should_use_model_ui_download_recovery(request) is False
+    assert _should_use_framework_official_download_recovery(
+        StepRequest(
+            user_prompt=request.user_prompt,
+            execution_style=request.execution_style,
+            observation_text=request.observation_text,
+            last_execution=request.last_execution,
+            replan_requested=True,
+            replan_reasons=["execution_error"],
+            step_index=request.step_index,
+        )
+    ) is True
+
+
+def test_model_ui_download_recovery_stops_after_first_exhausted_grounded_recovery_attempt() -> None:
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        observation_text=(
+            'MODEL_VISIBLE_UI_CANDIDATES: {"candidates":['
+            '{"text":"Download FileZilla Client for Windows","point":[1110,754],"tags":["download_like","target_like"]}'
+            "]} "
+        ),
+        last_execution={
+            "stdout_tail": (
+                "click visible download candidate[1/1]: Download FileZilla Client for Windows at (1110, 754)\n"
+                "candidate point 4 did not finish download yet: recent installer download did not appear\n"
+                "opened isolated recovery page: https://www.google.com/search?q=filezilla%20windows"
+            ),
+            "stderr_tail": "clicked all grounded points for all visible candidates without a stable download: recent installer download did not appear",
+        },
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+        step_index=2,
+    )
+
+    assert _should_use_model_ui_download_recovery(request) is False
+    assert _should_use_framework_official_download_recovery(request) is True
+
+
+def test_framework_official_download_retry_for_invalid_generation_enabled_after_exhausted_visible_download_recovery() -> None:
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        observation_text=(
+            'MODEL_VISIBLE_UI_CANDIDATES: {"candidates":['
+            '{"text":"Download FileZilla Client for Windows","point":[1110,754],"tags":["download_like","target_like"]}'
+            "]} "
+        ),
+        last_execution={
+            "stdout_tail": (
+                "click visible download candidate[1/1]: Download FileZilla Client for Windows at (1110, 754)\n"
+                "candidate point 4 did not finish download yet: recent installer download did not appear\n"
+                "skipping repeated isolated recovery page: https://www.google.com/search?q=filezilla%20windows"
+            ),
+            "stderr_tail": "clicked all grounded points for all visible candidates without a stable download: recent installer download did not appear",
+        },
+        replan_requested=True,
+        replan_reasons=["execution_error", "no_visible_download_candidates"],
+        step_index=2,
+    )
+
+    assert _should_use_framework_official_download_retry_for_invalid_generation(
+        request,
+        prompt_url_violation=False,
+        gui_first_visible_ui_violation=True,
+        guessed_artifact_url_generation=False,
+        gui_first_download_chunk_network_bypass=True,
+        gui_first_download_chunk_install_mix=True,
+    ) is True
+
+
+def test_framework_official_download_retry_for_invalid_generation_disabled_while_visible_ui_is_still_actionable() -> None:
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        observation_text=(
+            'MODEL_VISIBLE_UI_CANDIDATES: {"candidates":['
+            '{"text":"Download FileZilla Client for Windows","point":[1110,754],"tags":["download_like","target_like"]}'
+            "]} "
+        ),
+        last_execution={
+            "stdout_tail": "opened browser page for screenshot-grounded UI continuation",
+            "stderr_tail": "continue with latest screenshot and model-visible UI candidates",
+        },
+        replan_requested=True,
+        replan_reasons=["execution_error"],
+        step_index=1,
+    )
+
+    assert _should_use_framework_official_download_retry_for_invalid_generation(
+        request,
+        prompt_url_violation=False,
+        gui_first_visible_ui_violation=True,
+        guessed_artifact_url_generation=False,
+        gui_first_download_chunk_network_bypass=True,
+        gui_first_download_chunk_install_mix=True,
+    ) is False
+
+
+def test_model_ui_download_recovery_continues_late_stall_when_alternate_candidate_visible() -> None:
+    request = StepRequest(
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        execution_style="gui_first",
+        observation_text=(
+            'MODEL_VISIBLE_UI_CANDIDATES: {"candidates":['
+            '{"text":"Download for Windows","point":[920,430],"tags":["download_like"]},'
+            '{"text":"Download installer","point":[1220,700],"tags":["download_like"]}'
+            "]}"
+        ),
+        last_execution={
+            "stdout_tail": "click visible download candidate: Download for Windows at (920, 430)\ncandidate did not finish download yet: recent installer download did not appear",
+            "stderr_tail": "clicked a grounded download candidate; inspect the updated screenshot",
+        },
+        step_index=4,
+    )
+
+    assert _should_use_model_ui_download_recovery(request) is True
 
 
 def test_gui_first_visible_ui_bypass_detected_for_network_scraping_code() -> None:
@@ -1750,7 +4381,9 @@ print(links[:1])
     assert _looks_like_gui_first_download_chunk_network_bypass(request, code) is True
 
 
-def test_gui_first_download_bypass_can_execute_when_auto_open_prelude_is_available() -> None:
+def test_gui_first_download_bypass_can_execute_when_auto_open_prelude_is_available(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_FRAMEWORK_OCR_UI_HELPERS_ENABLED", True)
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", False)
     request = StepRequest(
         user_prompt=(
             "Open the official vendor page at https://vendor.example/download and download the Windows installer `.exe`. "
@@ -1960,6 +4593,11 @@ def test_framework_official_download_recovery_reuses_only_matching_existing_inst
     assert 'if not KEYWORDS:' in code
     assert 'if not any(keyword in lowered for keyword in KEYWORDS):' in code
     assert 'installer_suffixes = (".exe", ".msi", ".zip", ".alz")' in code
+    assert 'CONTEXT_PATH = Path.home() / "Downloads" / "computer-use-agent-context.json"' in code
+    assert "CONTEXT_PROMPT_KEY =" in code
+    assert '"prompt_key": CONTEXT_PROMPT_KEY' in code
+    assert "def write_download_context(path: Path, source_url: str) -> None:" in code
+    assert "write_download_context(dest, exe_url)" in code
 
 
 def test_duplicate_generation_detected_for_same_script() -> None:
@@ -1984,6 +4622,44 @@ def _synthesized_official_download_recovery_code_for_test(*, user_prompt: str) -
     from computer_use_raw_python_agent.service import _synthesized_official_download_recovery_code
 
     return _synthesized_official_download_recovery_code(user_prompt=user_prompt)
+
+
+def test_synthesized_official_download_recovery_uses_target_terms_not_prompt_noise() -> None:
+    prompt = (
+        "Return executable Python only for this chunk. "
+        "Download into C:\\Users\\kss930\\Downloads and prefer the official vendor site. "
+        "Open the official SampleDesk service page at https://www.vendorcorp.com/page/service/service/SampleDesk "
+        "and find the Windows installer. "
+        "가능하면 `sampledesk`, `vendorcorp` 같은 대상 앱 키워드가 포함된 공식 Windows installer를 찾으세요."
+    )
+    code = _synthesized_official_download_recovery_code_for_test(user_prompt=prompt)
+    keyword_section = code.split("KEYWORDS =", 1)[1].split("USER_AGENT =", 1)[0]
+
+    assert "sampledesk" in keyword_section
+    assert "vendorcorp" in keyword_section
+    assert "users" not in keyword_section
+    assert "python-driven" not in keyword_section
+    assert "FALLBACK_SEARCH_URL =" in code
+    assert "FALLBACK_LUCKY_URL =" in code
+    assert "def normalize_link(base_url: str, raw: str) -> str:" in code
+    assert "def host_matches_keyword_domain(host: str) -> bool:" in code
+    assert "or host_matches_keyword_domain(urlparse(resolved).netloc)" in code
+    assert 'replace("\\\\u002F", "/")' in code
+
+
+def test_official_download_recovery_prefers_search_before_guessed_domains_for_keyword_only_tasks() -> None:
+    code = _synthesized_official_download_recovery_code_for_test(
+        user_prompt="Return executable Python only for this chunk. filezilla 설치파일을 다운로드해줘"
+    )
+
+    assert 'FALLBACK_SEARCH_URL = "https://www.google.com/search?' in code
+    assert 'FALLBACK_ALTERNATE_SEARCH_URLS = ["https://www.google.com/search?q=filezilla%20kr"' in code
+    assert code.index("enqueue_page(page_queue, FALLBACK_SEARCH_URL)") < code.index(
+        "for fallback_alternate_search_url in FALLBACK_ALTERNATE_SEARCH_URLS:"
+    )
+    assert code.index("for fallback_alternate_search_url in FALLBACK_ALTERNATE_SEARCH_URLS:") < code.index(
+        "enqueue_page(page_queue, FALLBACK_LUCKY_URL)"
+    )
 
 
 def test_replan_prompt_rewrite_for_installer_app_not_found() -> None:
@@ -2060,6 +4736,135 @@ pyautogui.click(1180, 602)
     assert "try the next distinct candidate in the same script before giving up" in rewritten
     assert "Do not treat the browser toolbar, address bar, tab strip, bookmarks bar" in rewritten
     assert "Avoid reusing these previous click coordinates first: (1000, 600), (1180, 602)." in rewritten
+
+
+def test_replan_prompt_rewrite_for_download_preserves_original_target_terms() -> None:
+    prompt = (
+        "Open the official SampleDesk service page at https://www.vendorcorp.com/page/service/service/SampleDesk "
+        "and use Python-driven browser automation to find the Windows download link. "
+        "가능하면 `sampledesk`, `vendorcorp` 같은 대상 앱 키워드가 포함된 공식 Windows installer를 찾으세요."
+    )
+    rewritten = _rewrite_user_prompt_for_replan(
+        prompt,
+        active_replan_reasons=["partial_progress_opened_page_only"],
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": "open_url_and_wait('https://www.vendorcorp.com/page/service/service/SampleDesk')",
+            },
+            "stdout_tail": "opened browser page for screenshot-grounded UI continuation",
+            "stderr_tail": "continue with latest screenshot and model-visible UI candidates",
+        },
+    )
+
+    assert "Original task target terms to preserve: sampledesk, vendorcorp." in rewritten
+    assert "Original official URLs to preserve: https://www.vendorcorp.com/page/service/service/SampleDesk." in rewritten
+    assert "opened browser page for screenshot-grounded UI continuation" in rewritten
+
+
+def test_replan_prompt_rewrite_for_visible_candidate_navigation_without_browser_open_code() -> None:
+    prompt = "Use Python to stay on the visible browser page and download only the Windows installer into Downloads."
+    rewritten = _rewrite_user_prompt_for_replan(
+        prompt,
+        active_replan_reasons=["partial_progress_opened_page_only"],
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": "import pyautogui\npyautogui.click(920, 430)\n",
+            },
+            "stdout_tail": (
+                "visible candidate opened page: https://filezilla-project.org/download.php?type=client\n"
+                "opened browser page for screenshot-grounded UI continuation"
+            ),
+            "stderr_tail": "continue with latest screenshot and model-visible UI candidates",
+        },
+    )
+
+    assert rewritten.startswith("REPLAN OVERRIDE FOR THIS STEP:")
+    assert "Treat the current screenshot as the primary source of truth" in rewritten
+    assert "Continue from the visible browser/download UI with Python GUI automation" in rewritten
+    assert "Avoid reusing these previous click coordinates first: (920, 430)." in rewritten
+
+
+def test_replan_prompt_rewrite_for_download_no_candidates_forces_search_reset() -> None:
+    prompt = (
+        "Use Python to stay on the visible browser page and download only the Windows installer into Downloads."
+    )
+    rewritten = _rewrite_user_prompt_for_replan(
+        prompt,
+        active_replan_reasons=["no_visible_download_candidates"],
+        last_execution={
+            "stderr_tail": "download related fallback found no clickable candidates",
+        },
+    )
+
+    assert "The current page did not produce usable download candidates." in rewritten
+    assert "On retry, change the search terms" in rewritten
+    assert "refresh the page/search query" in rewritten
+
+
+def test_replan_prompt_rewrite_for_download_no_candidates_keeps_exact_target_keywords_in_search() -> None:
+    prompt = "filezilla 설치해줘"
+    rewritten = _rewrite_user_prompt_for_replan(
+        prompt,
+        active_replan_reasons=["no_visible_download_candidates"],
+        last_execution={
+            "stderr_tail": "download related fallback found no clickable candidates",
+        },
+    )
+
+    assert "Original task target terms to preserve: filezilla." in rewritten
+    assert "keep these exact task/product keywords in the query: filezilla." in rewritten.lower()
+    assert "Do not replace those task/product keywords with generic retry wording" in rewritten
+
+
+def test_replan_prompt_rewrite_for_download_no_candidates_ignores_prompt_boilerplate() -> None:
+    prompt = (
+        "Return executable Python only for this chunk.\n"
+        "이 chunk는 실행 가능한 Python 코드만으로 수행하세요. 현재 스크린샷에 브라우저 검색 결과가 보이면 이어서 사용하세요.\n\n"
+        "Use Python-driven browser automation on the current Windows desktop to open the FileZilla client download page, "
+        "then download the Windows installer `.exe` only.\n"
+        "작업과 일치하는 vendor, product, download 페이지를 우선 사용하세요. "
+        "가능하면 `filezilla` 같은 대상 앱 키워드가 포함된 Windows installer `.exe` 또는 `.msi`를 우선 찾으세요."
+    )
+    rewritten = _rewrite_user_prompt_for_replan(
+        prompt,
+        active_replan_reasons=["no_visible_download_candidates"],
+        last_execution={
+            "stderr_tail": "not execution path download-like official windows download",
+        },
+    )
+
+    assert "Original task target terms to preserve: filezilla." in rewritten
+    assert "keep these exact task/product keywords in the query: filezilla." in rewritten.lower()
+    assert "chunk, 가능한" not in rewritten
+    assert "not, execution, path" not in rewritten
+
+
+def test_replan_prompt_rewrite_for_install_chunk_after_browser_open_stays_install_chunk() -> None:
+    prompt = (
+        "Use Python to locate the FileZilla installer in Downloads, start it with subprocess.Popen, "
+        "and complete the Windows setup using default options unless the installer requires a straightforward confirmation. "
+        "After installation, launch FileZilla Client and confirm it starts successfully without errors.\n\n"
+        "Current chunk success target: FileZilla is installed and the client process starts successfully.\n\n"
+        "Preconditions expected before or during this chunk:\n"
+        "- A valid FileZilla installer .exe already exists in ~/Downloads.\n\n"
+        "Previously verified installer artifacts on the target machine. Prefer these exact installer paths before searching Downloads broadly again:\n"
+        "- `C:\\Users\\user\\Downloads\\FileZilla_3.70.4_win64_sponsored2-setup.exe`"
+    )
+    rewritten = _rewrite_user_prompt_for_replan(
+        prompt,
+        active_replan_reasons=["execution_error"],
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://www.google.com/search?q=filezilla%20official%20windows%20download", expected_title_tokens=["filezilla"])',
+            },
+            "stdout_tail": "opened browser page for screenshot-grounded UI continuation",
+            "stderr_tail": "continue with latest screenshot and model-visible UI candidates",
+        },
+    )
+    assert rewritten.startswith("REPLAN OVERRIDE FOR THIS STEP:")
+    assert "Use the existing installer already present in Downloads" in rewritten
+    assert "End this step only when the installed app process is running." in rewritten
+    assert "This is a download-only step." not in rewritten
 
 
 def test_replan_prompt_rewrite_for_truncated_gui_repetition_failure_adds_loop_hint() -> None:
