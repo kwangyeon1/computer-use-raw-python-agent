@@ -412,10 +412,13 @@ These candidates come from local model visual extraction of the latest screensho
     assert "def _process_exists(name):" in code
     assert "def _avoid_failsafe():" in code
     assert "def _launch_installed_exe(exe):" in code
+    assert "def _installed_exe_score(path):" in code
     assert "launch installed executable:" in code
     assert "if _launch_installed_exe(existing):" in code
     assert "if _launch_installed_exe(current):" in code
     assert "if not _launch_installed_exe(final):" in code
+    assert "sftp" in code
+    assert "sorted(matches, key=lambda p: len(str(p)))" not in code
     assert "no installer package available for installer recovery" in code
     assert "확인" in code
     assert "취소" not in code
@@ -2063,6 +2066,9 @@ def test_synthesized_visible_installer_recovery_code_prefers_existing_visible_in
     assert "_is_valid_installed_executable(" in code
     assert "FILENAME_TARGET_KEYWORDS" in code
     assert "_matches_filename_target(" in code
+    assert "score += 55" in code
+    assert "score -= 85" in code
+    assert "sftp" in code
     assert '"/appdata/local/temp/"' in code
     assert '"setup"' in code
     assert 'print(f"already installed: {existing}")' not in code

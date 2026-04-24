@@ -5334,21 +5334,27 @@ def _matches_filename_target(path: Path) -> bool:
 
 def _score_path(path: Path) -> tuple[int, int, float]:
     lowered = str(path).lower()
+    lowered_name = path.name.lower()
     score = 0
     matched_keywords = 0
     for keyword in TARGET_KEYWORDS:
         normalized = str(keyword or "").strip().lower()
         if not normalized:
             continue
-        if normalized in path.name.lower():
+        if normalized in lowered_name:
             score += 40
             matched_keywords += 1
         elif normalized in lowered:
             score += 18
             matched_keywords += 1
+    if FILENAME_TARGET_KEYWORDS:
+        if any(keyword in lowered_name for keyword in FILENAME_TARGET_KEYWORDS):
+            score += 55
+        else:
+            score -= 18
     if lowered.endswith((".exe", ".msi", ".zip", ".alz")):
         score += 10
-    if path.name.lower() in SYSTEM_APP_NAMES:
+    if lowered_name in SYSTEM_APP_NAMES:
         score -= 240
     if _is_temp_like_path(path):
         score -= 400
@@ -5356,6 +5362,8 @@ def _score_path(path: Path) -> tuple[int, int, float]:
         score -= 90
     if any(token in lowered for token in ("uninstall", "unins", "repair", "update", "updater", "helper", "runtime", "setup", "installer")):
         score -= 80
+    if any(token in lowered_name for token in ("sftp", "service", "broker", "daemon", "agent", "assistant", "console", "crash", "report")):
+        score -= 85
     if "program files" in lowered or "/programs/" in lowered:
         score += 20
     try:
@@ -6081,21 +6089,27 @@ def _is_valid_installed_executable(path: Path) -> bool:
 
 def _score_path(path: Path) -> tuple[int, int, float]:
     lowered = str(path).lower()
+    lowered_name = path.name.lower()
     score = 0
     matched_keywords = 0
     for keyword in TARGET_KEYWORDS:
         normalized = str(keyword or "").strip().lower()
         if not normalized:
             continue
-        if normalized in path.name.lower():
+        if normalized in lowered_name:
             score += 40
             matched_keywords += 1
         elif normalized in lowered:
             score += 18
             matched_keywords += 1
+    if FILENAME_TARGET_KEYWORDS:
+        if any(keyword in lowered_name for keyword in FILENAME_TARGET_KEYWORDS):
+            score += 55
+        else:
+            score -= 18
     if lowered.endswith(".exe"):
         score += 10
-    if path.name.lower() in SYSTEM_APP_NAMES:
+    if lowered_name in SYSTEM_APP_NAMES:
         score -= 240
     if _is_temp_like_path(path):
         score -= 400
@@ -6103,6 +6117,8 @@ def _score_path(path: Path) -> tuple[int, int, float]:
         score -= 90
     if any(token in lowered for token in ("uninstall", "unins", "repair", "update", "updater", "helper", "runtime", "setup", "installer")):
         score -= 80
+    if any(token in lowered_name for token in ("sftp", "service", "broker", "daemon", "agent", "assistant", "console", "crash", "report")):
+        score -= 85
     if "program files" in lowered or "/programs/" in lowered:
         score += 20
     try:
@@ -13166,10 +13182,37 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         "        return portable_targets[0]",
         "    raise SystemExit(f'no installer or target executable found after extracting {package}')",
         "",
+        "def _installed_exe_score(path):",
+        "    path = Path(path)",
+        "    lowered = str(path).lower()",
+        "    name = path.name.lower()",
+        "    score = 0",
+        "    matched_terms = 0",
+        "    for term in _target_terms():",
+        "        if _contains_target(name, term):",
+        "            score += 60",
+        "            matched_terms += 1",
+        "        elif _contains_target(lowered, term):",
+        "            score += 20",
+        "            matched_terms += 1",
+        "    if _target_terms():",
+        "        if any(_contains_target(name, term) for term in _target_terms()):",
+        "            score += 70",
+        "        else:",
+        "            score -= 18",
+        "    if 'program files' in lowered or '\\\\program files\\\\' in lowered:",
+        "        score += 20",
+        "    if any(token in name for token in ('unins', 'uninstall', 'update', 'updater', 'helper', 'runtime', 'service', 'broker', 'daemon', 'agent', 'assistant', 'console', 'crash', 'report', 'sftp')):",
+        "        score -= 85",
+        "    try:",
+        "        mtime = float(path.stat().st_mtime)",
+        "    except OSError:",
+        "        mtime = 0.0",
+        "    return score, matched_terms, mtime",
+        "",
         "def _find_installed_exe():",
-        "    terms = _target_terms()",
         "    roots = [Path(os.environ.get('LOCALAPPDATA', '')), Path(os.environ.get('ProgramFiles', '')), Path(os.environ.get('ProgramFiles(x86)', ''))]",
-        "    matches = []",
+        "    candidates = []",
         "    for root in roots:",
         "        if not str(root) or not root.exists():",
         "            continue",
@@ -13186,10 +13229,15 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         "                    continue",
         "                path = Path(dirpath) / filename",
         "                full = str(path).lower()",
+        "                terms = _target_terms()",
         "                if terms and not any(_contains_target(name, term) or _contains_target(full, term) for term in terms):",
         "                    continue",
-        "                matches.append(path)",
-        "    return sorted(matches, key=lambda p: len(str(p)))[0] if matches else None",
+        "                score, matched_terms, mtime = _installed_exe_score(path)",
+        "                if score <= 0 or (terms and matched_terms <= 0):",
+        "                    continue",
+        "                candidates.append((score, matched_terms, mtime, path))",
+        "    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)",
+        "    return candidates[0][3] if candidates else None",
         "",
         "def _write_marker(exe, *, installer_path=None):",
         "    previous_context = _read_json(CONTEXT_MARKER)",
