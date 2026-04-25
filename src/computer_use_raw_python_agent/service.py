@@ -533,6 +533,15 @@ def read_action_context(context_path, *, prompt_key=None):
         candidate = Path(os.path.expandvars(os.path.expanduser(raw)))
         return candidate.exists() and candidate.is_file()
 
+    def _normalized_download_path(value):
+        raw = str(value or "").strip().strip('"')
+        if not raw:
+            return ""
+        candidate = Path(os.path.expandvars(os.path.expanduser(raw)))
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+        return ""
+
     def _remove_context(path, **extra):
         try:
             path.unlink(missing_ok=True)
@@ -569,7 +578,11 @@ def read_action_context(context_path, *, prompt_key=None):
     expected_prompt_key = str(prompt_key or "").strip()
     stored_prompt_key = str(payload.get("prompt_key") or "").strip()
     if expected_prompt_key and stored_prompt_key != expected_prompt_key:
-        return _remove_context(path, _prompt_mismatch=True, previous_prompt_key=stored_prompt_key)
+        carried_installer = _normalized_download_path(payload.get("installer_path"))
+        extra = {"_prompt_mismatch": True, "previous_prompt_key": stored_prompt_key}
+        if carried_installer:
+            extra["_prompt_mismatch_installer_path"] = carried_installer
+        return _remove_context(path, **extra)
     if payload.get("installer_path") and not _valid_download_path(payload.get("installer_path")):
         return _drop_stale_download_fields(path, payload)
     payload["_context_path"] = str(path)
@@ -5399,7 +5412,28 @@ def _score_path(path: Path) -> tuple[int, int, float]:
     return score, matched_keywords, mtime
 
 def find_existing_installer() -> Path:
-    context_payload = ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)
+    initial_context_payload = read_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY)
+    carried_context_installer = _context_candidate(initial_context_payload.get("_prompt_mismatch_installer_path"))
+    if carried_context_installer is not None:
+        lowered = str(carried_context_installer).lower()
+        try:
+            carried_bytes = carried_context_installer.stat().st_size
+        except OSError:
+            carried_bytes = 0
+        if (not FILENAME_TARGET_KEYWORDS or any(keyword in lowered for keyword in FILENAME_TARGET_KEYWORDS)) and carried_bytes > 1_000_000:
+            # A verifier may refresh only installer_path after a broad Downloads scan. Carry just that path
+            # into the new task-scoped context here, without inheriting the previous prompt ownership.
+            context_payload = write_action_context(
+                CONTEXT_PATH,
+                prompt_key=CONTEXT_PROMPT_KEY,
+                prompt_excerpt=CONTEXT_PROMPT_EXCERPT,
+                phase="context_started",
+                installer_path=str(carried_context_installer),
+            )
+        else:
+            context_payload = ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)
+    else:
+        context_payload = ensure_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY, prompt_excerpt=CONTEXT_PROMPT_EXCERPT)
     context_installer = _context_candidate(context_payload.get("installer_path"))
     if context_installer is not None:
         lowered = str(context_installer).lower()
@@ -7827,10 +7861,47 @@ def _url_looks_like_installer_artifact(url: str | None) -> bool:
     return any(path.endswith(suffix) for suffix in (".exe", ".msi", ".zip", ".alz"))
 
 
+def _looks_like_archive_extract_or_executable_discovery_chunk(user_prompt: str) -> bool:
+    if not _looks_like_download_or_install_task(user_prompt):
+        return False
+    lowered = str(user_prompt or "").lower()
+    archive_or_discovery_markers = (
+        "extract the downloaded",
+        "extract the zip",
+        "extract the archive",
+        "extract the package",
+        "search the extracted contents",
+        "search extracted contents",
+        "find executable",
+        "find the executable",
+        "find the main executable",
+        "locate executable",
+        "locate the executable",
+        "압축 해제",
+        "압축을 풀",
+        "추출",
+        "실행 파일",
+    )
+    follow_up_markers = (
+        "prepare it for launch",
+        "prepare for launch",
+        "do not redownload",
+        "do not redownload anything",
+        "do not assume a fixed inner filename",
+        "archive is extracted",
+        "extracted folder",
+    )
+    return any(marker in lowered for marker in archive_or_discovery_markers) and any(
+        marker in lowered for marker in follow_up_markers
+    )
+
+
 def _looks_like_download_artifact_only_chunk(user_prompt: str) -> bool:
     if not _looks_like_download_or_install_task(user_prompt):
         return False
     if _looks_like_existing_installer_launch_task(user_prompt):
+        return False
+    if _looks_like_archive_extract_or_executable_discovery_chunk(user_prompt):
         return False
     lowered = str(user_prompt or "").lower()
     install_markers = (
@@ -7848,8 +7919,6 @@ def _looks_like_download_artifact_only_chunk(user_prompt: str) -> bool:
     if any(marker in lowered for marker in install_markers):
         return False
     success_target_markers = (
-        "current chunk success target",
-        "success target",
         "present in downloads",
         "nontrivial file size",
         "plausible size",
@@ -7858,10 +7927,10 @@ def _looks_like_download_artifact_only_chunk(user_prompt: str) -> bool:
         "installer file is fully present",
         "download artifact to stabilize in downloads",
         "wait for the download artifact to stabilize in downloads",
+        "wait until the download is complete",
         "fully present before finishing this chunk",
-        "downloads 폴더",
-        "downloads 안에",
-        "다운로드 폴더",
+        "다운로드가 끝나면",
+        "다운로드 완료",
     )
     download_markers = (
         "download the official",
@@ -13571,6 +13640,8 @@ def _should_use_model_ui_browser_prelude(request: StepRequest) -> bool:
     if str(request.execution_style or "python_first").lower() != "gui_first":
         return False
     if not _looks_like_download_or_install_task(request.user_prompt):
+        return False
+    if _looks_like_archive_extract_or_executable_discovery_chunk(request.user_prompt):
         return False
     if _looks_like_launch_app_chunk_task(request.user_prompt):
         return False

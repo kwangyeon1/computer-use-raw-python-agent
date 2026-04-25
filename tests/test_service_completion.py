@@ -1539,6 +1539,78 @@ def test_download_artifact_only_chunk_recognizes_replan_download_only_prompt() -
     assert service_module._looks_like_download_artifact_only_chunk(prompt) is True
 
 
+def test_extract_discovery_chunk_is_not_treated_as_download_only() -> None:
+    prompt = (
+        "Using Python on the target Windows machine, extract the downloaded MobaXterm ZIP into a new folder under Downloads, "
+        "then search the extracted contents for the main MobaXterm executable. Keep the flow self-contained: do not redownload anything, "
+        "and do not assume a fixed inner filename. If multiple executables are found, select the one that is clearly the MobaXterm application "
+        "and prepare it for launch."
+    )
+    assert service_module._looks_like_archive_extract_or_executable_discovery_chunk(prompt) is True
+    assert service_module._looks_like_download_artifact_only_chunk(prompt) is False
+
+
+def test_negated_launch_markers_keep_extract_discovery_out_of_launch_classifiers() -> None:
+    markers = (
+        "do not launch the app",
+        "do not launch",
+        "don't launch",
+        "do not run the app",
+        "do not run yet",
+        "not launch yet",
+        "not run yet",
+        "아직 실행하지",
+        "실행하지 마",
+        "실행하지 말",
+        "실행하지 않고",
+    )
+    for marker in markers:
+        prompt = (
+            "Using Python on the target Windows machine, extract the downloaded ZIP into a new folder under Downloads, "
+            "then search the extracted contents for the main executable. "
+            f"Keep the work focused on extraction and executable discovery only; {marker}. "
+            "Prepare it for launch in the next chunk."
+        )
+        assert service_module._looks_like_archive_extract_or_executable_discovery_chunk(prompt) is True
+        assert _looks_like_existing_installer_launch_task(prompt) is False
+        assert _looks_like_launch_app_chunk_task(prompt) is False
+
+
+def test_model_ui_browser_prelude_not_selected_for_extract_discovery_chunk(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n\n"
+            "Using Python on the target Windows machine, extract the downloaded MobaXterm ZIP into a new folder under Downloads, "
+            "then search the extracted contents for the main MobaXterm executable. Keep the flow self-contained: do not redownload anything, "
+            "and do not assume a fixed inner filename. If multiple executables are found, select the one that is clearly the MobaXterm application "
+            "and prepare it for launch."
+        ),
+        execution_style="gui_first",
+        step_index=0,
+        request_kind="task_step",
+    )
+    assert _should_use_model_ui_browser_prelude(request) is False
+
+
+def test_model_ui_download_recovery_not_selected_for_extract_discovery_chunk(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n\n"
+            "Using Python on the target Windows machine, extract the downloaded MobaXterm ZIP into a new folder under Downloads, "
+            "then search the extracted contents for the main MobaXterm executable. Keep the flow self-contained: do not redownload anything, "
+            "and do not assume a fixed inner filename. If multiple executables are found, select the one that is clearly the MobaXterm application "
+            "and prepare it for launch."
+        ),
+        execution_style="gui_first",
+        step_index=1,
+        request_kind="task_step",
+        observation_text='MODEL_VISIBLE_UI_CANDIDATES: {"candidates":[{"text":"Download MobaXterm Home Edition (current version)","click_point":[868,455],"reason_tags":["download_like","target_like","button_shape"]}]}',
+    )
+    assert _should_use_model_ui_download_recovery(request) is False
+
+
 def test_download_chunk_completed_accepts_model_ui_recovery_markers() -> None:
     prompt = "Current chunk success target: The official installer `.msi` exists in Downloads and is non-empty."
     assert _looks_like_download_chunk_completed(
@@ -2685,6 +2757,8 @@ def test_synthesized_visible_installer_recovery_uses_context_path_and_context_in
     )
     code = _synthesized_visible_installer_recovery_code(request)
     assert 'CONTEXT_PATH = Path(os.path.expanduser("~/Downloads/computer-use-agent/targetapp-1234/computer-use-agent-context.json"))' in code
+    assert "initial_context_payload = read_action_context(CONTEXT_PATH, prompt_key=CONTEXT_PROMPT_KEY)" in code
+    assert 'carried_context_installer = _context_candidate(initial_context_payload.get("_prompt_mismatch_installer_path"))' in code
     assert "context_installer = _context_candidate(context_payload.get(\"installer_path\"))" in code
     assert "write_action_context(" in code
     assert "phase=\"installer_started\"" in code
@@ -2867,6 +2941,7 @@ payload4 = read_action_context(path, prompt_key="prompt-b")
     exec(code, namespace)
     assert namespace["payload1"]["installer_path"] == str(old_installer)
     assert namespace["payload2"]["_prompt_mismatch"] is True
+    assert namespace["payload2"]["_prompt_mismatch_installer_path"] == str(old_installer)
     assert "installer_path" not in namespace["payload2"]
     assert namespace["payload_started"]["phase"] == "context_started"
     assert "installer_path" not in namespace["payload_started"]
@@ -4439,7 +4514,8 @@ subprocess.run(["start", "https://vendor.example/download/setup_target.exe"], sh
 def test_gui_first_download_chunk_network_bypass_detected_for_html_scraping_without_gui() -> None:
     request = StepRequest(
         user_prompt=(
-            "Current chunk success target: A target-app installer `.exe` or `.msi` exists in Downloads and is non-empty. "
+            "Download the official Windows installer `.exe` or `.msi` into Downloads, "
+            "wait until the download is complete, and end this step only when the installer file exists in Downloads and is non-empty. "
             "Do only this chunk. Do not skip ahead to later chunks."
         ),
         execution_style="gui_first",
