@@ -4703,8 +4703,31 @@ def _context_path_expr_for_flow(
     return 'Path.home() / "Downloads" / "computer-use-agent-context.json"'
 
 
+def _source_task_scope_for_prompt(prompt_text: str) -> tuple[str, str]:
+    prompt = str(prompt_text or "")
+    for pattern in (
+        r"top-level source task for this run:\s*(.+?)(?:\n|$)",
+        r"from this task:\s*(.+?)(?:[.,]\s|\n|$)",
+        r"source task:\s*(.+?)(?:[.,]\s|\n|$)",
+        r"source_task\"\s*:\s*\"(.+?)\"",
+    ):
+        match = re.search(pattern, prompt, flags=re.IGNORECASE)
+        if not match:
+            continue
+        normalized = re.sub(r"\s+", " ", str(match.group(1) or "")).strip().strip(".,")
+        if not normalized:
+            continue
+        basis = "source_task:" + normalized
+        prompt_key = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
+        return prompt_key, f"source_task={normalized}"[:240]
+    return "", ""
+
+
 def _context_prompt_key_for_request(request: StepRequest | None) -> tuple[str, str]:
     raw_prompt = str(getattr(request, "user_prompt", "") or "")
+    source_prompt_key, source_excerpt = _source_task_scope_for_prompt(raw_prompt)
+    if source_prompt_key:
+        return source_prompt_key, source_excerpt
     normalized_prompt = re.sub(r"\s+", " ", raw_prompt).strip()
     if not normalized_prompt:
         return "", ""
@@ -4723,6 +4746,9 @@ def _context_prompt_key_for_target_terms(
     request: StepRequest | None,
     target_terms: list[str] | tuple[str, ...],
 ) -> tuple[str, str]:
+    source_prompt_key, source_excerpt = _source_task_scope_for_prompt(str(getattr(request, "user_prompt", "") or ""))
+    if source_prompt_key:
+        return source_prompt_key, source_excerpt
     normalized_terms: list[str] = []
     for value in target_terms:
         token = re.sub(r"\s+", " ", str(value or "").strip().lower())
@@ -5636,7 +5662,12 @@ def _target_process_running() -> bool:
     return False
 
 def write_marker(exe_path: Path) -> None:
-    payload = {{"installed_exe": str(exe_path)}}
+    payload = {{
+        "installed_exe": str(exe_path),
+        "target_keywords": TARGET_KEYWORDS,
+        "prompt_key": CONTEXT_PROMPT_KEY,
+        "prompt_excerpt": CONTEXT_PROMPT_EXCERPT,
+    }}
     with open(MARKER_PATH, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
 
@@ -6368,12 +6399,23 @@ def _launch_executable(exe_path: Path) -> None:
         subprocess.Popen([str(exe_path)])
 
 def write_launch_marker(exe_path: Path) -> None:
-    payload = {{"launched_exe": str(exe_path), "process_name": exe_path.name}}
+    payload = {{
+        "launched_exe": str(exe_path),
+        "process_name": exe_path.name,
+        "target_keywords": TARGET_KEYWORDS,
+        "prompt_key": CONTEXT_PROMPT_KEY,
+        "prompt_excerpt": CONTEXT_PROMPT_EXCERPT,
+    }}
     with open(LAUNCH_MARKER_PATH, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 def write_install_marker(exe_path: Path) -> None:
-    payload = {{"installed_exe": str(exe_path)}}
+    payload = {{
+        "installed_exe": str(exe_path),
+        "target_keywords": TARGET_KEYWORDS,
+        "prompt_key": CONTEXT_PROMPT_KEY,
+        "prompt_excerpt": CONTEXT_PROMPT_EXCERPT,
+    }}
     with open(INSTALL_MARKER_PATH, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
 
@@ -10047,7 +10089,28 @@ def _is_low_signal_target_keyword(value: str) -> bool:
         "offers",
         "bundle",
         "bundled",
+        "가",
+        "것",
+        "그것",
+        "같은",
+        "있으면",
+        "있고",
+        "우선",
+        "우선하고",
+        "설치용",
+        "windows용",
+        "정도만",
+        "짧게",
+        "사용하세요",
+        "저장하세요",
+        "받으세요",
+        "실제로",
+        "존재한다",
     }:
+        return True
+    if re.search(r"[가-힣]", cleaned) and cleaned.endswith(
+        ("하세요", "마세요", "됩니다", "합니다", "하고", "하면", "있으면", "있고")
+    ):
         return True
     if re.fullmatch(r"(?:32|64)(?:bit)?", cleaned):
         return True
@@ -10466,8 +10529,11 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
     for match in re.finditer(r"`([^`]+)`", prompt_for_keywords):
         candidate = str(match.group(1) or "").strip()
         lowered = candidate.lower()
+        candidate_words = re.findall(r"[a-z0-9가-힣][a-z0-9가-힣._-]{1,}", lowered)
         if (
             not candidate
+            or "\n" in candidate
+            or len(candidate) > 80
             or "/" in candidate
             or "\\" in candidate
             or "." in candidate
@@ -10477,6 +10543,7 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
             or ")" in candidate
             or "helper" in lowered
             or "click_" in lowered
+            or len(candidate_words) > 5
             or lowered in {"zip", "archive", "portable"}
         ):
             continue
@@ -13244,13 +13311,13 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         "    previous_install = _read_json(INSTALL_MARKER)",
         "    preserved_installer = installer_path or previous_context.get('installer_path') or previous_install.get('installer_path')",
         "    preserved_source_url = previous_context.get('source_url') or previous_install.get('source_url')",
-        "    payload = {'installed_exe': str(exe), 'target_keywords': TARGET_TERMS}",
+        "    payload = {'installed_exe': str(exe), 'target_keywords': TARGET_TERMS, 'prompt_key': CONTEXT_PROMPT_KEY, 'prompt_excerpt': CONTEXT_PROMPT_EXCERPT}",
         "    if preserved_installer:",
         "        payload['installer_path'] = str(preserved_installer)",
         "    if preserved_source_url:",
         "        payload['source_url'] = str(preserved_source_url)",
         "    INSTALL_MARKER.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')",
-        "    context_payload = {'installed_exe': str(exe), 'target_keywords': TARGET_TERMS}",
+        "    context_payload = {'installed_exe': str(exe), 'target_keywords': TARGET_TERMS, 'prompt_key': CONTEXT_PROMPT_KEY, 'prompt_excerpt': CONTEXT_PROMPT_EXCERPT}",
         "    if preserved_installer:",
         "        context_payload['installer_path'] = str(preserved_installer)",
         "    if preserved_source_url:",
@@ -13484,10 +13551,10 @@ def _synthesized_model_ui_launch_recovery_code(request: StepRequest) -> str:
         "print(f'launched process running={running}: {exe.name}')",
         "if not running:",
         "    raise SystemExit(f'launched app process did not appear: {exe.name}')",
-        "payload = {'launched_exe': str(exe), 'installed_exe': str(exe), 'target_keywords': TERMS}",
+        "payload = {'launched_exe': str(exe), 'installed_exe': str(exe), 'target_keywords': TERMS, 'prompt_key': CONTEXT_PROMPT_KEY, 'prompt_excerpt': CONTEXT_PROMPT_EXCERPT}",
         "LAUNCH_MARKER.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')",
         "if CONTEXT_MARKER.parent.exists():",
-        "    context_payload.update({'launch_exe': str(exe), 'installed_exe': str(exe), 'target_keywords': TERMS})",
+        "    context_payload.update({'launch_exe': str(exe), 'installed_exe': str(exe), 'target_keywords': TERMS, 'prompt_key': CONTEXT_PROMPT_KEY, 'prompt_excerpt': CONTEXT_PROMPT_EXCERPT})",
         "    CONTEXT_MARKER.write_text(json.dumps(context_payload, ensure_ascii=False, indent=2), encoding='utf-8')",
         "print(f'launch marker written: {LAUNCH_MARKER} -> {exe}')",
     ]

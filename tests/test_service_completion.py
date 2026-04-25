@@ -23,6 +23,8 @@ from computer_use_raw_python_agent.service import (
     _infer_response_done,
     _installer_filename_keywords,
     _coerce_model_bbox,
+    _context_prompt_key_for_request,
+    _context_prompt_key_for_target_terms,
     _model_ui_candidates_observation,
     _model_ui_ocr_elements_from_text,
     _model_ui_candidates_from_observation,
@@ -113,6 +115,46 @@ def test_model_ui_candidate_bbox_accepts_large_absolute_coordinates() -> None:
 def test_model_ui_search_result_bbox_keeps_qwen_grid_for_both_axes() -> None:
     assert _coerce_model_bbox([268, 312, 526, 338], image_size=(2560, 1440)) == (686, 449, 1347, 487)
     assert _coerce_model_bbox([282, 456, 376, 482], image_size=(2560, 1440)) == (722, 657, 963, 694)
+
+
+def test_context_prompt_key_uses_top_level_source_task_across_chunks() -> None:
+    download_request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n\n"
+            "Top-level source task for this run: filezilla 설치해줘\n\n"
+            "Download the installer into Downloads."
+        )
+    )
+    install_request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n\n"
+            "Top-level source task for this run: filezilla 설치해줘\n\n"
+            "Run the installer and complete setup."
+        )
+    )
+
+    download_key, download_excerpt = _context_prompt_key_for_request(download_request)
+    install_key, install_excerpt = _context_prompt_key_for_request(install_request)
+
+    assert download_key
+    assert download_key == install_key
+    assert download_excerpt == "source_task=filezilla 설치해줘"
+    assert install_excerpt == "source_task=filezilla 설치해줘"
+
+
+def test_context_prompt_key_for_target_terms_prefers_top_level_source_task() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n\n"
+            "Top-level source task for this run: 메모잇 설치해줘\n\n"
+            "Use these exact page URLs first."
+        )
+    )
+
+    key, excerpt = _context_prompt_key_for_target_terms(request, ["memoit193", "memoit"])
+
+    assert key
+    assert excerpt == "source_task=메모잇 설치해줘"
 
 
 def test_search_result_observation_clears_after_opened_result_candidate() -> None:
@@ -2071,6 +2113,7 @@ def test_synthesized_visible_installer_recovery_code_prefers_existing_visible_in
     assert "sftp" in code
     assert '"/appdata/local/temp/"' in code
     assert '"setup"' in code
+    assert '"prompt_key": CONTEXT_PROMPT_KEY' in code
     assert 'print(f"already installed: {existing}")' not in code
 
 
@@ -2300,6 +2343,7 @@ def test_synthesized_visible_launch_recovery_ignores_invalid_install_marker_and_
     assert "write_install_marker(exe_path)" in code
     assert "write_launch_marker(exe_path)" in code
     assert "write_action_context(" in code
+    assert '"prompt_key": CONTEXT_PROMPT_KEY' in code
 
 
 def test_synthesized_visible_launch_recovery_defaults_to_downloads_marker_and_prompt_targets() -> None:
@@ -3650,6 +3694,28 @@ def test_visible_flow_extra_targets_filters_model_ui_prompt_noise() -> None:
     keywords = _visible_flow_extra_targets(request, limit=6)
 
     assert keywords == ["filezilla"]
+
+
+def test_visible_flow_extra_targets_ignore_rogue_backtick_url_block_noise() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n\n"
+            "Explicit open-target page URLs for this chunk. Treat these exact URLs as the primary runtime open targets "
+            "before any generic search, and open them in order:\n"
+            "- https://mydev.kr/`\n"
+            "- https://mydev.kr/\n\n"
+            "공식 사이트 `mydev.kr`에서 Windows용 메모잇 설치 파일 `setup_memoit193.exe`를 내려받아 `Downloads` 폴더에 저장하세요. "
+            "페이지에서 보이는 공식 다운로드 링크를 우선 사용하고, 반드시 `.exe` 또는 `.msi` 설치 파일만 받으세요."
+        ),
+        execution_style="gui_first",
+    )
+
+    keywords = _visible_flow_extra_targets(request, limit=8)
+
+    assert keywords[:3] == ["메모잇", "memoit193", "memoit"]
+    assert "가" not in keywords
+    assert "있으면" not in keywords
+    assert "그것" not in keywords
 
 
 def test_runtime_helper_download_official_installer_allows_keyword_matched_official_cross_domain() -> None:
