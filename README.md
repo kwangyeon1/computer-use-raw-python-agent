@@ -258,8 +258,9 @@ Codex wrapper prompt는 아래 문맥만 유지하도록 줄였습니다.
   - 예: `http://127.0.0.1:8080`
 - `searxng_preferred_engines`
   - 기본값은 `["google"]` 입니다.
-  - agent는 먼저 `google` 엔진으로 검색하고, 결과가 비면 SearXNG 전체 엔진 결과로 fallback 합니다.
-  - 같은 응답 안에 여러 엔진 결과가 섞여 있으면 `google` 결과를 앞쪽에 우선 배치합니다.
+  - agent는 SearXNG 호출 시 항상 `engines=google`만 사용합니다.
+  - config나 CLI에서 다른 preferred engine을 넘겨도 현재 런타임에서는 `google`로 정규화됩니다.
+  - Google 결과가 비어도 SearXNG 전체 엔진 fallback은 하지 않습니다.
 - `web_search_decision_use_image`
   - 기본값은 `false` 입니다.
   - 웹검색 필요 여부를 판단하는 decision 서브콜에서 스크린샷 이미지를 입력으로 쓰지 않습니다.

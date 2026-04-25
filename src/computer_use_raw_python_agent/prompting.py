@@ -33,10 +33,6 @@ Avoid docstrings and explanatory comments unless absolutely necessary.
 Do not stop after imports, variable setup, or print statements; perform the task in the same script.
 Prefer helper functions when possible:
 - open_url_and_wait
-- ocr_screen_text_regions
-- click_text_targets
-- click_download_like_target
-- open_responsive_header_menu
 - focus_window
 - press_key
 - press_hotkey
@@ -50,6 +46,14 @@ Prefer helper functions when possible:
 If helper functions are not sufficient, direct library usage is allowed.
 Always generate code that can run as a standalone script.
 When using keyboard automation, pay attention to the currently focused window and the active input locale / IME (for example Korean vs English) before typing.
+For visible UI work, rely on the screenshot provided to the local model. Do not call executor-side OCR/text-click helpers such as `ocr_screen_text_regions`, `click_text_targets`, `click_download_like_target`, or `open_responsive_header_menu`; those helpers are deprecated for new generations.
+If observation_text contains `MODEL_VISIBLE_UI_CANDIDATES`, those candidates were produced from the same screenshot by the local model, not by executor OCR. Prefer the listed click_point coordinates for visible buttons/links before inventing new coordinates.
+When a visible button or link needs to be clicked, estimate its coordinates from the screenshot and use Python GUI automation such as pyautogui, ctypes mouse events, or keyboard navigation. If a coordinate click does not visibly progress, choose a different candidate in the next step instead of using OCR helper fallbacks.
+Do not use `pyautogui.locateOnScreen("some_label.png")` or similar image-template calls unless the script itself creates that image file first. Visible text labels are not local image files.
+When a browser page or search results page is visible, prefer page-body links, result titles, and download buttons over the Windows taskbar, dock, pinned app icons, browser tabs, address bar, bookmarks bar, or blank page margins.
+Do not click browser URL-looking text as a download/install target, even when the URL contains words such as download, install, setup, or the app name. Use the address bar only when intentionally navigating to a new page.
+On a browser search results page, prefer result titles or links whose visible text matches the task target token or a plausible vendor/product domain. Avoid app-store or account/login results unless the task explicitly asks for them.
+If you need a browser search, use a short keyword query such as the product name plus one platform hint. Do not type a full-sentence query, long exclusion filters, or repetitive boilerplate like `official windows download` unless the current page context specifically requires it.
 
 State-inspection discipline:
 - If the current UI state is uncertain, prefer gathering state programmatically before clicking blind coordinates.
@@ -58,11 +62,11 @@ State-inspection discipline:
 - For Windows software installation tasks, prefer deterministic non-GUI mechanisms first when available: package managers such as winget, direct file download to disk, subprocess-based launches, and filesystem/process verification.
 - For download tasks, stay inside Python when possible. Prefer `urllib.request`, `requests`, regex/HTML parsing, and normal Python file I/O over shell-only tools such as `curl`, `wget`, `powershell Invoke-WebRequest`, or launching a local `http.server` helper.
 - On Windows, when writing into user profile paths such as Downloads or Desktop, resolve them with `os.environ`, `Path.home()`, or `os.path.expandvars`. Do not use a literal `%USERPROFILE%` or `%TEMP%` token as an unexpanded path segment.
-- For download tasks, if an official URL is already known from the current page, previous step, or web_search_context, prefer downloading the target file directly into the user's Downloads folder and then verifying the file exists with a plausible size.
-- If the current prompt, current page, or web_search_context already provides one or more official vendor URLs, fetch those exact URLs first before inventing a nearby host, shortened domain, or guessed `latest` path.
+- For download tasks, if a concrete download or vendor URL is already known from the current page, previous step, or web_search_context, prefer downloading the target file directly into the user's Downloads folder and then verifying the file exists with a plausible size.
+- If the current prompt, current page, or web_search_context already provides one or more concrete vendor or download URLs, fetch those exact URLs first before inventing a nearby host, shortened domain, or guessed `latest` path.
 - If a browser already shows search results or a vendor page, use the visible result, current page state, or web_search_context. Do not invent or guess a download URL that is not evidenced by the current screenshot, last_execution, or web_search_context.
-- Prefer official vendor domains and direct artifact URLs. Avoid SEO mirror or third-party download hosts unless the latest evidence clearly shows they are the official source.
-- For download/install tasks, use a deterministic sequence when possible: obtain the official installer, verify the file exists, launch it, detect installer windows, advance the installer, then verify the installed app or executable exists.
+- Prefer relevant vendor/product/download pages and direct artifact URLs that are supported by the current screenshot, current page, prompt URLs, or web_search_context. Avoid obviously unrelated SEO, store, login, or help pages.
+- For download/install tasks, use a deterministic sequence when possible: obtain the installer, verify the file exists, launch it, detect installer windows, advance the installer, then verify the installed app or executable exists.
 - For download/install tasks, avoid long helper scaffolding. Prefer immediate top-level statements and at most one short helper only when absolutely necessary.
 - For download/install tasks, do not spend most of the response on reusable abstractions, docstrings, or utility wrappers before the first real network/file/process action.
 - For download/install tasks, keep imports minimal and start real network, file, or process work within roughly the first 25 lines.
@@ -93,11 +97,11 @@ State-inspection discipline:
   `    ...locate <app>.exe...`
   `subprocess.Popen([str(app_exe)])`
   `...verify process...`
-- If a direct installer URL returns 404, not found, or another download error, do not guess a nearby filename pattern. Fetch the known official page HTML or current vendor page and extract a fresh official `.exe` link from that source before retrying.
-- Do not treat guessed artifact directories such as `/files/latest`, `/download/latest`, or similar patterns as HTML pages unless that exact URL was already linked from fetched official vendor HTML or provided as an official URL in the prompt/context.
-- If a vendor landing page does not expose a raw installer link, try at least one alternate official page or official release page in the same Python script before giving up.
+- If a direct installer URL returns 404, not found, or another download error, do not guess a nearby filename pattern. Fetch the known page HTML or current vendor page and extract a fresh `.exe` link from that source before retrying.
+- Do not treat guessed artifact directories such as `/files/latest`, `/download/latest`, or similar patterns as HTML pages unless that exact URL was already linked from fetched vendor HTML or provided as a concrete URL in the prompt/context.
+- If a landing page does not expose a raw installer link, try at least one alternate relevant page in the same Python script before giving up.
 - When extracting installer URLs from HTML, do not search only for `href="..."`. Also scan the full HTML/text for absolute `https://...exe` candidates and verify candidate URLs with a real HTTP request before choosing one.
-- When a vendor page contains relative download links, resolve them against the fetched official page with `urllib.parse.urljoin` before filtering or downloading.
+- When a page contains relative download links, resolve them against the fetched page with `urllib.parse.urljoin` before filtering or downloading.
 - Do not assume installer URLs contain a version number or match only digit-heavy regex patterns. Accept relative or absolute official `.exe` links when they resolve cleanly.
 - If the previous attempt failed because an external download tool was missing or hung, do not switch to another external tool. Use a pure-Python HTTP request plus HTML parsing flow instead.
 - If a browser already shows a completed download, prefer interacting with the downloaded file path directly instead of repeatedly clicking browser download UI.
@@ -131,6 +135,9 @@ If replan_requested is true:
 - Generate a materially different next step.
 - Use the latest screenshot and last_execution as the primary basis for the new strategy.
 - Do not repeat the same mechanism unless the screen state clearly changed and justifies it.
+- For gui_first browser/download replans, if the relevant page is still visible, keep using that same page/tab before opening a new site, search, or guessed direct URL.
+- If a previous coordinate click did not visibly progress, do not reuse that same point first. Prefer a few distinct candidate clicks from the current page content area and check for visible progress or a download artifact after each candidate.
+- Do not treat the browser toolbar, address bar, tab strip, bookmarks bar, Windows taskbar, dock, pinned app icons, or blank page margins as download/install click targets.
 
 If web_search_context is present:
 - Treat it as read-only external information gathered from web search.
@@ -150,14 +157,19 @@ GUI_FIRST_EXECUTION_APPEND = """
 Execution style: gui_first
 - Continue returning executable Python only, but prefer browser/UI-driven progression when relevant UI is already visible.
 - When a browser page, search results page, vendor page, installer wizard, UAC prompt, or completion dialog is already on screen, prefer advancing that visible state before bypassing it with a fresh direct download or silent install attempt.
-- When a visible page likely contains a download or installer control, prefer OCR-grounded helpers such as `click_download_like_target()` or `click_text_targets([...])` before switching to HTTP fetching or HTML parsing.
-- If the visible page appears to use a collapsed or responsive navigation header and the download control is not yet visible, prefer opening that visible menu with `open_responsive_header_menu()` before falling back to fresh network discovery.
+- When a visible page likely contains a download or installer control, use the model-visible screenshot to choose coordinates or keyboard actions. Do not call OCR/text-click helpers.
+- If `MODEL_VISIBLE_UI_CANDIDATES` is present during a gui_first browser/download step, click one of those page-content `click_point` candidates first. Do not switch to `urllib`, `requests`, HTML scraping, or direct artifact guessing until the visible candidates are exhausted or the UI clearly stalls.
+- If the visible page appears to use a collapsed or responsive navigation header and the download control is not yet visible, use screenshot-grounded GUI automation to open the menu or navigate it.
 - For download/install tasks, it is acceptable to navigate search results, click visible official download controls, use browser download UI, and drive installer dialogs like a user when that is the most grounded next action from the screenshot.
 - If the current screenshot or prompt indicates a grounded browser/download/installer UI path, do not switch to new urllib/requests HTML scraping, regex-based direct artifact discovery, or fresh silent-install shortcuts in the same step unless the latest execution clearly shows that visible UI path failed or stalled.
 - For install-launch chunks where the installer `.exe` is already present, do not start by retrying `/VERYSILENT`, `/SILENT`, `/SP-`, or `/NORESTART` unless the latest execution already proved a normal visible installer flow is impossible.
 - For gui_first install chunks, prefer this order: inspect visible installer/UAC/completion UI, advance that UI with Python GUI automation, then verify install paths or launch the installed app.
 - Use direct Python HTTP download, silent switches, or filesystem-only shortcuts only when there is no useful visible UI state or the visible UI path has clearly stalled.
 - Prefer continuing from the current browser/app/installer state instead of restarting the task from scratch.
+- On a gui_first retry where the page is already open, keep the same tab/page and try different visible page-content candidates before opening a fresh URL or search.
+- If one coordinate click fails to cause visible progress, try the next distinct candidate in the page content area instead of reusing the same point immediately.
+- Avoid toolbar/address/tab/bookmark/taskbar/dock areas when choosing browser click coordinates.
+- When opening a search page in gui_first, use only the core target keywords plus at most one short platform hint such as `pc` or `windows`.
 """
 
 REASONING_ENABLED_APPEND = """

@@ -15,8 +15,12 @@ def test_render_prompt_bundle_uses_gui_first_append() -> None:
     assert "Execution style: gui_first" in bundle.system_prompt
     assert "do not switch to new urllib/requests HTML scraping" in bundle.system_prompt
     assert "do not start by retrying `/VERYSILENT`, `/SILENT`, `/SP-`, or `/NORESTART`" in bundle.system_prompt
-    assert "click_download_like_target()" in bundle.system_prompt
-    assert "open_responsive_header_menu()" in bundle.system_prompt
+    assert "use the model-visible screenshot to choose coordinates" in bundle.system_prompt
+    assert "Do not call OCR/text-click helpers" in bundle.system_prompt
+    assert "keep the same tab/page and try different visible page-content candidates" in bundle.system_prompt
+    assert "Avoid toolbar/address/tab/bookmark areas when choosing browser click coordinates." in bundle.system_prompt
+    assert "click_download_like_target()" not in bundle.system_prompt
+    assert "open_responsive_header_menu()" not in bundle.system_prompt
     assert '"execution_style": "gui_first"' in bundle.user_prompt
 
 
