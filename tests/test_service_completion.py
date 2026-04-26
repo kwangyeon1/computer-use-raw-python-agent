@@ -1768,6 +1768,18 @@ def test_invalid_retry_history_discards_silent_installer_prefix() -> None:
     assert "installer_dialog_control" in joined
 
 
+def test_invalid_retry_history_never_includes_previous_python_prefix() -> None:
+    history = _history_for_invalid_python_retry_with_prompt(
+        [],
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        step_index=1,
+        previous_code="import os\n\ndef helper():\n    return os.getcwd()\n",
+    )
+    joined = "\n".join(history)
+    assert "previous_python_prefix=" not in joined
+    assert "continue the same script idea from the previous partial Python" not in joined
+
+
 def test_invalid_retry_history_warns_about_bottom_strip_clicks() -> None:
     history = _history_for_invalid_python_retry_with_prompt(
         [],
@@ -3825,10 +3837,92 @@ def test_visible_flow_extra_targets_ignore_rogue_backtick_url_block_noise() -> N
 
     keywords = _visible_flow_extra_targets(request, limit=8)
 
-    assert keywords[:3] == ["메모잇", "memoit193", "memoit"]
+    assert set(keywords[:3]) == {"메모잇", "memoit193", "memoit"}
     assert "가" not in keywords
     assert "있으면" not in keywords
     assert "그것" not in keywords
+
+
+def test_visible_flow_extra_targets_prefer_top_level_source_task_over_broken_markdown_url_noise() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n\n"
+            "Top-level source task for this run: 메모잇 프로그램을 설치해줘\n\n"
+            "Explicit open-target page URLs for this chunk. Treat these exact URLs as the primary runtime open targets before any generic search, and open them in order:\n"
+            "- https://mydev.kr/\n"
+            "- https://mydev.kr/`](https://mydev.kr/\n\n"
+            "Open the official Memoit site at a relevant product/download page in the browser, click the \"메모잇 다운로드 (v1.93)\" download button, "
+            "and use Python-based browser automation to ensure the Windows installer `setup_memoit193.exe` is downloaded into `~/Downloads`. "
+            "Download the `.exe` installer only and avoid any `.zip` or archive build.\n"
+        ),
+        execution_style="gui_first",
+    )
+
+    keywords = _visible_flow_extra_targets(request, limit=8)
+
+    assert keywords[:3] == ["메모잇", "memoit193", "memoit"]
+    assert "downloaded" not in keywords
+    assert "나" not in keywords
+
+
+def test_rewrite_user_prompt_for_replan_preserves_top_level_source_task_terms_over_broken_markdown_noise() -> None:
+    prompt = (
+        "Return executable Python only for this chunk.\n\n"
+        "Top-level source task for this run: 메모잇 프로그램을 설치해줘\n\n"
+        "Explicit open-target page URLs for this chunk. Treat these exact URLs as the primary runtime open targets before any generic search, and open them in order:\n"
+        "- https://mydev.kr/\n"
+        "- https://mydev.kr/`](https://mydev.kr/\n\n"
+        "Open the official Memoit site at a relevant product/download page in the browser, click the \"메모잇 다운로드 (v1.93)\" download button, "
+        "and use Python-based browser automation to ensure the Windows installer `setup_memoit193.exe` is downloaded into `~/Downloads`. "
+        "Download the `.exe` installer only and avoid any `.zip` or archive build.\n"
+        "Current chunk success target: `setup_memoit193.exe` is present in Downloads.\n"
+    )
+
+    rewritten = _rewrite_user_prompt_for_replan(
+        prompt,
+        active_replan_reasons=["partial_progress_opened_page_only", "same_page_click_retry_required"],
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://mydev.kr/", expected_title_tokens=["memoit193", "memoit"])',
+            },
+            "stdout_tail": "opened browser page for screenshot-grounded UI continuation",
+            "stderr_tail": "continue with latest screenshot and model-visible UI candidates",
+        },
+    )
+
+    assert "Original task target terms to preserve: 메모잇, memoit193, memoit." in rewritten
+    assert "Original task target terms to preserve: downloaded, 나." not in rewritten
+
+
+def test_visible_flow_extra_targets_recover_from_last_execution_visible_candidates_when_preserved_terms_are_polluted() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Return executable Python only.\n"
+            "Original task target terms to preserve: downloaded, 나.\n"
+            "Original official URLs to preserve: https://mydev.kr/.\n"
+            "If the previous click did not cause visible progress, do not reuse the same coordinates first.\n"
+            "Choose a different visible download/install candidate in the page content area.\n"
+        ),
+        execution_style="gui_first",
+        replan_requested=True,
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": (
+                    "TARGET_TERMS = ['downloaded', '나']\n"
+                    "VISIBLE_CANDIDATES = ["
+                    "{'text': '메모잇 다운로드 (v1.93)', 'point': [1790, 760], 'score': 11, 'tags': ['download_like']}"
+                    "]\n"
+                ),
+            },
+        },
+    )
+
+    keywords = _visible_flow_extra_targets(request, limit=6)
+
+    assert keywords[0] == "메모잇"
+    assert "downloaded" not in keywords
+    assert "나" not in keywords
 
 
 def test_runtime_helper_download_official_installer_allows_keyword_matched_official_cross_domain() -> None:

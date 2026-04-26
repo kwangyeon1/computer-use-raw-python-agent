@@ -4716,20 +4716,27 @@ def _context_path_expr_for_flow(
     return 'Path.home() / "Downloads" / "computer-use-agent-context.json"'
 
 
-def _source_task_scope_for_prompt(prompt_text: str) -> tuple[str, str]:
+_SOURCE_TASK_PROMPT_PATTERNS = (
+    r"top-level source task for this run:\s*(.+?)(?:\n|$)",
+    r"from this task:\s*(.+?)(?:[.,]\s|\n|$)",
+    r"source task:\s*(.+?)(?:[.,]\s|\n|$)",
+    r"source_task\"\s*:\s*\"(.+?)\"",
+)
+
+
+def _iter_source_task_prompt_segments(prompt_text: str) -> list[str]:
     prompt = str(prompt_text or "")
-    for pattern in (
-        r"top-level source task for this run:\s*(.+?)(?:\n|$)",
-        r"from this task:\s*(.+?)(?:[.,]\s|\n|$)",
-        r"source task:\s*(.+?)(?:[.,]\s|\n|$)",
-        r"source_task\"\s*:\s*\"(.+?)\"",
-    ):
-        match = re.search(pattern, prompt, flags=re.IGNORECASE)
-        if not match:
-            continue
-        normalized = re.sub(r"\s+", " ", str(match.group(1) or "")).strip().strip(".,")
-        if not normalized:
-            continue
+    segments: list[str] = []
+    for pattern in _SOURCE_TASK_PROMPT_PATTERNS:
+        for match in re.finditer(pattern, prompt, flags=re.IGNORECASE):
+            normalized = re.sub(r"\s+", " ", str(match.group(1) or "")).strip().strip(".,")
+            if normalized:
+                segments.append(normalized)
+    return segments
+
+
+def _source_task_scope_for_prompt(prompt_text: str) -> tuple[str, str]:
+    for normalized in _iter_source_task_prompt_segments(prompt_text):
         basis = "source_task:" + normalized
         prompt_key = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
         return prompt_key, f"source_task={normalized}"[:240]
@@ -6768,15 +6775,6 @@ def _history_for_empty_retry(history: list[str], *, step_index: int) -> list[str
     return retry_history
 
 
-def _compact_previous_python_for_retry(code: str, *, max_chars: int = 1200) -> str:
-    normalized = _normalize_python_code(code)
-    if len(normalized) <= max_chars:
-        return normalized
-    head_limit = max_chars // 2
-    tail_limit = max_chars - head_limit - 5
-    return normalized[:head_limit].rstrip() + "\n...\n" + normalized[-tail_limit:].lstrip()
-
-
 def _history_for_invalid_python_retry(history: list[str], *, step_index: int, previous_code: str | None = None) -> list[str]:
     retry_history = _history_for_step(history)
     retry_history.append(f"step-{step_index:03d}_invalid_python_generation=1")
@@ -6798,12 +6796,6 @@ def _history_for_invalid_python_retry(history: list[str], *, step_index: int, pr
     retry_history.append(
         "system_hint=do not emit import-only or setup-only code; import only modules you use and start doing the actual task within the first 25 lines"
     )
-    compact_previous = _compact_previous_python_for_retry(previous_code or "")
-    if compact_previous:
-        retry_history.append(
-            "system_hint=continue the same script idea from the previous partial Python below; return the full finished script from the beginning, not only the missing tail"
-        )
-        retry_history.append(f"previous_python_prefix=\n{compact_previous}")
     return retry_history
 
 
@@ -7690,15 +7682,8 @@ def _rewrite_user_prompt_for_replan(
         or optional_gui_dependency_failure
     )
     source_task_hint = ""
-    for pattern in (
-        r"from this task:\s*(.+?)(?:[.,]\s|\n|$)",
-        r"source task:\s*(.+?)(?:[.,]\s|\n|$)",
-        r"source_task\"\s*:\s*\"(.+?)\"",
-    ):
-        match = re.search(pattern, prompt, flags=re.IGNORECASE)
-        if not match:
-            continue
-        source_task_hint = re.sub(r"\s+", " ", str(match.group(1) or "")).strip().strip(".,")
+    for source_task_segment in _iter_source_task_prompt_segments(prompt):
+        source_task_hint = source_task_segment
         if source_task_hint:
             break
     override_lines = [
@@ -8969,13 +8954,8 @@ def _fallback_browser_search_url_for_request(
         if explicit_installer:
             source_keywords.extend(_installer_filename_keywords(explicit_installer, limit=4))
 
-        for pattern in (
-            r"from this task:\s*(.+?)(?:[.,]\s|\n|$)",
-            r"source task:\s*(.+?)(?:[.,]\s|\n|$)",
-            r"source_task\"\s*:\s*\"(.+?)\"",
-        ):
-            for match in re.finditer(pattern, prompt_for_search, flags=re.IGNORECASE):
-                source_keywords.extend(_prompt_keyword_candidates(match.group(1), limit=4))
+        for segment in _iter_source_task_prompt_segments(prompt_for_search):
+            source_keywords.extend(_prompt_keyword_candidates(segment, limit=4))
 
         source_keywords.extend(_expected_title_tokens_from_code(last_execution_code))
 
@@ -10028,10 +10008,8 @@ def _prompt_keyword_candidates(text: str, *, limit: int = 12) -> list[str]:
         return cleaned
 
     task_segments: list[str] = []
+    task_segments.extend(_iter_source_task_prompt_segments(raw_text))
     for pattern in (
-        r"from this task:\s*(.+?)(?:[.,]\s|\n|$)",
-        r"source task:\s*(.+?)(?:[.,]\s|\n|$)",
-        r"source_task\"\s*:\s*\"(.+?)\"",
         r"original task target terms to preserve:\s*(.+?)(?:[.\n]|$)",
         r"original target terms to preserve:\s*(.+?)(?:[.\n]|$)",
     ):
@@ -10181,7 +10159,10 @@ def _is_low_signal_target_keyword(value: str) -> bool:
         "받으세요",
         "실제로",
         "존재한다",
+        "downloaded",
     }:
+        return True
+    if re.fullmatch(r"[가-힣]", cleaned):
         return True
     if re.search(r"[가-힣]", cleaned) and cleaned.endswith(
         ("하세요", "마세요", "됩니다", "합니다", "하고", "하면", "있으면", "있고")
@@ -10588,6 +10569,11 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
         last_execution_code,
         ("TARGET_TERMS", "target_terms", "TARGET_KEYWORDS", "target_keywords"),
     )
+    last_execution_candidate_texts = [
+        str(candidate.get("text") or "").strip()
+        for candidate in _last_execution_visible_candidates(request.last_execution)
+        if str(candidate.get("text") or "").strip()
+    ]
     last_execution_title_tokens: list[str] = []
     for title_match in re.finditer(r"expected_title_tokens\s*=\s*\[(.*?)\]", last_execution_code, flags=re.S):
         for token_match in re.findall(r'"([^"]+)"|\'([^\']+)\'', str(title_match.group(1) or "")):
@@ -10596,15 +10582,7 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
                 last_execution_title_tokens.append(token)
     task_segments: list[str] = []
     preserved_target_segments: list[str] = []
-    for pattern in (
-        r"from this task:\s*(.+?)(?:[.,]\s|\n|$)",
-        r"source task:\s*(.+?)(?:[.,]\s|\n|$)",
-        r"source_task\"\s*:\s*\"(.+?)\"",
-    ):
-        task_segments.extend(
-            match.group(1)
-            for match in re.finditer(pattern, prompt_for_keywords, flags=re.IGNORECASE)
-        )
+    task_segments.extend(_iter_source_task_prompt_segments(prompt_for_keywords))
     for pattern in (
         r"original task target terms to preserve:\s*(.+?)(?:[.\n]|$)",
         r"original target terms to preserve:\s*(.+?)(?:[.\n]|$)",
@@ -10640,18 +10618,19 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
     for source_text in (
         " ".join(task_segments),
         " ".join(last_execution_title_tokens),
+        " ".join(last_execution_candidate_texts),
     ):
         for keyword in _prompt_keyword_candidates(str(source_text or ""), limit=limit):
             if _append_keyword(keyword, authoritative=True, keep_generic=True):
                 return merged
-    for keyword in _prompt_keyword_candidates(" ".join(quoted_task_segments), limit=limit):
-        if _append_keyword(keyword, authoritative=True):
-            return merged
     explicit_installer = _extract_prompt_download_glob(prompt_for_keywords)
     if explicit_installer:
         for explicit_keyword in _installer_filename_keywords(explicit_installer, limit=limit):
             if _append_keyword(explicit_keyword, supplemental=True, keep_generic=True):
                 return merged
+    for keyword in _prompt_keyword_candidates(" ".join(quoted_task_segments), limit=limit):
+        if _append_keyword(keyword, authoritative=True):
+            return merged
     for keyword in last_execution_target_terms:
         if _append_keyword(keyword, supplemental=True, keep_generic=True):
             return merged[:limit]
@@ -12318,9 +12297,11 @@ def _last_execution_visible_candidates(last_execution: dict[str, Any]) -> list[d
     if not isinstance(payload_metadata, dict):
         return []
     agent_response = payload_metadata.get("agent_response")
-    if not isinstance(agent_response, dict):
-        return []
-    code = str(agent_response.get("python_code") or "")
+    code = ""
+    if isinstance(agent_response, dict):
+        code = str(agent_response.get("python_code") or "")
+    if not code:
+        code = str(payload_metadata.get("executed_python_code") or "")
     if "VISIBLE_CANDIDATES" not in code:
         return []
     try:
