@@ -10158,6 +10158,12 @@ def _is_low_signal_target_keyword(value: str) -> bool:
         "offers",
         "bundle",
         "bundled",
+        "stay",
+        "tab",
+        "guessed",
+        "irrelevant",
+        "blocked",
+        "broken",
         "가",
         "것",
         "그것",
@@ -10326,9 +10332,15 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
         "current",
         "page",
         "site",
+        "stay",
+        "tab",
         "official",
         "opened",
         "relevant",
+        "irrelevant",
+        "blocked",
+        "broken",
+        "guessed",
         "not",
         "execution-style",
         "executi",
@@ -10583,17 +10595,25 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
             if token:
                 last_execution_title_tokens.append(token)
     task_segments: list[str] = []
+    preserved_target_segments: list[str] = []
     for pattern in (
         r"from this task:\s*(.+?)(?:[.,]\s|\n|$)",
         r"source task:\s*(.+?)(?:[.,]\s|\n|$)",
         r"source_task\"\s*:\s*\"(.+?)\"",
-        r"original task target terms to preserve:\s*(.+?)(?:[.\n]|$)",
-        r"original target terms to preserve:\s*(.+?)(?:[.\n]|$)",
     ):
         task_segments.extend(
             match.group(1)
             for match in re.finditer(pattern, prompt_for_keywords, flags=re.IGNORECASE)
         )
+    for pattern in (
+        r"original task target terms to preserve:\s*(.+?)(?:[.\n]|$)",
+        r"original target terms to preserve:\s*(.+?)(?:[.\n]|$)",
+    ):
+        preserved_target_segments.extend(
+            match.group(1)
+            for match in re.finditer(pattern, prompt_for_keywords, flags=re.IGNORECASE)
+        )
+    task_segments.extend(preserved_target_segments)
     quoted_task_segments: list[str] = []
     for match in re.finditer(r"`([^`]+)`", prompt_for_keywords):
         candidate = str(match.group(1) or "").strip()
@@ -10635,6 +10655,15 @@ def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) 
     for keyword in last_execution_target_terms:
         if _append_keyword(keyword, supplemental=True, keep_generic=True):
             return merged[:limit]
+    if (
+        merged
+        and preserved_target_segments
+        and (
+            request.replan_requested
+            or prompt_for_keywords.lstrip().lower().startswith("replan override")
+        )
+    ):
+        return merged[:limit]
     prompt_urls_for_keywords = _extract_prompt_urls(prompt_for_keywords)
     if merged and (
         (request.replan_requested and not prompt_urls_for_keywords)
@@ -10925,9 +10954,9 @@ import urllib.request
 
 PROMPT_URLS = {json.dumps(prompt_urls, ensure_ascii=False)}
 KEYWORDS = {json.dumps(keyword_candidates, ensure_ascii=False)}
-FALLBACK_SEARCH_URL = {json.dumps(fallback_search_url, ensure_ascii=False)}
+FALLBACK_SEARCH_URL = {json.dumps(fallback_search_url, ensure_ascii=False) if fallback_search_url is not None else "None"}
 FALLBACK_ALTERNATE_SEARCH_URLS = {json.dumps(fallback_alternate_search_urls, ensure_ascii=False)}
-FALLBACK_LUCKY_URL = {json.dumps(fallback_lucky_url, ensure_ascii=False)}
+FALLBACK_LUCKY_URL = {json.dumps(fallback_lucky_url, ensure_ascii=False) if fallback_lucky_url is not None else "None"}
 FALLBACK_DOMAIN_URLS = {json.dumps(fallback_domain_urls, ensure_ascii=False)}
 USER_AGENT = "Mozilla/5.0"
 CONTEXT_PATH = Path.home() / "Downloads" / "computer-use-agent-context.json"
@@ -12607,7 +12636,20 @@ def _synthesized_model_ui_download_recovery_code(request: StepRequest) -> str:
         "    if not strict_terms:",
         "        return True",
         "    lowered = str(path_text or '').lower()",
-        "    return any(term in lowered for term in strict_terms)",
+        "    path_tokens = [token for token in re.split(r'[^a-z0-9]+', lowered) if token]",
+        "    for term in strict_terms:",
+        "        if term in lowered:",
+        "            return True",
+        "        term_root = re.sub(r'[^a-z0-9]+', '', term)",
+        "        for token in path_tokens:",
+        "            shared = 0",
+        "            for left, right in zip(term_root, token):",
+        "                if left != right:",
+        "                    break",
+        "                shared += 1",
+        "            if shared >= 5:",
+        "                return True",
+        "    return False",
         "",
         "def _normalize_search_query_text(query):",
         "    normalized = urllib.parse.unquote_plus(str(query or '')).strip().lower()",
@@ -12933,12 +12975,12 @@ def _synthesized_model_ui_download_recovery_code(request: StepRequest) -> str:
         "        except SystemExit as exc:",
         "            print(f'isolated recovery page did not find a stable installer: {exc}')",
         "            _record_failed_recovery_url(retry_source_url, exc)",
-        "            raise SystemExit('continue with latest screenshot and model-visible UI candidates after opening isolated recovery page')",
+        "            continue",
         "        except Exception as exc:",
         "            print(f'isolated recovery page recovery failed: {exc}')",
         "            _record_failed_recovery_url(retry_source_url, exc)",
-        "            raise SystemExit('continue with latest screenshot and model-visible UI candidates after opening isolated recovery page')",
-        "    return None",
+        "            continue",
+        "    raise SystemExit('continue with latest screenshot and model-visible UI candidates after exhausting isolated recovery pages')",
         "",
         "def _colored_cta_points():",
         "    try:",
@@ -13685,7 +13727,20 @@ def _synthesized_model_ui_browser_prelude_code(request: StepRequest) -> str:
         "    if not strict_terms:",
         "        return True",
         "    lowered = str(path_text or '').lower()",
-        "    return any(term in lowered for term in strict_terms)",
+        "    path_tokens = [token for token in re.split(r'[^a-z0-9]+', lowered) if token]",
+        "    for term in strict_terms:",
+        "        if term in lowered:",
+        "            return True",
+        "        term_root = re.sub(r'[^a-z0-9]+', '', term)",
+        "        for token in path_tokens:",
+        "            shared = 0",
+        "            for left, right in zip(term_root, token):",
+        "                if left != right:",
+        "                    break",
+        "                shared += 1",
+        "            if shared >= 5:",
+        "                return True",
+        "    return False",
         "",
         "def _record_existing_download(path_value, *, source_url=None):",
         "    write_action_context(",
