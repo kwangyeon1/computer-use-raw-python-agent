@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import urllib.parse
 
 import computer_use_raw_python_agent.service as service_module
@@ -451,6 +452,8 @@ These candidates come from local model visual extraction of the latest screensho
     assert "_extract_archive(" in code
     assert "msiexec.exe" in code
     assert "CONTEXT_MARKER.write_text" in code
+    assert "CONTEXT_PROMPT_KEY = " in code
+    assert "CONTEXT_PROMPT_EXCERPT = " in code
     assert "def _process_exists(name):" in code
     assert "def _avoid_failsafe():" in code
     assert "def _launch_installed_exe(exe):" in code
@@ -668,6 +671,7 @@ These candidates come from local model visual extraction of the latest screensho
     assert "_record_clicked_candidate(candidate, points[0])" in code
     assert "wait_for_recent_download_artifact(" in code
     assert "def _wait_for_download_progress(since_ts, timeout_s=6.0):" in code
+    assert "def _progress_download_targets(progress_path):" in code
     assert "def _is_success_exit(exc):" in code
     assert "download progress detected:" in code
     assert "extra_targets=None" not in code
@@ -677,6 +681,10 @@ These candidates come from local model visual extraction of the latest screensho
     assert "since_ts=(time.time() - 30.0)" in code
     assert "timeout_s=3.0" in code
     assert "timeout_s=45.0" in code
+    progress_hint_index = code.index("progress_targets = _progress_download_targets(progress)")
+    rescan_index = code.index("download = wait_for_recent_download_artifact(", progress_hint_index)
+    assert progress_hint_index < rescan_index
+    assert "extra_targets=[*progress_targets, *TARGET_TERMS]" in code
     assert "if _is_success_exit(exc):" in code
     assert "def _is_partial_progress_exit(exc):" in code
     assert "clicked all grounded points for all visible candidates without a stable download" in code
@@ -699,8 +707,10 @@ These candidates come from local model visual extraction of the latest screensho
     assert "download_official_installer_from_page(retry_source_url, extra_targets=TARGET_TERMS" in code
     assert "download recovered from isolated recovery page" in code
     assert "isolated recovery page recovery failed:" in code
+    assert "continue with latest screenshot and model-visible UI candidates after exhausting isolated recovery pages" in code
+    assert "isolated recovery page did not find a stable installer: {exc}')\n            _record_failed_recovery_url(retry_source_url, exc)\n            continue" in code
     assert (
-        "raise SystemExit('continue with latest screenshot and model-visible UI candidates after opening isolated recovery page')"
+        "raise SystemExit('continue with latest screenshot and model-visible UI candidates after exhausting isolated recovery pages')"
         in code
     )
     assert "\n    recovered = _try_download_from_isolated_recovery_page()" in code
@@ -715,9 +725,44 @@ These candidates come from local model visual extraction of the latest screensho
     assert "Memoit 다운로드" in code
     assert "CONTEXT_PROMPT_KEY = null" not in code
     assert "CONTEXT_PROMPT_KEY = \"\"" not in code
-    assert "CONTEXT_PROMPT_EXCERPT = \"target_terms=" in code
     assert "북마크" not in code
     assert "null" not in code
+
+
+def test_model_ui_download_recovery_path_match_accepts_shared_product_root(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Original task target terms to preserve: 카카오톡, kakaocorp, stay, tab, guessed, irrelevant, blocked, broken.\n"
+            "Use the visible download button and wait for a Windows installer in Downloads."
+        ),
+        execution_style="gui_first",
+        observation_text="""MODEL_VISIBLE_UI_CANDIDATES:
+{"screenshot_size":[1920,1080],"candidates":[
+  {"text":"카카오톡 다운로드","click_point":[1062,173],"reason_tags":["download_like","target_like"],"score":93}
+]}""",
+    )
+
+    target_terms = _visible_flow_extra_targets(request, limit=8)
+    assert "카카오톡" in target_terms
+    assert "stay" not in target_terms
+    assert "tab" not in target_terms
+    assert "guessed" not in target_terms
+    assert "irrelevant" not in target_terms
+    assert "blocked" not in target_terms
+    assert "broken" not in target_terms
+
+    code = _synthesized_model_ui_download_recovery_code(request)
+    assert "if shared >= 5:" in code
+    helper_source = "def _path_matches_reuse_target(path_text):" + code.split(
+        "def _path_matches_reuse_target(path_text):", 1
+    )[1].split("\ndef _normalize_search_query_text", 1)[0]
+    namespace = {"TARGET_TERMS": ["카카오톡", "kakaocorp"], "re": re}
+    exec(helper_source, namespace)
+
+    assert namespace["_path_matches_reuse_target"](r"C:\Users\user\Downloads\KakaoTalk_Setup.exe")
+    assert not namespace["_path_matches_reuse_target"](r"C:\Users\user\Downloads\Git-2.53.0-64-bit.exe")
 
 
 def test_search_url_exclusion_treats_platform_only_variants_as_repeated() -> None:
@@ -1730,6 +1775,18 @@ def test_invalid_retry_history_discards_silent_installer_prefix() -> None:
     assert "installer_dialog_control" in joined
 
 
+def test_invalid_retry_history_never_includes_previous_python_prefix() -> None:
+    history = _history_for_invalid_python_retry_with_prompt(
+        [],
+        user_prompt="Use Python to stay on the visible browser page and download only the Windows installer into Downloads.",
+        step_index=1,
+        previous_code="import os\n\ndef helper():\n    return os.getcwd()\n",
+    )
+    joined = "\n".join(history)
+    assert "previous_python_prefix=" not in joined
+    assert "continue the same script idea from the previous partial Python" not in joined
+
+
 def test_invalid_retry_history_warns_about_bottom_strip_clicks() -> None:
     history = _history_for_invalid_python_retry_with_prompt(
         [],
@@ -2311,6 +2368,8 @@ def test_model_ui_launch_recovery_selected_for_model_ui_launch_chunk(monkeypatch
     assert "INSTALL_MARKER" in code
     assert "LAUNCH_MARKER" in code
     assert "CONTEXT_MARKER" in code
+    assert "CONTEXT_PROMPT_KEY = " in code
+    assert "CONTEXT_PROMPT_EXCERPT = " in code
     assert "def _process_exists(name):" in code
     assert "launched process running=" in code
     assert "MARKER_HAYSTACK" in code
@@ -3787,10 +3846,92 @@ def test_visible_flow_extra_targets_ignore_rogue_backtick_url_block_noise() -> N
 
     keywords = _visible_flow_extra_targets(request, limit=8)
 
-    assert keywords[:3] == ["메모잇", "memoit193", "memoit"]
+    assert set(keywords[:3]) == {"메모잇", "memoit193", "memoit"}
     assert "가" not in keywords
     assert "있으면" not in keywords
     assert "그것" not in keywords
+
+
+def test_visible_flow_extra_targets_prefer_top_level_source_task_over_broken_markdown_url_noise() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n\n"
+            "Top-level source task for this run: 메모잇 프로그램을 설치해줘\n\n"
+            "Explicit open-target page URLs for this chunk. Treat these exact URLs as the primary runtime open targets before any generic search, and open them in order:\n"
+            "- https://mydev.kr/\n"
+            "- https://mydev.kr/`](https://mydev.kr/\n\n"
+            "Open the official Memoit site at a relevant product/download page in the browser, click the \"메모잇 다운로드 (v1.93)\" download button, "
+            "and use Python-based browser automation to ensure the Windows installer `setup_memoit193.exe` is downloaded into `~/Downloads`. "
+            "Download the `.exe` installer only and avoid any `.zip` or archive build.\n"
+        ),
+        execution_style="gui_first",
+    )
+
+    keywords = _visible_flow_extra_targets(request, limit=8)
+
+    assert keywords[:3] == ["메모잇", "memoit193", "memoit"]
+    assert "downloaded" not in keywords
+    assert "나" not in keywords
+
+
+def test_rewrite_user_prompt_for_replan_preserves_top_level_source_task_terms_over_broken_markdown_noise() -> None:
+    prompt = (
+        "Return executable Python only for this chunk.\n\n"
+        "Top-level source task for this run: 메모잇 프로그램을 설치해줘\n\n"
+        "Explicit open-target page URLs for this chunk. Treat these exact URLs as the primary runtime open targets before any generic search, and open them in order:\n"
+        "- https://mydev.kr/\n"
+        "- https://mydev.kr/`](https://mydev.kr/\n\n"
+        "Open the official Memoit site at a relevant product/download page in the browser, click the \"메모잇 다운로드 (v1.93)\" download button, "
+        "and use Python-based browser automation to ensure the Windows installer `setup_memoit193.exe` is downloaded into `~/Downloads`. "
+        "Download the `.exe` installer only and avoid any `.zip` or archive build.\n"
+        "Current chunk success target: `setup_memoit193.exe` is present in Downloads.\n"
+    )
+
+    rewritten = _rewrite_user_prompt_for_replan(
+        prompt,
+        active_replan_reasons=["partial_progress_opened_page_only", "same_page_click_retry_required"],
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'open_url_and_wait("https://mydev.kr/", expected_title_tokens=["memoit193", "memoit"])',
+            },
+            "stdout_tail": "opened browser page for screenshot-grounded UI continuation",
+            "stderr_tail": "continue with latest screenshot and model-visible UI candidates",
+        },
+    )
+
+    assert "Original task target terms to preserve: 메모잇, memoit193, memoit." in rewritten
+    assert "Original task target terms to preserve: downloaded, 나." not in rewritten
+
+
+def test_visible_flow_extra_targets_recover_from_last_execution_visible_candidates_when_preserved_terms_are_polluted() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Return executable Python only.\n"
+            "Original task target terms to preserve: downloaded, 나.\n"
+            "Original official URLs to preserve: https://mydev.kr/.\n"
+            "If the previous click did not cause visible progress, do not reuse the same coordinates first.\n"
+            "Choose a different visible download/install candidate in the page content area.\n"
+        ),
+        execution_style="gui_first",
+        replan_requested=True,
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": (
+                    "TARGET_TERMS = ['downloaded', '나']\n"
+                    "VISIBLE_CANDIDATES = ["
+                    "{'text': '메모잇 다운로드 (v1.93)', 'point': [1790, 760], 'score': 11, 'tags': ['download_like']}"
+                    "]\n"
+                ),
+            },
+        },
+    )
+
+    keywords = _visible_flow_extra_targets(request, limit=6)
+
+    assert keywords[0] == "메모잇"
+    assert "downloaded" not in keywords
+    assert "나" not in keywords
 
 
 def test_runtime_helper_download_official_installer_allows_keyword_matched_official_cross_domain() -> None:
@@ -3861,6 +4002,29 @@ def test_visible_flow_extra_targets_ignore_replan_failure_noise_words() -> None:
         },
     )
     assert _visible_flow_extra_targets(request, limit=8) == ["filezilla"]
+
+
+def test_visible_flow_extra_targets_preserved_terms_ignore_replan_control_sentence_noise() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Return executable Python only.\n"
+            "Original task target terms to preserve: 카카오톡.\n"
+            "Original official URLs to preserve: https://pc.kakao.com/talk/notices/ko/2983?agent=win32.\n"
+            "If the previous click did not cause visible progress, do not reuse the same coordinates first.\n"
+            "Choose a different visible download/install candidate in the page content area.\n"
+            "Previous stdout summary: isolated recovery page did not find a stable installer."
+        ),
+        execution_style="gui_first",
+        replan_requested=True,
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": 'TARGET_TERMS = ["카카오톡"]\nprint("retry download")',
+            }
+        },
+    )
+
+    assert _visible_flow_extra_targets(request, limit=8) == ["카카오톡"]
 
 
 def test_model_ui_installer_recovery_uses_strong_target_matching_for_short_tokens() -> None:
@@ -4287,7 +4451,7 @@ def test_official_download_recovery_disables_lucky_search_for_hangul_targets() -
         )
     )
 
-    assert "FALLBACK_LUCKY_URL = null" in code
+    assert "FALLBACK_LUCKY_URL = None" in code
     assert "FALLBACK_SEARCH_URL = \"https://www.google.com/search?" in code
 
 
