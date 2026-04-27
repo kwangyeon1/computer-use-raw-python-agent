@@ -12912,6 +12912,26 @@ def _synthesized_model_ui_download_recovery_code(request: StepRequest) -> str:
         "        time.sleep(0.5)",
         "    return None",
         "",
+        "def _progress_download_targets(progress_path):",
+        "    raw_name = Path(str(progress_path or '')).name.strip()",
+        "    if not raw_name:",
+        "        return []",
+        "    cleaned_name = raw_name",
+        "    partial_suffixes = ('.crdownload', '.part', '.partial', '.tmp')",
+        "    changed = True",
+        "    while changed:",
+        "        changed = False",
+        "        lowered = cleaned_name.lower()",
+        "        for suffix in partial_suffixes:",
+        "            if lowered.endswith(suffix) and len(cleaned_name) > len(suffix):",
+        "                cleaned_name = cleaned_name[:-len(suffix)]",
+        "                changed = True",
+        "                break",
+        "    stem = Path(cleaned_name).stem.strip()",
+        "    if not stem:",
+        "        return []",
+        "    return [stem]",
+        "",
         "def _is_success_exit(exc):",
         "    code = getattr(exc, 'code', exc)",
         "    return code in (0, None)",
@@ -13045,7 +13065,8 @@ def _synthesized_model_ui_download_recovery_code(request: StepRequest) -> str:
         "            if progress is None:",
         "                raise SystemExit('recent installer download did not appear')",
         "            print(f'download progress detected after colored CTA click: {progress}')",
-        "            download = wait_for_recent_download_artifact(extra_targets=TARGET_TERMS, min_bytes=1_000_000, timeout_s=45.0, since_ts=since_ts, require_target_match=True)",
+        "            progress_targets = _progress_download_targets(progress)",
+        "            download = wait_for_recent_download_artifact(extra_targets=[*progress_targets, *TARGET_TERMS], min_bytes=1_000_000, timeout_s=45.0, since_ts=since_ts, require_target_match=True)",
         "            _record_download(download)",
         "            return download",
         "        except SystemExit as exc:",
@@ -13100,8 +13121,9 @@ def _synthesized_model_ui_download_recovery_code(request: StepRequest) -> str:
         "                if progress is None:",
         "                    raise SystemExit('recent installer download did not appear')",
         "                print(f'download progress detected: {progress}')",
+        "                progress_targets = _progress_download_targets(progress)",
         "                download = wait_for_recent_download_artifact(",
-        "                    extra_targets=TARGET_TERMS,",
+        "                    extra_targets=[*progress_targets, *TARGET_TERMS],",
         "                    min_bytes=1_000_000,",
         "                    timeout_s=45.0,",
         "                    since_ts=download_started_at,",
@@ -13140,6 +13162,7 @@ def _synthesized_model_ui_download_recovery_code(request: StepRequest) -> str:
 def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
     candidates = _model_ui_candidates_from_observation(request.observation_text)
     target_terms = _visible_flow_extra_targets(request, limit=8)
+    context_prompt_key, context_prompt_excerpt = _context_prompt_key_for_target_terms(request, target_terms)
     reject_terms = ("cancel", "취소", "close", "닫기", "no", "아니")
     installer_control_terms_en = {
         "ok",
@@ -13210,6 +13233,8 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
             else "INSTALL_MARKER = Path.home() / 'Downloads' / 'install-success.json'"
         ),
         "CONTEXT_MARKER = Path.home() / 'Downloads' / 'computer-use-agent-context.json'",
+        f"CONTEXT_PROMPT_KEY = {json.dumps(context_prompt_key, ensure_ascii=False)}",
+        f"CONTEXT_PROMPT_EXCERPT = {json.dumps(context_prompt_excerpt, ensure_ascii=False)}",
         "DOWNLOADS = Path.home() / 'Downloads'",
         "ARCHIVE_SUFFIXES = ('.zip', '.alz')",
         "INSTALLER_SUFFIXES = ('.exe', '.msi')",
@@ -13510,6 +13535,7 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
 
 def _synthesized_model_ui_launch_recovery_code(request: StepRequest) -> str:
     target_terms = _visible_flow_extra_targets(request, limit=8)
+    context_prompt_key, context_prompt_excerpt = _context_prompt_key_for_target_terms(request, target_terms)
     install_marker = _extract_prompt_install_marker_path(request.user_prompt)
     launch_marker = _extract_prompt_launch_marker_path(request.user_prompt)
     lines = [
@@ -13532,6 +13558,8 @@ def _synthesized_model_ui_launch_recovery_code(request: StepRequest) -> str:
             else "LAUNCH_MARKER = Path.home() / 'Downloads' / 'launch-success.json'"
         ),
         "CONTEXT_MARKER = Path.home() / 'Downloads' / 'computer-use-agent-context.json'",
+        f"CONTEXT_PROMPT_KEY = {json.dumps(context_prompt_key, ensure_ascii=False)}",
+        f"CONTEXT_PROMPT_EXCERPT = {json.dumps(context_prompt_excerpt, ensure_ascii=False)}",
         "LAUNCH_MARKER.parent.mkdir(parents=True, exist_ok=True)",
         "CONTEXT_MARKER.parent.mkdir(parents=True, exist_ok=True)",
         "",

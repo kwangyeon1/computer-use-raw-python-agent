@@ -452,6 +452,8 @@ These candidates come from local model visual extraction of the latest screensho
     assert "_extract_archive(" in code
     assert "msiexec.exe" in code
     assert "CONTEXT_MARKER.write_text" in code
+    assert "CONTEXT_PROMPT_KEY = " in code
+    assert "CONTEXT_PROMPT_EXCERPT = " in code
     assert "def _process_exists(name):" in code
     assert "def _avoid_failsafe():" in code
     assert "def _launch_installed_exe(exe):" in code
@@ -669,6 +671,7 @@ These candidates come from local model visual extraction of the latest screensho
     assert "_record_clicked_candidate(candidate, points[0])" in code
     assert "wait_for_recent_download_artifact(" in code
     assert "def _wait_for_download_progress(since_ts, timeout_s=6.0):" in code
+    assert "def _progress_download_targets(progress_path):" in code
     assert "def _is_success_exit(exc):" in code
     assert "download progress detected:" in code
     assert "extra_targets=None" not in code
@@ -678,6 +681,10 @@ These candidates come from local model visual extraction of the latest screensho
     assert "since_ts=(time.time() - 30.0)" in code
     assert "timeout_s=3.0" in code
     assert "timeout_s=45.0" in code
+    progress_hint_index = code.index("progress_targets = _progress_download_targets(progress)")
+    rescan_index = code.index("download = wait_for_recent_download_artifact(", progress_hint_index)
+    assert progress_hint_index < rescan_index
+    assert "extra_targets=[*progress_targets, *TARGET_TERMS]" in code
     assert "if _is_success_exit(exc):" in code
     assert "def _is_partial_progress_exit(exc):" in code
     assert "clicked all grounded points for all visible candidates without a stable download" in code
@@ -2361,6 +2368,8 @@ def test_model_ui_launch_recovery_selected_for_model_ui_launch_chunk(monkeypatch
     assert "INSTALL_MARKER" in code
     assert "LAUNCH_MARKER" in code
     assert "CONTEXT_MARKER" in code
+    assert "CONTEXT_PROMPT_KEY = " in code
+    assert "CONTEXT_PROMPT_EXCERPT = " in code
     assert "def _process_exists(name):" in code
     assert "launched process running=" in code
     assert "MARKER_HAYSTACK" in code
