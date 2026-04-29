@@ -23,12 +23,18 @@ from computer_use_raw_python_agent.service import (
     _history_for_invalid_python_retry_with_prompt,
     _infer_response_done,
     _installer_filename_keywords,
+    _installer_recovery_target_terms,
+    _installer_launcher_pid_from_last_execution,
+    _installer_ui_candidates_from_observation,
+    _installer_ui_candidates_observation,
     _coerce_model_bbox,
+    _execution_screenshot_region_for_request,
     _context_prompt_key_for_request,
     _context_prompt_key_for_target_terms,
     _model_ui_candidates_observation,
     _model_ui_ocr_elements_from_text,
     _model_ui_candidates_from_observation,
+    _teacher_visible_installer_clicks_from_prompt,
     _score_model_ui_candidate,
     _looks_like_guessed_artifact_url_generation,
     _looks_like_gui_first_download_chunk_network_bypass,
@@ -80,6 +86,7 @@ from computer_use_raw_python_agent.service import (
     _should_use_framework_visible_download_flow,
     _should_use_model_ui_browser_prelude,
     _should_use_model_ui_candidates,
+    _should_use_installer_ui_candidates,
     _should_use_model_ui_download_recovery,
     _should_use_model_ui_installer_recovery,
     _should_use_model_ui_launch_recovery,
@@ -436,18 +443,24 @@ def test_model_ui_candidate_parser_recovers_truncated_json_text() -> None:
 
 def test_model_ui_installer_recovery_uses_visible_candidates(monkeypatch) -> None:
     monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
-    observation = """MODEL_VISIBLE_UI_CANDIDATES:
-These candidates come from local model visual extraction of the latest screenshot, not Windows OCR.
+    observation = """INSTALLER_VISIBLE_UI_CANDIDATES:
+These candidates come from local model visual extraction of a cropped installer/dialog UI region, not Windows OCR.
 {"screenshot_size":[1920,1080],"candidates":[{"text":"확인","click_point":[960,700],"reason_tags":["installer_dialog_control"]},{"text":"취소","click_point":[1100,700],"reason_tags":["installer_dialog_control"]}]}"""
     request = StepRequest(
         user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
         execution_style="gui_first",
         observation_text=observation,
     )
-    assert len(_model_ui_candidates_from_observation(observation)) == 2
+    assert len(_installer_ui_candidates_from_observation(observation)) == 2
+    assert _should_use_model_ui_candidates(request) is False
+    assert _should_use_installer_ui_candidates(request) is False
     assert _should_use_model_ui_installer_recovery(request) is True
     code = _synthesized_model_ui_installer_recovery_code(request)
     assert "pyautogui.click(x, y)" in code
+    assert "def ensure_windows_dpi_aware(" in code
+    assert "ensure_windows_dpi_aware()" in code
+    assert code.index("ensure_windows_dpi_aware()") < code.index("import pyautogui")
+    assert code.index("ensure_windows_dpi_aware()") < code.index("pyautogui.click(x, y)")
     assert "os.walk(root" in code
     assert "_extract_archive(" in code
     assert "msiexec.exe" in code
@@ -464,10 +477,320 @@ These candidates come from local model visual extraction of the latest screensho
     assert "if not _launch_installed_exe(final):" in code
     assert "sftp" in code
     assert "sorted(matches, key=lambda p: len(str(p)))" not in code
+    assert "installer_launcher_pid=" in code
+    assert "proc = subprocess.Popen([str(installer)], shell=False)" in code
     assert "no installer package available for installer recovery" in code
     assert "확인" in code
     assert "취소" not in code
     assert "/VERYSILENT" not in code
+    assert "def _click_visible_controls_once():" in code
+    assert "visible_controls_clicked = False" in code
+    assert "_click_visible_controls_once()" in code
+
+
+def test_model_ui_installer_recovery_keeps_sentence_form_installer_controls(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    observation = """INSTALLER_VISIBLE_UI_CANDIDATES:
+These candidates come from local model visual extraction of a cropped installer/dialog UI region, not Windows OCR.
+{"screenshot_size":[1920,1080],"candidates":[{"text":"약관에 동의함","click_point":[860,640],"bbox":[820,620,980,660],"reason_tags":["installer_dialog_control","checkbox_kind"]},{"text":"설치 진행","click_point":[1000,700],"reason_tags":["installer_dialog_control"]},{"text":"취소","click_point":[1180,700],"reason_tags":["installer_dialog_control"]}]}"""
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        observation_text=observation,
+    )
+
+    code = _synthesized_model_ui_installer_recovery_code(request)
+
+    assert '"text": "약관에 동의함"' in code
+    assert '"point": [860, 640]' in code
+    assert '"bbox": [820, 620, 980, 660]' in code
+    assert "def _click_points_for_visible_control(item):" not in code
+    assert "checkbox_gap" not in code
+    assert "left - checkbox_gap" not in code
+    assert "right + checkbox_gap" not in code
+    assert '"text": "설치 진행"' in code
+    assert '"point": [1000, 700]' in code
+    assert "취소" not in code
+
+
+def test_model_ui_installer_recovery_keeps_sentence_form_english_controls(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    observation = """INSTALLER_VISIBLE_UI_CANDIDATES:
+These candidates come from local model visual extraction of a cropped installer/dialog UI region, not Windows OCR.
+{"screenshot_size":[1920,1080],"candidates":[{"text":"I agree to the license terms","click_point":[840,620],"reason_tags":["installer_dialog_control","checkbox_kind"]},{"text":"Continue setup","click_point":[1020,700],"reason_tags":["installer_dialog_control"]}]}"""
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        observation_text=observation,
+    )
+
+    code = _synthesized_model_ui_installer_recovery_code(request)
+
+    assert '"text": "I agree to the license terms"' in code
+    assert '"point": [840, 620]' in code
+    assert '"text": "Continue setup"' in code
+    assert '"point": [1020, 700]' in code
+
+
+def test_model_ui_installer_recovery_prefers_teacher_selected_click(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    observation = """INSTALLER_VISIBLE_UI_CANDIDATES:
+These candidates come from local model visual extraction of a cropped installer/dialog UI region, not Windows OCR.
+{"screenshot_size":[1920,1080],"candidates":[{"text":"다음","click_point":[1000,700],"reason_tags":["installer_dialog_control"]},{"text":"동의","click_point":[860,640],"reason_tags":["installer_dialog_control"]}]}"""
+    prompt = (
+        "Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.\n\n"
+        'TEACHER_VISIBLE_INSTALLER_ACTIONS: {"actions":[{"action":"click","point":[860,640],"text":"동의"}]}'
+    )
+    request = StepRequest(
+        user_prompt=prompt,
+        execution_style="gui_first",
+        observation_text=observation,
+    )
+
+    assert _teacher_visible_installer_clicks_from_prompt(prompt) == [
+        {"text": "동의", "point": [860, 640], "tags": ["teacher_selected", "installer_dialog_control"]}
+    ]
+    code = _synthesized_model_ui_installer_recovery_code(request)
+
+    assert '"teacher_selected"' in code
+    assert code.index('"point": [860, 640]') < code.index('"point": [1000, 700]')
+
+
+def test_installer_ui_candidates_observation_uses_cropped_installer_flow(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def generate_text(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(kwargs)
+            if len(self.calls) > 1:
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "text": json.dumps(
+                            {
+                                "controls": [
+                                    {
+                                        "control": {
+                                            "kind": "checkbox",
+                                            "bbox": [100, 300, 200, 700],
+                                            "point": [150, 500],
+                                            "confidence": 0.8,
+                                        },
+                                        "label": {"text": "다른 선택", "bbox": [200, 300, 500, 700]},
+                                    },
+                                    {
+                                        "control": {
+                                            "kind": "checkbox",
+                                            "bbox": [400, 300, 600, 700],
+                                            "point": [500, 500],
+                                            "confidence": 0.96,
+                                        },
+                                        "label": {"text": "동의함", "bbox": [600, 300, 900, 700]},
+                                    },
+                                ]
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "model_id": "fake-model",
+                    },
+                )()
+            return type(
+                "Result",
+                (),
+                {
+                    "text": '{"elements":[{"text":"동의함","kind":"checkbox","bbox":[100,100,300,200],"point":[200,150],"confidence":0.96}]}',
+                    "model_id": "fake-model",
+                },
+            )()
+
+    from io import BytesIO
+    from PIL import Image
+
+    image = Image.new("RGB", (1000, 800), "white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        screenshot_base64=base64.b64encode(buffer.getvalue()).decode("ascii"),
+        screenshot_region={"left": 60, "top": 64, "right": 1060, "bottom": 864},
+    )
+    runtime = FakeRuntime()
+    observation = _installer_ui_candidates_observation(
+        runtime=runtime,
+        request=request,
+        max_new_tokens=256,
+        generation_context={"run_dir": tmp_path, "step_id": "step-001"},
+    )
+
+    assert observation is not None
+    assert "INSTALLER_VISIBLE_UI_CANDIDATES:" in observation
+    assert "MODEL_VISIBLE_UI_CANDIDATES:" not in observation
+    assert len(runtime.calls) == 2
+    assert runtime.calls[0]["image_bytes"] == buffer.getvalue()
+    assert runtime.calls[1]["image_bytes"] != buffer.getvalue()
+    user_payload = json.loads(runtime.calls[0]["prompt_bundle"].user_prompt)
+    assert "screen_size" not in user_payload
+    assert "crop_region" not in user_payload
+    assert "crop_size" not in user_payload
+    assert "This image is the installer/dialog crop." in user_payload["instructions"]
+    assert (tmp_path / "responses" / "step-001.installer-ui-candidates.json").exists()
+    candidates = _installer_ui_candidates_from_observation(observation)
+    assert candidates[0]["text"] == "동의함"
+    assert candidates[0]["click_point"] == [260, 184]
+    assert candidates[0]["bbox"] == [160, 144, 360, 224]
+    assert candidates[0]["refined_click_point"] == [370, 284]
+    assert candidates[0]["refined_bbox"] == [308, 196, 432, 372]
+    assert candidates[0]["refined_label_bbox"] == [432, 196, 618, 372]
+    assert candidates[0]["refinement_match_score"] == 110
+    assert "installer_choice_control" in candidates[0]["reason_tags"]
+
+
+def test_installer_ui_candidates_keeps_tiny_checkbox_bbox_when_point_exists(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+
+    class FakeRuntime:
+        def generate_text(self, **_kwargs):  # type: ignore[no-untyped-def]
+            return type(
+                "Result",
+                (),
+                {
+                    "text": json.dumps(
+                        {
+                            "elements": [
+                                {
+                                    "text": "동의함",
+                                    "kind": "checkbox",
+                                    "bbox": [12, 720, 15, 735],
+                                    "point": [12, 728],
+                                    "confidence": 0.95,
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "model_id": "fake-model",
+                },
+            )()
+
+    from io import BytesIO
+    from PIL import Image
+
+    image = Image.new("RGB", (878, 543), "white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        screenshot_base64=base64.b64encode(buffer.getvalue()).decode("ascii"),
+        screenshot_region={"left": 842, "top": 413, "right": 1720, "bottom": 956},
+    )
+
+    observation = _installer_ui_candidates_observation(
+        runtime=FakeRuntime(),  # type: ignore[arg-type]
+        request=request,
+        max_new_tokens=256,
+        generation_context={"run_dir": tmp_path, "step_id": "step-001"},
+    )
+
+    assert observation is not None
+    candidates = _installer_ui_candidates_from_observation(observation)
+    assert len(candidates) == 1
+    assert candidates[0]["text"] == "동의함"
+    assert candidates[0]["kind"] == "checkbox"
+    assert candidates[0]["click_point"] == [853, 808]
+    assert candidates[0]["bbox"] == [847, 802, 859, 814]
+
+
+def test_model_ui_installer_recovery_keeps_checkbox_raw_click_point(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    observation = """INSTALLER_VISIBLE_UI_CANDIDATES:
+These candidates come from local model visual extraction of a cropped installer/dialog UI region, not Windows OCR.
+{"candidates":[{"text":"동의함","kind":"checkbox","click_point":[891,834],"bbox":[853,826,930,842],"reason_tags":["installer_dialog_control","installer_choice_control"]}]}"""
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        observation_text=observation,
+    )
+    code = _synthesized_model_ui_installer_recovery_code(request)
+
+    assert '"text": "동의함"' in code
+    assert '"point": [891, 834]' in code
+    assert '"kind": "checkbox"' in code
+    assert '"bbox": [853, 826, 930, 842]' in code
+    assert "if kind in ('checkbox', 'radio'):" in code
+    assert "refined_bbox = item.get('refined_bbox') or []" in code
+    assert "y = int(top + max(1, (bottom - top) * 0.7))" in code
+    assert "pyautogui.mouseDown()" not in code
+    assert "pyautogui.mouseUp()" not in code
+    assert "time.sleep(0.9)" in code
+    assert "_click_point_for_visible_control" not in code
+
+
+def test_model_ui_installer_recovery_prefers_refined_checkbox_click_point(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    observation = """INSTALLER_VISIBLE_UI_CANDIDATES:
+These candidates come from local model visual extraction of a cropped installer/dialog UI region, not Windows OCR.
+{"candidates":[{"text":"동의함","kind":"checkbox","click_point":[891,834],"refined_click_point":[910,852],"refined_label_bbox":[910,840,980,864],"bbox":[853,826,930,842],"reason_tags":["installer_dialog_control","installer_choice_control"]}]}"""
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        observation_text=observation,
+    )
+    code = _synthesized_model_ui_installer_recovery_code(request)
+
+    assert '"point": [891, 834]' in code
+    assert '"refined_click_point": [910, 852]' in code
+    assert '"refined_label_bbox": [910, 840, 980, 864]' in code
+    assert "point = item.get('refined_click_point') or item.get('point') or [0, 0]" in code
+    assert "refined_label_bbox = item.get('refined_label_bbox') or []" in code
+    assert "if kind in ('checkbox', 'radio') and isinstance(refined_label_bbox, list)" in code
+
+
+def test_installer_ui_candidates_observation_requires_executor_region(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        screenshot_base64="iVBORw0KGgo=",
+    )
+
+    assert _installer_ui_candidates_observation(
+        runtime=object(),  # type: ignore[arg-type]
+        request=request,
+        max_new_tokens=256,
+        generation_context=None,
+    ) is None
+
+
+def test_installer_launcher_pid_is_extracted_from_last_execution_stdout() -> None:
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        last_execution={"stdout_tail": "launch installer target: C:\\Downloads\\app.exe\ninstaller_launcher_pid=4321\n"},
+    )
+
+    assert _installer_launcher_pid_from_last_execution(request) == 4321
+
+
+def test_installer_execution_region_prefers_launcher_pid_over_stale_region(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        screenshot_base64="iVBORw0KGgo=",
+        screenshot_region={"left": 10, "top": 20, "right": 110, "bottom": 220},
+        last_execution={"stdout_tail": "installer_launcher_pid: 9876"},
+    )
+
+    assert _execution_screenshot_region_for_request(request) == {
+        "mode": "installer_window",
+        "expected_pid": 9876,
+    }
 
 
 def test_visible_flow_extra_targets_ignores_continuity_instruction_words() -> None:
@@ -648,6 +971,10 @@ These candidates come from local model visual extraction of the latest screensho
     code = _synthesized_model_ui_download_recovery_code(request)
     assert "pyautogui.click(x, y)" in code
     assert "pyautogui.FAILSAFE = False" in code
+    assert "def ensure_windows_dpi_aware(" in code
+    assert "ensure_windows_dpi_aware()" in code
+    assert code.index("ensure_windows_dpi_aware()") < code.index("import pyautogui")
+    assert code.index("ensure_windows_dpi_aware()") < code.index("pyautogui.click(x, y)")
     assert "def _candidate_points(candidate):" in code
     assert "for delta_x in (-80, 80):" in code
     assert "return deduped[:4]" in code
@@ -1705,7 +2032,7 @@ def test_model_ui_download_recovery_selected_for_replan_download_only_prompt(mon
     assert _should_use_model_ui_download_recovery(request) is True
 
 
-def test_model_ui_candidates_run_on_first_installer_step(monkeypatch) -> None:
+def test_installer_ui_candidates_run_on_first_installer_step(monkeypatch) -> None:
     monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
     request = StepRequest(
         user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
@@ -1713,7 +2040,8 @@ def test_model_ui_candidates_run_on_first_installer_step(monkeypatch) -> None:
         screenshot_base64="iVBORw0KGgo=",
         step_index=0,
     )
-    assert _should_use_model_ui_candidates(request) is True
+    assert _should_use_model_ui_candidates(request) is False
+    assert _should_use_installer_ui_candidates(request) is True
 
 
 def test_missing_image_template_generation_detects_guessed_locate_on_screen() -> None:
@@ -4004,6 +4332,42 @@ def test_visible_flow_extra_targets_ignore_replan_failure_noise_words() -> None:
     assert _visible_flow_extra_targets(request, limit=8) == ["filezilla"]
 
 
+def test_visible_flow_extra_targets_filters_prompt_scaffold_words_from_installer_replan() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "REPLAN OVERRIDE FOR THIS STEP:\n"
+            "Return executable Python only.\n"
+            "Source task: 고클린 설치해줘.\n"
+            "Explicit open-target page URLs for this chunk:\n"
+            "- https://www.gobest.kr/goclean_app/index.htm\n"
+            "Find the downloaded GoClean `.exe` in the Downloads folder and execute it.\n"
+            "Previous stdout summary: install marker written: C:\\Program Files\\Git\\usr\\bin\\find.exe\n"
+            "Previous stderr summary: installed executable detected but process did not stay running\n"
+            "Use the existing installer already present in Downloads; do not add download logic."
+        ),
+        execution_style="gui_first",
+        replan_requested=True,
+        last_execution={
+            "payload_metadata": {
+                "executed_python_code": (
+                    'TARGET_TERMS = ["고클린", "gocleansetup153", "gocleansetup", '
+                    '"gobest", "top-level", "explicit", "find", "goclean"]'
+                ),
+            },
+            "stdout_tail": "install marker written: C:\\Program Files\\Git\\usr\\bin\\find.exe",
+            "stderr_tail": "installed executable detected but process did not stay running",
+        },
+    )
+
+    keywords = _visible_flow_extra_targets(request, limit=8)
+
+    assert "고클린" in keywords
+    assert "goclean" in keywords
+    assert "find" not in keywords
+    assert "explicit" not in keywords
+    assert "top-level" not in keywords
+
+
 def test_visible_flow_extra_targets_preserved_terms_ignore_replan_control_sentence_noise() -> None:
     request = StepRequest(
         user_prompt=(
@@ -4047,6 +4411,113 @@ def test_model_ui_installer_recovery_preserves_context_installer_path() -> None:
     assert "preserved_installer = installer_path or previous_context.get('installer_path')" in code
     assert "payload['installer_path'] = str(preserved_installer)" in code
     assert "context_payload['installer_path'] = str(preserved_installer)" in code
+
+
+def test_model_ui_installer_recovery_uses_context_installer_filename_for_package_terms(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    installer = downloads / "gocleansetup153.exe"
+    installer.write_bytes(b"x" * 128)
+    request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n\n"
+            "Top-level source task for this run: 고클린 설치해줘\n\n"
+            "Using Python automation on Windows, run the downloaded 고클린 installer `.exe` from Downloads "
+            "and complete the setup wizard with default options."
+        ),
+        execution_style="gui_first",
+    )
+    code = _synthesized_model_ui_installer_recovery_code(request)
+    prefix = code.split("\npackages = _candidate_packages()", 1)[0].replace("import pyautogui\n", "")
+    namespace: dict[str, object] = {}
+    exec(prefix, namespace)
+    context_marker = downloads / "computer-use-agent-context.json"
+    context_marker.write_text(
+        json.dumps(
+            {
+                "prompt_key": namespace["CONTEXT_PROMPT_KEY"],
+                "installer_path": str(installer),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    packages = namespace["_candidate_packages"]()
+
+    assert namespace["_target_terms"]() == ["고클린"]
+    assert "gocleansetup153" in namespace["_package_terms"](str(installer))
+    assert "gocleansetup" in namespace["_package_terms"](str(installer))
+    assert packages == [installer]
+
+
+def test_model_ui_installer_recovery_does_not_expand_package_terms_from_mismatched_context(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    installer = downloads / "gocleansetup153.exe"
+    installer.write_bytes(b"x" * 128)
+    request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n\n"
+            "Top-level source task for this run: 고클린 설치해줘\n\n"
+            "Using Python automation on Windows, run the downloaded 고클린 installer `.exe` from Downloads."
+        ),
+        execution_style="gui_first",
+    )
+    code = _synthesized_model_ui_installer_recovery_code(request)
+    prefix = code.split("\npackages = _candidate_packages()", 1)[0].replace("import pyautogui\n", "")
+    namespace: dict[str, object] = {}
+    exec(prefix, namespace)
+    context_marker = downloads / "computer-use-agent-context.json"
+    context_marker.write_text(
+        json.dumps(
+            {
+                "prompt_key": "previous-task",
+                "installer_path": str(installer),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    assert namespace["_candidate_packages"]() == []
+
+
+def test_installer_recovery_target_terms_ignore_installer_control_and_impl_words() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n\n"
+            "Top-level source task for this run: 고클린 설치해줘\n\n"
+            "Using Python on the Windows machine, locate the downloaded `gocleansetup153.exe` in Downloads "
+            "and launch it with subprocess or an equivalent automation method. Complete the installer wizard "
+            "with default choices, advancing through `다음`, `설치`, and `마침` as shown."
+        ),
+        execution_style="gui_first",
+    )
+    keywords = _installer_recovery_target_terms(request, limit=8)
+    assert "고클린" in keywords
+    assert "gocleansetup153" in keywords
+    assert "다음" not in keywords
+    assert "마침" not in keywords
+    assert "subprocess" not in keywords
+
+
+def test_model_ui_installer_recovery_prefers_installer_before_existing_exe_scan() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n\n"
+            "Top-level source task for this run: 고클린 설치해줘\n\n"
+            "Use Python on the Windows machine to locate the downloaded `gocleansetup153.exe` in Downloads "
+            "and run it with subprocess. Continue with 기본 설치."
+        ),
+        execution_style="gui_first",
+    )
+    code = _synthesized_model_ui_installer_recovery_code(request)
+    assert code.index("installer = _resolve_installer_target(packages[0]) if packages else None") < code.index(
+        "existing = _find_installed_exe()"
+    )
 
 
 def test_recent_download_helper_rejects_portable_when_not_requested() -> None:
