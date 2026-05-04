@@ -12424,6 +12424,130 @@ def _crop_png_bytes(image_bytes: bytes, box: tuple[int, int, int, int]) -> tuple
         return None
 
 
+def _enhanced_ocr_image_variants(
+    image_bytes: bytes,
+    image_size: tuple[int, int],
+    *,
+    include_original: bool = True,
+) -> list[dict[str, Any]]:
+    variants: list[dict[str, Any]] = []
+    if include_original:
+        variants.append({"name": "original", "bytes": image_bytes, "size": image_size, "scale": 1.0})
+    try:
+        from io import BytesIO
+        from PIL import Image, ImageOps
+
+        with Image.open(BytesIO(image_bytes)) as source:
+            rgb = source.convert("RGB")
+            width, height = image_size
+            scale = 2.0 if max(width, height) < 1200 else 1.5
+            enlarged_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+            enlarged = rgb.resize(enlarged_size, Image.Resampling.LANCZOS)
+            enhanced = ImageOps.autocontrast(enlarged.convert("L")).convert("RGB")
+            enhanced_buffer = BytesIO()
+            enhanced.save(enhanced_buffer, format="PNG")
+            variants.append(
+                {
+                    "name": "enhanced",
+                    "bytes": enhanced_buffer.getvalue(),
+                    "size": enlarged_size,
+                    "scale": scale,
+                }
+            )
+    except Exception:
+        pass
+    return variants
+
+
+def _screen_region_metadata(left: int, top: int, right: int, bottom: int) -> dict[str, int]:
+    return {
+        "left": int(left),
+        "top": int(top),
+        "right": int(right),
+        "bottom": int(bottom),
+        "width": max(0, int(right) - int(left)),
+        "height": max(0, int(bottom) - int(top)),
+    }
+
+
+def _scale_point_to_base(point: tuple[int, int], scale: float) -> tuple[int, int]:
+    safe_scale = max(float(scale or 1.0), 0.001)
+    return (int(round(point[0] / safe_scale)), int(round(point[1] / safe_scale)))
+
+
+def _scale_bbox_to_base(bbox: tuple[int, int, int, int], scale: float) -> tuple[int, int, int, int]:
+    safe_scale = max(float(scale or 1.0), 0.001)
+    return (
+        int(round(bbox[0] / safe_scale)),
+        int(round(bbox[1] / safe_scale)),
+        int(round(bbox[2] / safe_scale)),
+        int(round(bbox[3] / safe_scale)),
+    )
+
+
+def _offset_point_to_screen(point: tuple[int, int], left: int, top: int) -> list[int]:
+    return [int(left + point[0]), int(top + point[1])]
+
+
+def _offset_bbox_to_screen(bbox: tuple[int, int, int, int], left: int, top: int) -> list[int]:
+    return [int(left + bbox[0]), int(top + bbox[1]), int(left + bbox[2]), int(top + bbox[3])]
+
+
+def _coerce_installer_crop_point(value: Any, *, image_size: tuple[int, int] | None) -> tuple[int, int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    try:
+        x, y = float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return None
+    if not image_size:
+        return int(round(x)), int(round(y))
+    width, height = image_size
+    if 0 <= x <= width and 0 <= y <= height:
+        return max(0, min(int(round(x)), width - 1)), max(0, min(int(round(y)), height - 1))
+    return _coerce_model_point(value, image_size=image_size)
+
+
+def _coerce_installer_crop_bbox(value: Any, *, image_size: tuple[int, int] | None) -> tuple[int, int, int, int] | None:
+    if isinstance(value, dict):
+        raw_values = [value.get(key) for key in ("left", "top", "right", "bottom")]
+        if any(item is None for item in raw_values):
+            left = value.get("x")
+            top = value.get("y")
+            width_value = value.get("width", value.get("w"))
+            height_value = value.get("height", value.get("h"))
+            raw_values = [
+                left,
+                top,
+                None if left is None or width_value is None else float(left) + float(width_value),
+                None if top is None or height_value is None else float(top) + float(height_value),
+            ]
+    elif isinstance(value, (list, tuple)) and len(value) >= 4:
+        raw_values = list(value[:4])
+    else:
+        return None
+    try:
+        left, top, right, bottom = [float(item) for item in raw_values]
+    except (TypeError, ValueError):
+        return None
+    if right <= left or bottom <= top:
+        right = left + abs(right)
+        bottom = top + abs(bottom)
+    if not image_size:
+        left, top, right, bottom = [int(round(item)) for item in (left, top, right, bottom)]
+        return (left, top, right, bottom) if right - left >= 4 and bottom - top >= 4 else None
+    width, height = image_size
+    if 0 <= left <= width and 0 <= top <= height and 0 <= right <= width and 0 <= bottom <= height:
+        coerced = (
+            max(0, min(int(round(left)), width - 1)),
+            max(0, min(int(round(top)), height - 1)),
+            max(0, min(int(round(right)), width)),
+            max(0, min(int(round(bottom)), height)),
+        )
+        return coerced if coerced[2] - coerced[0] >= 4 and coerced[3] - coerced[1] >= 4 else None
+    return _coerce_model_bbox(value, image_size=image_size)
+
+
 def _choice_control_elements_from_payload(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, dict) and isinstance(payload.get("control"), dict):
         control = dict(payload["control"])
@@ -12481,6 +12605,141 @@ def _installer_choice_text_score(candidate_text: str, item: dict[str, Any]) -> i
     return len(expected_tokens & combined_tokens) * 20
 
 
+def _best_choice_control_from_elements(
+    elements: list[dict[str, Any]],
+    *,
+    candidate_text: str,
+    image_size: tuple[int, int],
+    image_scale_to_base: float,
+) -> dict[str, Any] | None:
+    best: dict[str, Any] | None = None
+    best_score = -1
+    for item in elements:
+        item_kind = str(item.get("kind") or item.get("type") or "").strip().lower()
+        if item_kind and item_kind not in {"checkbox", "radio", "control", "input"}:
+            continue
+        point = _coerce_model_point(item.get("point") or item.get("click_point"), image_size=image_size)
+        item_bbox = _coerce_model_bbox(item.get("bbox") or item.get("box") or item.get("rect"), image_size=image_size)
+        label_bbox = _coerce_model_bbox(item.get("label_bbox"), image_size=image_size)
+        if point is None and item_bbox is not None:
+            left, top, right, bottom = item_bbox
+            point = (int((left + right) / 2), int((top + bottom) / 2))
+        if point is None:
+            continue
+        base_point = _scale_point_to_base(point, image_scale_to_base)
+        base_bbox = _scale_bbox_to_base(item_bbox, image_scale_to_base) if item_bbox is not None else None
+        base_label_bbox = _scale_bbox_to_base(label_bbox, image_scale_to_base) if label_bbox is not None else None
+        text_score = _installer_choice_text_score(candidate_text, item)
+        kind_score = 10 if item_kind in {"checkbox", "radio"} else 0
+        total_score = text_score + kind_score
+        if total_score > best_score:
+            best_score = total_score
+            best = {
+                "raw": item,
+                "point": base_point,
+                "bbox": base_bbox,
+                "label_bbox": base_label_bbox,
+                "match_score": total_score,
+            }
+    return best
+
+
+def _visual_refine_installer_choice_candidate(
+    *,
+    crop_bytes: bytes,
+    crop_size: tuple[int, int],
+    crop_left: int,
+    crop_top: int,
+    candidate: dict[str, Any],
+) -> dict[str, Any] | None:
+    kind = str(candidate.get("kind") or "").strip().lower()
+    if kind not in {"checkbox", "radio"}:
+        return None
+    source_point = candidate.get("source_click_point")
+    if not isinstance(source_point, list) or len(source_point) < 2:
+        return None
+    try:
+        anchor_x, anchor_y = int(source_point[0]), int(source_point[1])
+    except (TypeError, ValueError):
+        return None
+    width, height = crop_size
+    if width <= 0 or height <= 0:
+        return None
+    try:
+        from io import BytesIO
+        from PIL import Image, ImageOps
+
+        with Image.open(BytesIO(crop_bytes)) as source:
+            gray = ImageOps.grayscale(source.convert("RGB"))
+    except Exception:
+        return None
+    pixels = gray.load()
+    search_left = max(0, anchor_x - 120)
+    search_right = min(width, anchor_x + 180)
+    search_top = max(0, anchor_y - 90)
+    search_bottom = min(height, anchor_y + 90)
+    if search_right - search_left < 12 or search_bottom - search_top < 12:
+        return None
+    best: tuple[float, int, int, int, int, int] | None = None
+    for top in range(search_top, search_bottom):
+        for left in range(search_left, search_right):
+            for size in range(10, 30):
+                right = left + size
+                bottom = top + size
+                if right >= search_right or bottom >= search_bottom:
+                    continue
+                top_dark = sum(1 for offset in range(size) if pixels[left + offset, top] < 190)
+                bottom_dark = sum(1 for offset in range(size) if pixels[left + offset, bottom - 1] < 190)
+                left_dark = sum(1 for offset in range(size) if pixels[left, top + offset] < 190)
+                right_dark = sum(1 for offset in range(size) if pixels[right - 1, top + offset] < 190)
+                if min(top_dark, bottom_dark, left_dark, right_dark) < 3:
+                    continue
+                border_strength = top_dark + bottom_dark + left_dark + right_dark
+                if border_strength < int(size * 1.1):
+                    continue
+                interior_values = [
+                    pixels[x, y]
+                    for y in range(top + 3, bottom - 3, 3)
+                    for x in range(left + 3, right - 3, 3)
+                ]
+                if not interior_values:
+                    continue
+                interior_light = sum(1 for value in interior_values if value > 170)
+                interior_dark = sum(1 for value in interior_values if value < 130)
+                if interior_light < max(1, len(interior_values) // 2):
+                    continue
+                if interior_dark > max(2, int(len(interior_values) * 0.18)):
+                    continue
+                center_x = left + size // 2
+                center_y = top + size // 2
+                distance = ((center_x - anchor_x) ** 2 + (center_y - anchor_y) ** 2) ** 0.5
+                score = (
+                    float(border_strength)
+                    + float(min(top_dark, bottom_dark, left_dark, right_dark) * 4)
+                    + float(interior_light)
+                    - distance * 1.3
+                )
+                if best is None or score > best[0]:
+                    best = (score, center_x, center_y, left, top, size)
+    if best is None:
+        return None
+    score, center_x, center_y, left, top, size = best
+    if score < 20:
+        return None
+    source_bbox = (left, top, left + size, top + size)
+    source_point = (center_x, center_y)
+    return {
+        "click_point": _offset_point_to_screen(source_point, crop_left, crop_top),
+        "bbox": _offset_bbox_to_screen(source_bbox, crop_left, crop_top),
+        "source_click_point": [int(source_point[0]), int(source_point[1])],
+        "source_bbox": [int(source_bbox[0]), int(source_bbox[1]), int(source_bbox[2]), int(source_bbox[3])],
+        "visual_refined_click_point": _offset_point_to_screen(source_point, crop_left, crop_top),
+        "visual_refined_bbox": _offset_bbox_to_screen(source_bbox, crop_left, crop_top),
+        "visual_refined_source_coord_space": "installer_crop_pixel",
+        "visual_refined_score": int(round(score)),
+    }
+
+
 def _refine_installer_choice_candidate(
     *,
     runtime: AgentRuntime,
@@ -12513,8 +12772,8 @@ def _refine_installer_choice_candidate(
         return None
     candidate_width = local_right - local_left
     candidate_height = local_bottom - local_top
-    margin_x = min(320, max(180, candidate_width * 4))
-    margin_y = min(280, max(160, candidate_height * 10))
+    margin_x = min(90, max(55, candidate_width))
+    margin_y = min(72, max(40, int(candidate_height * 2.5)))
     small_left = max(0, local_left - margin_x)
     small_top = max(0, local_top - margin_y)
     small_right = min(width, local_right + margin_x)
@@ -12539,84 +12798,111 @@ def _refine_installer_choice_candidate(
         "Use bbox and point relative to this small crop image. For Qwen3.5/Qwen3-VL, use normalized 0-1000 coordinates for both x and y.",
         "Output exactly this schema: {\"controls\":[{\"control\":{\"kind\":\"checkbox|radio\",\"bbox\":[l,t,r,b],\"point\":[x,y],\"confidence\":0.0},\"label\":{\"text\":\"...\",\"bbox\":[l,t,r,b]}}]}",
     ]
-    generated = runtime.generate_text(
-        prompt_bundle=PromptBundle(
-            system_prompt=system_prompt,
-            user_prompt=json.dumps(
-                {
-                    "candidate_text": candidate.get("text", ""),
-                    "candidate_kind": kind,
-                    "instructions": instructions,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            session_prompt=request.user_prompt,
-            policy=request.policy,
-            execution_style=request.execution_style,
-            reasoning_enabled=False,
-            observation_text=None,
-            last_execution=request.last_execution,
-            web_search_context={},
-            recent_history=request.recent_history,
-            replan_requested=request.replan_requested,
-            replan_reasons=request.replan_reasons,
-        ),
-        image_path=None,
-        image_bytes=small_bytes,
-        use_blank_image=False,
-        max_new_tokens=min(max(int(max_new_tokens or 256), 160), 320),
-        generation_context=generation_context,
-    )
-    payload = _extract_json_object_or_array(generated.text)
-    elements = _choice_control_elements_from_payload(payload)
-    if not elements:
-        elements = _model_ui_ocr_elements_from_text(generated.text)
-    best: dict[str, Any] | None = None
-    best_score = -1
     candidate_text = str(candidate.get("text") or "")
-    for item in elements:
-        item_kind = str(item.get("kind") or item.get("type") or "").strip().lower()
-        if item_kind and item_kind not in {"checkbox", "radio", "control", "input"}:
-            continue
-        point = _coerce_model_point(item.get("point") or item.get("click_point"), image_size=small_size)
-        item_bbox = _coerce_model_bbox(item.get("bbox") or item.get("box") or item.get("rect"), image_size=small_size)
-        label_bbox = _coerce_model_bbox(item.get("label_bbox"), image_size=small_size)
-        if point is None and item_bbox is not None:
-            left, top, right, bottom = item_bbox
-            point = (int((left + right) / 2), int((top + bottom) / 2))
-        if point is None:
-            continue
-        text_score = _installer_choice_text_score(candidate_text, item)
-        kind_score = 10 if item_kind in {"checkbox", "radio"} else 0
-        total_score = text_score + kind_score
-        if total_score > best_score:
-            best_score = total_score
-            best = {"raw": item, "point": point, "bbox": item_bbox, "label_bbox": label_bbox, "match_score": total_score}
+    raw_text_by_variant: list[dict[str, Any]] = []
+    best: dict[str, Any] | None = None
+    best_model_id = ""
+    best_variant_name = ""
+    best_score = -1
+    for variant in _enhanced_ocr_image_variants(small_bytes, small_size):
+        generated = runtime.generate_text(
+            prompt_bundle=PromptBundle(
+                system_prompt=system_prompt,
+                user_prompt=json.dumps(
+                    {
+                        "candidate_text": candidate.get("text", ""),
+                        "candidate_kind": kind,
+                        "image_variant": variant["name"],
+                        "instructions": instructions,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                session_prompt=request.user_prompt,
+                policy=request.policy,
+                execution_style=request.execution_style,
+                reasoning_enabled=False,
+                observation_text=None,
+                last_execution=request.last_execution,
+                web_search_context={},
+                recent_history=request.recent_history,
+                replan_requested=request.replan_requested,
+                replan_reasons=request.replan_reasons,
+            ),
+            image_path=None,
+            image_bytes=variant["bytes"],
+            use_blank_image=False,
+            max_new_tokens=min(max(int(max_new_tokens or 256), 160), 320),
+            generation_context=generation_context,
+        )
+        raw_text_by_variant.append({"variant": variant["name"], "raw_text": generated.text[:4000]})
+        payload = _extract_json_object_or_array(generated.text)
+        elements = _choice_control_elements_from_payload(payload)
+        if not elements:
+            elements = _model_ui_ocr_elements_from_text(generated.text)
+        variant_best = _best_choice_control_from_elements(
+            elements,
+            candidate_text=candidate_text,
+            image_size=variant["size"],
+            image_scale_to_base=float(variant["scale"]),
+        )
+        variant_score = int(variant_best.get("match_score") or 0) if variant_best is not None else -1
+        if variant_best is not None and variant_score > best_score:
+            best = variant_best
+            best_score = variant_score
+            best_model_id = generated.model_id
+            best_variant_name = str(variant["name"])
     if best is None:
+        return None
+    if int(best.get("match_score") or 0) < 80:
+        if generation_context and generation_context.get("run_dir") and generation_context.get("step_id"):
+            run_dir = Path(str(generation_context["run_dir"]))
+            step_id = str(generation_context["step_id"])
+            _write_json(
+                run_dir / "responses" / f"{step_id}.installer-ui-refine-{index:02d}.json",
+                {
+                    "candidate": candidate,
+                    "small_crop": {"left": small_left, "top": small_top, "right": small_right, "bottom": small_bottom},
+                    "small_crop_size": list(small_size),
+                    "raw_text_by_variant": raw_text_by_variant,
+                    "refined": {
+                        "refinement_rejected": {
+                            "reason": "label_text_mismatch",
+                            "match_score": int(best.get("match_score") or 0),
+                        }
+                    },
+                },
+            )
         return None
     point_x, point_y = best["point"]
     refined: dict[str, Any] = {
-        "refined_click_point": [int(crop_left + small_left + point_x), int(crop_top + small_top + point_y)],
-        "refinement_model_id": generated.model_id,
+        "refined_click_point": _offset_point_to_screen((point_x + small_left, point_y + small_top), crop_left, crop_top),
+        "refined_coord_space": "screen_abs",
+        "refined_source_coord_space": "installer_refine_crop_pixel",
+        "refined_source_region": _screen_region_metadata(
+            crop_left + small_left,
+            crop_top + small_top,
+            crop_left + small_right,
+            crop_top + small_bottom,
+        ),
+        "refinement_model_id": best_model_id,
+        "refinement_image_variant": best_variant_name,
         "refinement_match_score": int(best.get("match_score") or 0),
     }
     if best.get("bbox") is not None:
         left, top, right, bottom = best["bbox"]
-        refined["refined_bbox"] = [
-            int(crop_left + small_left + left),
-            int(crop_top + small_top + top),
-            int(crop_left + small_left + right),
-            int(crop_top + small_top + bottom),
-        ]
+        refined["refined_bbox"] = _offset_bbox_to_screen(
+            (left + small_left, top + small_top, right + small_left, bottom + small_top),
+            crop_left,
+            crop_top,
+        )
     if best.get("label_bbox") is not None:
         left, top, right, bottom = best["label_bbox"]
-        refined["refined_label_bbox"] = [
-            int(crop_left + small_left + left),
-            int(crop_top + small_top + top),
-            int(crop_left + small_left + right),
-            int(crop_top + small_top + bottom),
-        ]
+        refined["refined_label_bbox"] = _offset_bbox_to_screen(
+            (left + small_left, top + small_top, right + small_left, bottom + small_top),
+            crop_left,
+            crop_top,
+        )
     if generation_context and generation_context.get("run_dir") and generation_context.get("step_id"):
         run_dir = Path(str(generation_context["run_dir"]))
         step_id = str(generation_context["step_id"])
@@ -12626,7 +12912,7 @@ def _refine_installer_choice_candidate(
                 "candidate": candidate,
                 "small_crop": {"left": small_left, "top": small_top, "right": small_right, "bottom": small_bottom},
                 "small_crop_size": list(small_size),
-                "raw_text": generated.text[:4000],
+                "raw_text_by_variant": raw_text_by_variant,
                 "refined": refined,
             },
         )
@@ -12669,7 +12955,7 @@ def _installer_ui_candidates_observation(
         "Include OK, Yes, Next, Install, Finish, Continue, 확인, 예, 다음, 설치, 마침, 완료 when visible.",
         "Do not include browser address bars, download-page links, taskbar items, or unrelated background text.",
         "Do not choose or emphasize Cancel, Close, Back, Decline, No, 취소, 닫기, 뒤로, 거부, 아니오.",
-        "Use bbox as [left, top, right, bottom] relative to this cropped image. For Qwen3.5/Qwen3-VL, use normalized 0-1000 coordinates for both x and y.",
+        "Use bbox as [left, top, right, bottom] pixel coordinates relative to this cropped image.",
         "If you can identify the exact clickable point, include point:[x,y] relative to this cropped image.",
         "Output exactly this schema: {\"elements\":[{\"text\":\"...\",\"kind\":\"button|checkbox|radio|input|text\",\"bbox\":[l,t,r,b],\"point\":[x,y],\"confidence\":0.0}]}",
     ]
@@ -12677,92 +12963,126 @@ def _installer_ui_candidates_observation(
         "task": request.user_prompt,
         "instructions": instructions,
     }
-    generated = runtime.generate_text(
-        prompt_bundle=PromptBundle(
-            system_prompt=system_prompt,
-            user_prompt=json.dumps(user_payload, ensure_ascii=False, indent=2),
-            session_prompt=request.user_prompt,
-            policy=request.policy,
-            execution_style=request.execution_style,
-            reasoning_enabled=False,
-            observation_text=None,
-            last_execution=request.last_execution,
-            web_search_context={},
-            recent_history=request.recent_history,
-            replan_requested=request.replan_requested,
-            replan_reasons=request.replan_reasons,
-        ),
-        image_path=None,
-        image_bytes=crop_bytes,
-        use_blank_image=False,
-        max_new_tokens=min(max(int(max_new_tokens or 256), 256), 512),
-        generation_context=generation_context,
-    )
-    payload = _extract_json_object_or_array(generated.text)
-    elements = _model_ui_ocr_elements_from_payload(payload)
-    if not elements:
-        elements = _model_ui_ocr_elements_from_text(generated.text)
     candidates: list[dict[str, Any]] = []
-    for index, item in enumerate(elements):
-        text = str(item.get("text") or item.get("label") or item.get("content") or "").strip()
-        kind = str(item.get("kind") or item.get("type") or "text").strip().lower()
-        raw_point = item.get("point") or item.get("click_point")
-        point = _coerce_model_point(raw_point, image_size=crop_size)
-        raw_bbox_value = item.get("bbox") or item.get("box") or item.get("rect")
-        bbox = _coerce_model_bbox(raw_bbox_value, image_size=crop_size)
-        if bbox is None and kind in {"checkbox", "radio"} and point is not None:
-            x, y = point
-            bbox = (
-                max(0, x - 6),
-                max(0, y - 6),
-                min(crop_size[0], x + 6),
-                min(crop_size[1], y + 6),
-            )
-        if not text or bbox is None:
-            continue
-        score, tags = _score_installer_ui_candidate(text, kind)
-        if score <= 0:
-            continue
-        left, top, right, bottom = bbox
-        if point is None:
-            point = (int((left + right) / 2), int((top + bottom) / 2))
-        screen_bbox = [left + crop_left, top + crop_top, right + crop_left, bottom + crop_top]
-        screen_point = [point[0] + crop_left, point[1] + crop_top]
-        candidate = {
-            "candidate_id": f"installer-ui-{index:02d}",
-            "text": text[:160],
-            "kind": kind or "text",
-            "bbox": screen_bbox,
-            "click_point": screen_point,
-            "score": int(score),
-            "confidence": item.get("confidence", 1.0),
-            "reason_tags": tags,
-        }
-        refined = _refine_installer_choice_candidate(
-            runtime=runtime,
-            request=request,
-            crop_bytes=crop_bytes,
-            crop_size=crop_size,
-            crop_left=crop_left,
-            crop_top=crop_top,
-            candidate=candidate,
-            max_new_tokens=max_new_tokens,
+    raw_text_by_variant: list[dict[str, Any]] = []
+    parsed_element_count = 0
+    model_ids: list[str] = []
+    for variant_index, variant in enumerate(_enhanced_ocr_image_variants(crop_bytes, crop_size)):
+        generated = runtime.generate_text(
+            prompt_bundle=PromptBundle(
+                system_prompt=system_prompt,
+                user_prompt=json.dumps(
+                    {**user_payload, "image_variant": variant["name"]},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                session_prompt=request.user_prompt,
+                policy=request.policy,
+                execution_style=request.execution_style,
+                reasoning_enabled=False,
+                observation_text=None,
+                last_execution=request.last_execution,
+                web_search_context={},
+                recent_history=request.recent_history,
+                replan_requested=request.replan_requested,
+                replan_reasons=request.replan_reasons,
+            ),
+            image_path=None,
+            image_bytes=variant["bytes"],
+            use_blank_image=False,
+            max_new_tokens=min(max(int(max_new_tokens or 256), 256), 512),
             generation_context=generation_context,
-            index=index,
         )
-        if refined:
-            candidate.update(refined)
-        candidates.append(candidate)
+        model_ids.append(generated.model_id)
+        raw_text_by_variant.append({"variant": variant["name"], "raw_text": generated.text[:4000]})
+        payload = _extract_json_object_or_array(generated.text)
+        elements = _model_ui_ocr_elements_from_payload(payload)
+        if not elements:
+            elements = _model_ui_ocr_elements_from_text(generated.text)
+        parsed_element_count += len(elements)
+        for index, item in enumerate(elements):
+            text = str(item.get("text") or item.get("label") or item.get("content") or "").strip()
+            kind = str(item.get("kind") or item.get("type") or "text").strip().lower()
+            raw_point = item.get("point") or item.get("click_point")
+            point = _coerce_installer_crop_point(raw_point, image_size=variant["size"])
+            raw_bbox_value = item.get("bbox") or item.get("box") or item.get("rect")
+            bbox = _coerce_installer_crop_bbox(raw_bbox_value, image_size=variant["size"])
+            point = _scale_point_to_base(point, float(variant["scale"])) if point is not None else None
+            bbox = _scale_bbox_to_base(bbox, float(variant["scale"])) if bbox is not None else None
+            if bbox is None and kind in {"checkbox", "radio"} and point is not None:
+                x, y = point
+                bbox = (
+                    max(0, x - 6),
+                    max(0, y - 6),
+                    min(crop_size[0], x + 6),
+                    min(crop_size[1], y + 6),
+                )
+            if not text or bbox is None:
+                continue
+            score, tags = _score_installer_ui_candidate(text, kind)
+            if score <= 0:
+                continue
+            left, top, right, bottom = bbox
+            if point is None:
+                point = (int((left + right) / 2), int((top + bottom) / 2))
+            screen_bbox = _offset_bbox_to_screen(bbox, crop_left, crop_top)
+            screen_point = _offset_point_to_screen(point, crop_left, crop_top)
+            candidate = {
+                "candidate_id": f"installer-ui-{variant_index:02d}-{index:02d}",
+                "text": text[:160],
+                "kind": kind or "text",
+                "bbox": screen_bbox,
+                "click_point": screen_point,
+                "coord_space": "screen_abs",
+                "source_coord_space": "installer_crop_pixel",
+                "source_region": _screen_region_metadata(crop_left, crop_top, crop_right, crop_bottom),
+                "source_image_variant": variant["name"],
+                "source_bbox": list(bbox),
+                "source_click_point": list(point),
+                "score": int(score),
+                "confidence": item.get("confidence", 1.0),
+                "reason_tags": tags,
+            }
+            visual_refined = _visual_refine_installer_choice_candidate(
+                crop_bytes=crop_bytes,
+                crop_size=crop_size,
+                crop_left=crop_left,
+                crop_top=crop_top,
+                candidate=candidate,
+            )
+            if visual_refined:
+                candidate.update(visual_refined)
+                candidate["reason_tags"] = list(dict.fromkeys([*candidate.get("reason_tags", []), "visual_choice_control"]))
+            refined = None
+            if not visual_refined:
+                refined = _refine_installer_choice_candidate(
+                    runtime=runtime,
+                    request=request,
+                    crop_bytes=crop_bytes,
+                    crop_size=crop_size,
+                    crop_left=crop_left,
+                    crop_top=crop_top,
+                    candidate=candidate,
+                    max_new_tokens=max_new_tokens,
+                    generation_context=generation_context,
+                    index=len(candidates),
+                )
+            if refined:
+                candidate.update(refined)
+            candidates.append(candidate)
+        if candidates:
+            break
     candidates.sort(key=lambda item: int(item.get("score") or 0), reverse=True)
     candidates = candidates[:8]
     debug_payload = {
         "enabled": True,
-        "model_id": generated.model_id,
+        "model_id": model_ids[0] if model_ids else "",
+        "model_ids": model_ids,
         "screenshot_size": list(image_size),
-        "crop_region": {"left": crop_left, "top": crop_top, "right": crop_right, "bottom": crop_bottom},
+        "crop_region": _screen_region_metadata(crop_left, crop_top, crop_right, crop_bottom),
         "crop_size": list(crop_size),
-        "raw_text": generated.text[:4000],
-        "parsed_element_count": len(elements),
+        "raw_text_by_variant": raw_text_by_variant,
+        "parsed_element_count": parsed_element_count,
         "candidates": candidates,
     }
     if generation_context and generation_context.get("run_dir") and generation_context.get("step_id"):
@@ -13943,6 +14263,7 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
             continue
         if re.search(r"\bv?\d+(?:\.\d+)+\b", lowered):
             continue
+        kind = str(item.get("kind") or "").strip().lower()
         try:
             x, y = int(point[0]), int(point[1])
         except (TypeError, ValueError):
@@ -13950,7 +14271,7 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         if (x, y) in seen_click_points:
             continue
         seen_click_points.add((x, y))
-        click_payload = {"text": text[:80], "point": [x, y], "kind": str(item.get("kind") or ""), "tags": tags}
+        click_payload = {"text": text[:80], "point": [x, y], "kind": kind, "tags": tags}
         bbox = item.get("bbox")
         if isinstance(bbox, list) and len(bbox) >= 4:
             try:
@@ -13996,7 +14317,7 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         "",
         f"PRODUCT_TERMS = {json.dumps(target_terms, ensure_ascii=False)}",
         "TARGET_TERMS = PRODUCT_TERMS",
-        f"VISIBLE_CLICKS = {json.dumps(click_points, ensure_ascii=False)}",
+        f"VISIBLE_CLICKS = json.loads({repr(json.dumps(click_points, ensure_ascii=False))})",
         (
             f"INSTALL_MARKER = Path({json.dumps(install_marker, ensure_ascii=False)}).expanduser()"
             if install_marker
@@ -14293,27 +14614,12 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         "    for item in VISIBLE_CLICKS:",
         "        point = item.get('refined_click_point') or item.get('point') or [0, 0]",
         "        kind = str(item.get('kind') or '').strip().lower()",
-        "        refined_label_bbox = item.get('refined_label_bbox') or []",
-        "        refined_bbox = item.get('refined_bbox') or []",
-        "        if kind in ('checkbox', 'radio') and isinstance(refined_label_bbox, list) and len(refined_label_bbox) >= 4:",
-        "            left, top, right, bottom = [int(value) for value in refined_label_bbox[:4]]",
-        "            x = int((left + right) / 2)",
-        "            y = int((top + bottom) / 2)",
-        "        elif kind in ('checkbox', 'radio') and isinstance(refined_bbox, list) and len(refined_bbox) >= 4:",
-        "            left, top, right, bottom = [int(value) for value in refined_bbox[:4]]",
-        "            x = int((left + right) / 2)",
-        "            y = int(top + max(1, (bottom - top) * 0.7))",
-        "        else:",
-        "            x, y = int(point[0]), int(point[1])",
+        "        x, y = int(point[0]), int(point[1])",
         "        _avoid_failsafe()",
         "        print(f\"click visible installer control: {item.get('text')} at {(x, y)}\")",
         "        pyautogui.click(x, y)",
         "        clicked = True",
-        "        if kind in ('checkbox', 'radio'):",
-        "            time.sleep(0.9)",
-        "        else:",
-        "            time.sleep(0.45)",
-        "        time.sleep(0.35)",
+        "        time.sleep(0.55 if kind in ('checkbox', 'radio') else 0.35)",
         "    return clicked",
         "",
         "packages = _candidate_packages()",

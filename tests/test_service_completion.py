@@ -565,6 +565,27 @@ def test_installer_ui_candidates_observation_uses_cropped_installer_flow(monkeyp
 
         def generate_text(self, **kwargs):  # type: ignore[no-untyped-def]
             self.calls.append(kwargs)
+            if len(self.calls) > 2:
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "text": json.dumps(
+                            {
+                                "controls": [
+                                    {
+                                        "kind": "checkbox",
+                                        "bbox": [150, 450, 250, 550],
+                                        "point": [200, 500],
+                                        "confidence": 0.99,
+                                    }
+                                ]
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "model_id": "fake-model",
+                    },
+                )()
             if len(self.calls) > 1:
                 return type(
                     "Result",
@@ -630,22 +651,33 @@ def test_installer_ui_candidates_observation_uses_cropped_installer_flow(monkeyp
     assert observation is not None
     assert "INSTALLER_VISIBLE_UI_CANDIDATES:" in observation
     assert "MODEL_VISIBLE_UI_CANDIDATES:" not in observation
-    assert len(runtime.calls) == 2
+    assert len(runtime.calls) == 3
     assert runtime.calls[0]["image_bytes"] == buffer.getvalue()
     assert runtime.calls[1]["image_bytes"] != buffer.getvalue()
+    assert runtime.calls[2]["image_bytes"] != runtime.calls[1]["image_bytes"]
     user_payload = json.loads(runtime.calls[0]["prompt_bundle"].user_prompt)
     assert "screen_size" not in user_payload
     assert "crop_region" not in user_payload
     assert "crop_size" not in user_payload
     assert "This image is the installer/dialog crop." in user_payload["instructions"]
+    assert any("pixel coordinates relative to this cropped image" in item for item in user_payload["instructions"])
     assert (tmp_path / "responses" / "step-001.installer-ui-candidates.json").exists()
     candidates = _installer_ui_candidates_from_observation(observation)
     assert candidates[0]["text"] == "동의함"
-    assert candidates[0]["click_point"] == [260, 184]
-    assert candidates[0]["bbox"] == [160, 144, 360, 224]
-    assert candidates[0]["refined_click_point"] == [370, 284]
-    assert candidates[0]["refined_bbox"] == [308, 196, 432, 372]
-    assert candidates[0]["refined_label_bbox"] == [432, 196, 618, 372]
+    assert candidates[0]["click_point"] == [260, 214]
+    assert candidates[0]["bbox"] == [160, 164, 360, 264]
+    assert candidates[0]["coord_space"] == "screen_abs"
+    assert candidates[0]["source_coord_space"] == "installer_crop_pixel"
+    assert candidates[0]["source_region"] == {"left": 60, "top": 64, "right": 1060, "bottom": 864, "width": 1000, "height": 800}
+    assert candidates[0]["source_image_variant"] == "original"
+    assert candidates[0]["refined_click_point"] == [260, 214]
+    assert candidates[0]["refined_coord_space"] == "screen_abs"
+    assert candidates[0]["refined_source_coord_space"] == "installer_refine_crop_pixel"
+    assert candidates[0]["refined_bbox"] == [222, 165, 298, 263]
+    assert candidates[0]["refined_label_bbox"] == [298, 165, 412, 263]
+    assert "final_refined_click_point" not in candidates[0]
+    assert "final_refined_bbox" not in candidates[0]
+    assert candidates[0]["refinement_image_variant"] == "original"
     assert candidates[0]["refinement_match_score"] == 110
     assert "installer_choice_control" in candidates[0]["reason_tags"]
 
@@ -706,7 +738,131 @@ def test_installer_ui_candidates_keeps_tiny_checkbox_bbox_when_point_exists(monk
     assert candidates[0]["bbox"] == [847, 802, 859, 814]
 
 
-def test_model_ui_installer_recovery_keeps_checkbox_raw_click_point(monkeypatch) -> None:
+def test_installer_ui_candidates_treats_in_crop_coordinates_as_pixels(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+
+    class FakeRuntime:
+        def generate_text(self, **_kwargs):  # type: ignore[no-untyped-def]
+            return type(
+                "Result",
+                (),
+                {
+                    "text": json.dumps(
+                        {
+                            "elements": [
+                                {
+                                    "text": "동의함",
+                                    "kind": "label",
+                                    "bbox": [160, 400, 220, 460],
+                                    "point": [190, 430],
+                                    "confidence": 1.0,
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "model_id": "fake-model",
+                },
+            )()
+
+    from io import BytesIO
+    from PIL import Image
+
+    image = Image.new("RGB", (878, 543), "white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        screenshot_base64=base64.b64encode(buffer.getvalue()).decode("ascii"),
+        screenshot_region={"left": 842, "top": 413, "right": 1720, "bottom": 956},
+    )
+
+    observation = _installer_ui_candidates_observation(
+        runtime=FakeRuntime(),  # type: ignore[arg-type]
+        request=request,
+        max_new_tokens=256,
+        generation_context={"run_dir": tmp_path, "step_id": "step-001"},
+    )
+
+    assert observation is not None
+    candidates = _installer_ui_candidates_from_observation(observation)
+    assert len(candidates) == 1
+    assert candidates[0]["text"] == "동의함"
+    assert candidates[0]["click_point"] == [1032, 843]
+    assert candidates[0]["bbox"] == [1002, 813, 1062, 873]
+    assert candidates[0]["source_click_point"] == [190, 430]
+    assert candidates[0]["source_bbox"] == [160, 400, 220, 460]
+
+
+def test_installer_ui_candidates_visually_refines_checkbox_square_from_model_anchor(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_text(self, **_kwargs):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            return type(
+                "Result",
+                (),
+                {
+                    "text": json.dumps(
+                        {
+                            "elements": [
+                                {
+                                    "text": "동의함",
+                                    "kind": "checkbox",
+                                    "bbox": [12, 756, 15, 774],
+                                    "point": [15, 765],
+                                    "confidence": 0.95,
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "model_id": "fake-model",
+                },
+            )()
+
+    from io import BytesIO
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (878, 543), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([44, 435, 63, 454], outline=(80, 80, 80), width=2)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        screenshot_base64=base64.b64encode(buffer.getvalue()).decode("ascii"),
+        screenshot_region={"left": 842, "top": 413, "right": 1720, "bottom": 956},
+    )
+    runtime = FakeRuntime()
+
+    observation = _installer_ui_candidates_observation(
+        runtime=runtime,  # type: ignore[arg-type]
+        request=request,
+        max_new_tokens=256,
+        generation_context={"run_dir": tmp_path, "step_id": "step-001"},
+    )
+
+    assert observation is not None
+    candidates = _installer_ui_candidates_from_observation(observation)
+    assert len(candidates) == 1
+    assert runtime.calls == 1
+    assert "visual_choice_control" in candidates[0]["reason_tags"]
+    assert candidates[0]["visual_refined_source_coord_space"] == "installer_crop_pixel"
+    x, y = candidates[0]["click_point"]
+    assert 890 <= x <= 905
+    assert 850 <= y <= 870
+    assert candidates[0]["source_click_point"][0] >= 44
+    assert candidates[0]["source_click_point"][1] >= 435
+
+
+def test_model_ui_installer_recovery_keeps_model_checkbox_raw_click_point(monkeypatch) -> None:
     monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
     observation = """INSTALLER_VISIBLE_UI_CANDIDATES:
 These candidates come from local model visual extraction of a cropped installer/dialog UI region, not Windows OCR.
@@ -722,12 +878,17 @@ These candidates come from local model visual extraction of a cropped installer/
     assert '"point": [891, 834]' in code
     assert '"kind": "checkbox"' in code
     assert '"bbox": [853, 826, 930, 842]' in code
-    assert "if kind in ('checkbox', 'radio'):" in code
-    assert "refined_bbox = item.get('refined_bbox') or []" in code
-    assert "y = int(top + max(1, (bottom - top) * 0.7))" in code
+    assert "if kind in ('checkbox', 'radio') and isinstance(control_bbox, list)" not in code
+    assert "geometry_valid = bool(item.get('refined_geometry_valid'))" not in code
+    assert "refined_bbox if geometry_valid else []" not in code
+    assert "refined_bbox = item.get('refined_bbox') or []" not in code
+    assert "click_points = [" not in code
+    assert "int(left + width * 0.7)" not in code
+    assert "int(left + width * 0.3)" not in code
+    assert "x = int((left + right) / 2)" not in code
+    assert "y = int((top + bottom) / 2)" not in code
     assert "pyautogui.mouseDown()" not in code
     assert "pyautogui.mouseUp()" not in code
-    assert "time.sleep(0.9)" in code
     assert "_click_point_for_visible_control" not in code
 
 
@@ -747,8 +908,123 @@ These candidates come from local model visual extraction of a cropped installer/
     assert '"refined_click_point": [910, 852]' in code
     assert '"refined_label_bbox": [910, 840, 980, 864]' in code
     assert "point = item.get('refined_click_point') or item.get('point') or [0, 0]" in code
-    assert "refined_label_bbox = item.get('refined_label_bbox') or []" in code
-    assert "if kind in ('checkbox', 'radio') and isinstance(refined_label_bbox, list)" in code
+    assert "refined_label_bbox = item.get('refined_label_bbox') or []" not in code
+    assert "if kind in ('checkbox', 'radio') and isinstance(control_bbox, list)" not in code
+
+
+def test_installer_choice_refinement_rejects_label_text_mismatch(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+
+    class FakeRuntime:
+        def generate_text(self, **_kwargs):  # type: ignore[no-untyped-def]
+            return type(
+                "Result",
+                (),
+                {
+                    "text": json.dumps(
+                        {
+                            "controls": [
+                                {
+                                    "control": {
+                                        "kind": "checkbox",
+                                        "bbox": [100, 100, 150, 150],
+                                        "point": [125, 125],
+                                        "confidence": 0.95,
+                                    },
+                                    "label": {"text": "고클린", "bbox": [160, 100, 300, 150]},
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "model_id": "fake-model",
+                },
+            )()
+
+    from io import BytesIO
+    from PIL import Image
+
+    image = Image.new("RGB", (200, 120), "white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    result = service_module._refine_installer_choice_candidate(
+        runtime=FakeRuntime(),  # type: ignore[arg-type]
+        request=StepRequest(user_prompt="고클린 설치해줘", execution_style="gui_first"),
+        crop_bytes=buffer.getvalue(),
+        crop_size=(200, 120),
+        crop_left=842,
+        crop_top=413,
+        candidate={"text": "동의함", "kind": "checkbox", "bbox": [850, 450, 920, 470]},
+        max_new_tokens=256,
+        generation_context={"run_dir": tmp_path, "step_id": "step-001"},
+        index=0,
+    )
+
+    assert result is None
+    debug = json.loads((tmp_path / "responses" / "step-001.installer-ui-refine-00.json").read_text(encoding="utf-8"))
+    assert debug["refined"]["refinement_rejected"]["reason"] == "label_text_mismatch"
+
+
+def test_installer_choice_refinement_can_use_enhanced_variant(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def generate_text(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(kwargs)
+            payload = json.loads(kwargs["prompt_bundle"].user_prompt)
+            label_text = "동의함" if payload.get("image_variant") == "enhanced" else "다른 선택"
+            return type(
+                "Result",
+                (),
+                {
+                    "text": json.dumps(
+                        {
+                            "controls": [
+                                {
+                                    "control": {
+                                        "kind": "checkbox",
+                                        "bbox": [100, 300, 200, 500],
+                                        "point": [150, 400],
+                                        "confidence": 0.95,
+                                    },
+                                    "label": {"text": label_text, "bbox": [240, 300, 650, 500]},
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "model_id": "fake-model",
+                },
+            )()
+
+    from io import BytesIO
+    from PIL import Image
+
+    image = Image.new("RGB", (120, 90), "white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    runtime = FakeRuntime()
+    result = service_module._refine_installer_choice_candidate(
+        runtime=runtime,  # type: ignore[arg-type]
+        request=StepRequest(user_prompt="고클린 설치해줘", execution_style="gui_first"),
+        crop_bytes=buffer.getvalue(),
+        crop_size=(120, 90),
+        crop_left=10,
+        crop_top=20,
+        candidate={"text": "동의함", "kind": "checkbox", "bbox": [30, 40, 50, 55]},
+        max_new_tokens=256,
+        generation_context={"run_dir": tmp_path, "step_id": "step-001"},
+        index=0,
+    )
+
+    assert result is not None
+    assert len(runtime.calls) == 2
+    assert result["refinement_image_variant"] == "enhanced"
+    assert result["refined_coord_space"] == "screen_abs"
+    assert result["refined_source_coord_space"] == "installer_refine_crop_pixel"
 
 
 def test_installer_ui_candidates_observation_requires_executor_region(monkeypatch) -> None:
