@@ -9544,6 +9544,58 @@ def _looks_like_download_chunk_completed(*, user_prompt: str, last_execution: di
     )
 
 
+def _looks_like_search_download_step(*, request: StepRequest, response: StepResponse, last_execution: dict[str, Any]) -> bool:
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    prompt = str(request.user_prompt or "")
+    if not _looks_like_download_or_install_task(prompt):
+        return False
+    if _looks_like_existing_installer_launch_task(prompt):
+        return False
+    if _looks_like_archive_extract_or_executable_discovery_chunk(prompt):
+        return False
+    model_id = str(response.model_id or "")
+    code = str(response.python_code or "")
+    return bool(
+        model_id
+        in {
+            "framework:model-ui-download-recovery",
+            "framework:official-download-recovery",
+            "framework:visible-download-flow",
+            "framework:model-ui-browser-prelude",
+        }
+        or _looks_like_download_artifact_only_chunk(prompt)
+        or _looks_like_opened_page_only_step(code)
+        or _last_execution_opened_browser_for_gui_flow(last_execution)
+        or _looks_like_partial_download_page_navigation(last_execution)
+        or _looks_like_no_visible_download_candidates(last_execution)
+    )
+
+
+def _last_execution_has_installer_artifact(last_execution: dict[str, Any]) -> bool:
+    if not last_execution:
+        return False
+    combined = "\n".join(str(last_execution.get(key) or "") for key in ("stdout_tail", "stderr_tail")).lower()
+    artifact_markers = (
+        "downloaded:",
+        "downloaded successfully:",
+        "download ready:",
+        "recent download ready:",
+        "prompt-named download ready:",
+        "using existing installer:",
+        "using context installer:",
+        "using previously downloaded artifact:",
+        "using previously downloaded artifact before opening browser:",
+        "using existing installer from downloads before opening browser:",
+        "existing installer found:",
+        "installer_path",
+        "archive_extracted",
+    )
+    if any(marker in combined for marker in artifact_markers):
+        return True
+    return bool(re.search(r"\.(?:exe|msi|zip|alz)\b", combined))
+
+
 def build_executor_client(*, endpoint: str | None, mcp_command: list[str] | None, mcp_cwd: str | None):
     if bool(endpoint) == bool(mcp_command):
         raise RuntimeError("provide exactly one of endpoint or mcp_command")
@@ -16159,6 +16211,8 @@ def run_agent_control_loop(
     dependency_repairs_used = 0
     empty_generation_retries_used = 0
     invalid_generation_retries_used = 0
+    search_download_steps_used = 0
+    search_download_artifact_seen = False
     normalized_preferred_search_engines = ["google"]
     searxng_client = SearXNGClient(base_url=searxng_base_url, timeout_s=web_search_timeout_s) if web_search_enabled else None
 
@@ -16784,6 +16838,18 @@ def run_agent_control_loop(
             final_response = response.to_dict()
             stopped_reason = stopped_reason or "task_completed"
             break
+
+        if _looks_like_search_download_step(request=request, response=response, last_execution=last_execution):
+            search_download_steps_used += 1
+            search_download_artifact_seen = search_download_artifact_seen or _last_execution_has_installer_artifact(last_execution)
+            response.notes.append(f"search_download_steps_used={search_download_steps_used}")
+            if search_download_steps_used >= 3 and not search_download_artifact_seen:
+                response.notes.append("stopped_due_to_search_download_step_limit")
+                final_response = response.to_dict()
+                _write_json(response_path, response.to_dict())
+                stopped_reason = "search_download_step_limit"
+                history.append(f"{step_id}_stopped=search_download_step_limit")
+                break
 
         current_visual_hash = _state_visual_hash(state)
         replan_reasons: list[str] = []
