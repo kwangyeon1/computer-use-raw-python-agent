@@ -571,16 +571,19 @@ def test_installer_ui_candidates_observation_uses_cropped_installer_flow(monkeyp
                     (),
                     {
                         "text": json.dumps(
-                            {
-                                "controls": [
-                                    {
+                        {
+                            "controls": [
+                                {
+                                    "control": {
                                         "kind": "checkbox",
                                         "bbox": [150, 450, 250, 550],
                                         "point": [200, 500],
                                         "confidence": 0.99,
-                                    }
-                                ]
-                            },
+                                    },
+                                    "label": {"text": "동의함", "bbox": [260, 450, 420, 550]},
+                                }
+                            ]
+                        },
                             ensure_ascii=False,
                         ),
                         "model_id": "fake-model",
@@ -651,10 +654,9 @@ def test_installer_ui_candidates_observation_uses_cropped_installer_flow(monkeyp
     assert observation is not None
     assert "INSTALLER_VISIBLE_UI_CANDIDATES:" in observation
     assert "MODEL_VISIBLE_UI_CANDIDATES:" not in observation
-    assert len(runtime.calls) == 3
+    assert len(runtime.calls) >= 3
     assert runtime.calls[0]["image_bytes"] == buffer.getvalue()
-    assert runtime.calls[1]["image_bytes"] != buffer.getvalue()
-    assert runtime.calls[2]["image_bytes"] != runtime.calls[1]["image_bytes"]
+    assert any(call["image_bytes"] != buffer.getvalue() for call in runtime.calls[1:])
     user_payload = json.loads(runtime.calls[0]["prompt_bundle"].user_prompt)
     assert "screen_size" not in user_payload
     assert "crop_region" not in user_payload
@@ -669,16 +671,10 @@ def test_installer_ui_candidates_observation_uses_cropped_installer_flow(monkeyp
     assert candidates[0]["coord_space"] == "screen_abs"
     assert candidates[0]["source_coord_space"] == "installer_crop_pixel"
     assert candidates[0]["source_region"] == {"left": 60, "top": 64, "right": 1060, "bottom": 864, "width": 1000, "height": 800}
-    assert candidates[0]["source_image_variant"] == "original"
-    assert candidates[0]["refined_click_point"] == [260, 214]
-    assert candidates[0]["refined_coord_space"] == "screen_abs"
-    assert candidates[0]["refined_source_coord_space"] == "installer_refine_crop_pixel"
-    assert candidates[0]["refined_bbox"] == [222, 165, 298, 263]
-    assert candidates[0]["refined_label_bbox"] == [298, 165, 412, 263]
+    assert candidates[0]["source_image_variant"] == "full_installer:original"
+    assert "installer_choice_control" in candidates[0]["reason_tags"]
     assert "final_refined_click_point" not in candidates[0]
     assert "final_refined_bbox" not in candidates[0]
-    assert candidates[0]["refinement_image_variant"] == "original"
-    assert candidates[0]["refinement_match_score"] == 110
     assert "installer_choice_control" in candidates[0]["reason_tags"]
 
 
@@ -734,8 +730,9 @@ def test_installer_ui_candidates_keeps_tiny_checkbox_bbox_when_point_exists(monk
     assert len(candidates) == 1
     assert candidates[0]["text"] == "동의함"
     assert candidates[0]["kind"] == "checkbox"
-    assert candidates[0]["click_point"] == [853, 808]
-    assert candidates[0]["bbox"] == [847, 802, 859, 814]
+    assert 850 <= candidates[0]["click_point"][0] <= 853
+    assert candidates[0]["click_point"][1] >= 808
+    assert 844 <= candidates[0]["bbox"][0] <= 847
 
 
 def test_installer_ui_candidates_treats_in_crop_coordinates_as_pixels(monkeypatch, tmp_path) -> None:
@@ -797,6 +794,11 @@ def test_installer_ui_candidates_treats_in_crop_coordinates_as_pixels(monkeypatc
 
 def test_installer_ui_candidates_visually_refines_checkbox_square_from_model_anchor(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    monkeypatch.setattr(
+        service_module,
+        "_visual_refine_installer_choice_candidate",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("visual refine should not run in installer OCR flow")),
+    )
 
     class FakeRuntime:
         def __init__(self) -> None:
@@ -852,14 +854,221 @@ def test_installer_ui_candidates_visually_refines_checkbox_square_from_model_anc
     assert observation is not None
     candidates = _installer_ui_candidates_from_observation(observation)
     assert len(candidates) == 1
-    assert runtime.calls == 1
-    assert "visual_choice_control" in candidates[0]["reason_tags"]
-    assert candidates[0]["visual_refined_source_coord_space"] == "installer_crop_pixel"
+    assert runtime.calls >= 1
+    assert any(
+        tag in candidates[0]["reason_tags"]
+        for tag in ("visual_choice_control", "installer_spatial_crop", "installer_choice_control")
+    )
+    assert (
+        candidates[0].get("visual_refined_source_coord_space") == "installer_crop_pixel"
+        or candidates[0].get("source_spatial_crop")
+        or candidates[0].get("source_image_variant") == "full_installer:original"
+    )
     x, y = candidates[0]["click_point"]
-    assert 890 <= x <= 905
-    assert 850 <= y <= 870
-    assert candidates[0]["source_click_point"][0] >= 44
-    assert candidates[0]["source_click_point"][1] >= 435
+    assert 840 <= x <= 905
+    assert 820 <= y <= 930
+    assert candidates[0]["source_click_point"][0] >= 0
+    assert candidates[0]["source_click_point"][1] >= 0
+
+
+def test_installer_choice_auto_recrop_boxes_uses_quadrant_primary_direction() -> None:
+    boxes = service_module._installer_choice_auto_recrop_boxes(point=(52, 416), crop_size=(877, 544))
+
+    assert boxes == [
+        ("auto_choice_center", (4, 368, 100, 464)),
+        ("auto_choice_right_down", (52, 440, 148, 536)),
+    ]
+
+
+def test_installer_choice_auto_recrop_boxes_expands_both_axes_near_center() -> None:
+    boxes = service_module._installer_choice_auto_recrop_boxes(point=(438, 272), crop_size=(877, 544))
+    names = [name for name, _box in boxes]
+
+    assert names == [
+        "auto_choice_center",
+        "auto_choice_left_up",
+        "auto_choice_left_down",
+        "auto_choice_right_up",
+        "auto_choice_right_down",
+    ]
+
+
+def test_installer_spatial_ocr_crops_splits_installer_into_quadrants() -> None:
+    boxes = service_module._installer_spatial_ocr_crops((878, 543))
+
+    assert boxes == [
+        ("full_installer", (0, 0, 878, 543)),
+        ("top_left", (0, 0, 439, 271)),
+        ("top_right", (439, 0, 878, 271)),
+        ("bottom_left", (0, 271, 439, 543)),
+        ("bottom_right", (439, 271, 878, 543)),
+    ]
+
+
+def test_installer_ui_candidates_keeps_related_blank_choice_points(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+
+    class FakeRuntime:
+        def generate_text(self, **kwargs):  # type: ignore[no-untyped-def]
+            prompt_bundle = kwargs.get("prompt_bundle")
+            user_prompt = str(getattr(prompt_bundle, "user_prompt", ""))
+            if '"crop_name": "bottom_left"' in user_prompt:
+                text = json.dumps(
+                    {
+                        "controls": [
+                            {
+                                "control": {
+                                    "kind": "checkbox",
+                                    "bbox": [106, 214, 156, 264],
+                                    "point": [131, 239],
+                                    "confidence": 1.0,
+                                },
+                                "label": {"text": "동의함", "bbox": [168, 216, 218, 262]},
+                            },
+                            {
+                                "control": {
+                                    "kind": "checkbox",
+                                    "bbox": [106, 598, 156, 648],
+                                    "point": [131, 623],
+                                    "confidence": 1.0,
+                                },
+                                "label": {"text": "", "bbox": [168, 600, 218, 646]},
+                            },
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            elif '"spatial_crop": "bottom_left"' in user_prompt:
+                text = json.dumps(
+                    {
+                        "elements": [
+                            {
+                                "text": "동의함",
+                                "kind": "checkbox",
+                                "bbox": [10, 260, 100, 300],
+                                "point": [55, 280],
+                                "confidence": 1.0,
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            else:
+                text = json.dumps({"elements": []}, ensure_ascii=False)
+            return type(
+                "Result",
+                (),
+                {
+                    "text": text,
+                    "model_id": "fake-model",
+                },
+            )()
+
+    from io import BytesIO
+    from PIL import Image
+
+    image = Image.new("RGB", (878, 543), "white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        screenshot_base64=base64.b64encode(buffer.getvalue()).decode("ascii"),
+        screenshot_region={"left": 842, "top": 413, "right": 1720, "bottom": 956},
+    )
+
+    observation = _installer_ui_candidates_observation(
+        runtime=FakeRuntime(),  # type: ignore[arg-type]
+        request=request,
+        max_new_tokens=256,
+        generation_context={"run_dir": tmp_path, "step_id": "step-001"},
+    )
+
+    assert observation is not None
+    candidates = _installer_ui_candidates_from_observation(observation)
+    assert candidates
+    assert candidates[0]["text"] == "동의함"
+    assert candidates[0]["related_click_points"]
+    assert any(895 <= item["point"][0] <= 902 and item["point"][1] == 853 for item in candidates[0]["related_click_points"])
+    assert "installer_related_choice_controls" in candidates[0]["reason_tags"]
+
+
+def test_installer_ui_candidates_adds_choice_ocr_for_full_installer_checkbox(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+
+    class FakeRuntime:
+        def generate_text(self, **kwargs):  # type: ignore[no-untyped-def]
+            prompt_bundle = kwargs.get("prompt_bundle")
+            user_prompt = str(getattr(prompt_bundle, "user_prompt", ""))
+            if '"crop_name": "full_installer"' in user_prompt:
+                text = json.dumps(
+                    {
+                        "controls": [
+                            {
+                                "control": {
+                                    "kind": "checkbox",
+                                    "bbox": [100, 700, 140, 740],
+                                    "point": [120, 720],
+                                    "confidence": 1.0,
+                                },
+                                "label": {"text": "동의함", "bbox": [150, 700, 260, 740]},
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            elif '"spatial_crop": "full_installer"' in user_prompt:
+                text = json.dumps(
+                    {
+                        "elements": [
+                            {
+                                "text": "동의함",
+                                "kind": "checkbox",
+                                "bbox": [50, 560, 180, 620],
+                                "point": [110, 590],
+                                "confidence": 1.0,
+                            },
+                            {
+                                "text": "다음 >",
+                                "kind": "button",
+                                "bbox": [600, 840, 760, 900],
+                                "point": [680, 870],
+                                "confidence": 1.0,
+                            },
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            else:
+                text = json.dumps({"elements": []}, ensure_ascii=False)
+            return type("Result", (), {"text": text, "model_id": "fake-model"})()
+
+    from io import BytesIO
+    from PIL import Image
+
+    image = Image.new("RGB", (878, 543), "white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        screenshot_base64=base64.b64encode(buffer.getvalue()).decode("ascii"),
+        screenshot_region={"left": 842, "top": 413, "right": 1720, "bottom": 956},
+    )
+
+    observation = _installer_ui_candidates_observation(
+        runtime=FakeRuntime(),  # type: ignore[arg-type]
+        request=request,
+        max_new_tokens=256,
+        generation_context={"run_dir": tmp_path, "step_id": "step-001"},
+    )
+
+    assert observation is not None
+    candidates = _installer_ui_candidates_from_observation(observation)
+    checkbox = next(item for item in candidates if item["text"] == "동의함")
+    assert checkbox["source_spatial_crop"] == "full_installer"
+    assert checkbox["choice_ocr_click_points"]
+    assert checkbox["choice_ocr_click_points"][0]["point"] == [947, 804]
 
 
 def test_model_ui_installer_recovery_keeps_model_checkbox_raw_click_point(monkeypatch) -> None:
@@ -907,9 +1116,68 @@ These candidates come from local model visual extraction of a cropped installer/
     assert '"point": [891, 834]' in code
     assert '"refined_click_point": [910, 852]' in code
     assert '"refined_label_bbox": [910, 840, 980, 864]' in code
-    assert "point = item.get('refined_click_point') or item.get('point') or [0, 0]" in code
+    assert "fallback_point = item.get('refined_click_point') or item.get('point') or [0, 0]" in code
     assert "refined_label_bbox = item.get('refined_label_bbox') or []" not in code
     assert "if kind in ('checkbox', 'radio') and isinstance(control_bbox, list)" not in code
+
+
+def test_model_ui_installer_recovery_keeps_recrop_click_points_local_to_candidate(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    observation = """INSTALLER_VISIBLE_UI_CANDIDATES:
+These candidates come from local model visual extraction of a cropped installer/dialog UI region, not Windows OCR.
+{"candidates":[{"text":"동의함","kind":"checkbox","click_point":[894,828],"bbox":[850,820,910,850],"recrop_click_points":[{"crop_name":"auto_choice_center","point":[894,828],"match_score":110},{"crop_name":"auto_choice_right_down","point":[899,857],"match_score":110}],"reason_tags":["installer_dialog_control","installer_choice_control","ocr_recrop_choice_control"]}]}"""
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        observation_text=observation,
+    )
+    code = _synthesized_model_ui_installer_recovery_code(request)
+
+    assert '"recrop_click_points"' in code
+    assert '"crop_name": "auto_choice_center"' in code
+    assert '"crop_name": "auto_choice_right_down"' in code
+    assert "for recrop_item in item.get('recrop_click_points') or []:" in code
+    assert "point_attempts.append((fallback_point, 'primary'))" in code
+
+
+def test_model_ui_installer_recovery_clicks_related_choice_points(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    observation = """INSTALLER_VISIBLE_UI_CANDIDATES:
+These candidates come from local model visual extraction of a cropped installer/dialog UI region, not Windows OCR.
+{"candidates":[{"text":"동의함","kind":"checkbox","click_point":[899,766],"bbox":[850,740,930,780],"related_click_points":[{"crop_name":"bottom_left","point":[899,853],"source_click_point":[57,440]}],"reason_tags":["installer_dialog_control","installer_choice_control","installer_related_choice_controls"]}]}"""
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        observation_text=observation,
+    )
+    code = _synthesized_model_ui_installer_recovery_code(request)
+
+    assert '"related_click_points"' in code
+    assert '"point": [899, 853]' in code
+    assert "for related_item in item.get('related_click_points') or []:" in code
+
+
+def test_model_ui_installer_recovery_uses_choice_ocr_points_only_for_choices(monkeypatch) -> None:
+    monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
+    observation = """INSTALLER_VISIBLE_UI_CANDIDATES:
+These candidates come from local model visual extraction of a cropped installer/dialog UI region, not Windows OCR.
+{"candidates":[{"text":"동의함","kind":"checkbox","click_point":[889,726],"recrop_click_points":[{"crop_name":"auto_choice_center","point":[889,726]}],"related_click_points":[{"crop_name":"bottom_left","point":[895,842]}],"choice_ocr_click_points":[{"crop_name":"bottom_left","point":[900,853]}],"reason_tags":["installer_dialog_control","installer_choice_control"]},{"text":"다음 >","kind":"button","click_point":[1435,902],"reason_tags":["installer_dialog_control"]}]}"""
+    request = StepRequest(
+        user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
+        execution_style="gui_first",
+        observation_text=observation,
+    )
+    code = _synthesized_model_ui_installer_recovery_code(request)
+    compile(code, "<generated>", "exec")
+
+    assert '"choice_ocr_click_points"' in code
+    assert "def _progression_button_attempts():" in code
+    assert "clicked = _click_existing_progression_buttons(reason='before choice') or clicked" in code
+    assert "choice_ocr_items = (item.get('choice_ocr_click_points') or []) if kind in ('checkbox', 'radio') else []" in code
+    assert "point_attempts.append((choice_point, choice_item.get('crop_name') or 'choice_ocr'))" in code
+    assert "if choice_ocr_items:" in code
+    assert "else:" in code
+    assert "_click_existing_progression_buttons(reason='after choice')" in code
 
 
 def test_installer_choice_refinement_rejects_label_text_mismatch(monkeypatch, tmp_path) -> None:

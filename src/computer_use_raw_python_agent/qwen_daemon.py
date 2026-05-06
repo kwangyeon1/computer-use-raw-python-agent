@@ -364,6 +364,7 @@ def _handle_debug_installer_ocr(daemon_state: AgentDaemonState, payload: dict[st
             user_prompt=prompt,
             policy=load_policy_from_path(str(defaults.get("policy") or "")),
             execution_style="gui_first",
+            request_kind="task_step",
             screenshot_base64=state.get("screenshot_base64"),
             screenshot_media_type=state.get("screenshot_media_type"),
             screenshot_region=state.get("screenshot_region") if isinstance(state.get("screenshot_region"), dict) else None,
@@ -372,12 +373,14 @@ def _handle_debug_installer_ocr(daemon_state: AgentDaemonState, payload: dict[st
             reasoning_enabled=False,
             step_index=int(payload.get("step_index", 1)),
         )
-        observation = _installer_ui_candidates_observation(
-            runtime=daemon_state.ensure_runtime(),
-            request=request,
-            max_new_tokens=int(payload.get("max_new_tokens") or defaults.get("max_new_tokens") or 512),
-            generation_context={"run_dir": run_dir, "step_id": "debug-installer-ocr"},
-        )
+        observation = None
+        if not bool(payload.get("skip_standard_candidates", False)):
+            observation = _installer_ui_candidates_observation(
+                runtime=daemon_state.ensure_runtime(),
+                request=request,
+                max_new_tokens=int(payload.get("max_new_tokens") or defaults.get("max_new_tokens") or 512),
+                generation_context={"run_dir": run_dir, "step_id": "debug-installer-ocr"},
+            )
         candidates = _installer_ui_candidates_from_observation(observation or "")
         multi_crop_results: list[dict[str, Any]] = []
         image_bytes = None
@@ -393,12 +396,16 @@ def _handle_debug_installer_ocr(daemon_state: AgentDaemonState, payload: dict[st
                 image_size = (int.from_bytes(image_bytes[16:20], "big"), int.from_bytes(image_bytes[20:24], "big"))
             if image_size:
                 crop_width, crop_height = image_size
-                crop_specs = [
-                    ("full_installer", (0, 0, crop_width, crop_height)),
-                    ("lower_controls", (0, int(crop_height * 0.62), crop_width, crop_height)),
-                    ("agreement_band", (0, int(crop_height * 0.68), int(crop_width * 0.72), int(crop_height * 0.92))),
-                    ("lower_left_controls", (0, int(crop_height * 0.72), int(crop_width * 0.46), int(crop_height * 0.96))),
-                ]
+                crop_specs = []
+                if not bool(payload.get("custom_crops_only", False)):
+                    crop_specs.extend(
+                        [
+                            ("full_installer", (0, 0, crop_width, crop_height)),
+                            ("lower_controls", (0, int(crop_height * 0.62), crop_width, crop_height)),
+                            ("agreement_band", (0, int(crop_height * 0.68), int(crop_width * 0.72), int(crop_height * 0.92))),
+                            ("lower_left_controls", (0, int(crop_height * 0.72), int(crop_width * 0.46), int(crop_height * 0.96))),
+                        ]
+                    )
                 for custom in payload.get("custom_crop_specs") or []:
                     if not isinstance(custom, dict):
                         continue
