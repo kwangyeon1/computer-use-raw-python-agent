@@ -40,8 +40,11 @@ class ExecutorStdioClient:
             raise RuntimeError(f"stdio executor returned no response. stderr={stderr_text!r}")
         return json.loads(line)
 
-    def observe(self) -> dict[str, Any]:
-        return self._rpc({"action": "observe"})
+    def observe(self, *, screenshot_region: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"action": "observe"}
+        if screenshot_region is not None:
+            payload["screenshot_region"] = screenshot_region
+        return self._rpc(payload)
 
     def execute(
         self,
@@ -50,16 +53,18 @@ class ExecutorStdioClient:
         run_dir: str,
         step_id: str,
         metadata: dict[str, Any] | None = None,
+        screenshot_region: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._rpc(
-            {
-                "action": "execute",
-                "python_code": python_code,
-                "run_dir": run_dir,
-                "step_id": step_id,
-                "metadata": metadata or {},
-            }
-        )
+        payload: dict[str, Any] = {
+            "action": "execute",
+            "python_code": python_code,
+            "run_dir": run_dir,
+            "step_id": step_id,
+            "metadata": metadata or {},
+        }
+        if screenshot_region is not None:
+            payload["screenshot_region"] = screenshot_region
+        return self._rpc(payload)
 
     def close(self) -> None:
         if self._proc is None:
@@ -94,8 +99,11 @@ class ExecutorHttpClient:
             raise RuntimeError(f"http executor error status={exc.code} body={body!r}") from exc
         return json.loads(body)
 
-    def observe(self) -> dict[str, Any]:
-        return self._rpc({"action": "observe"})
+    def observe(self, *, screenshot_region: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"action": "observe"}
+        if screenshot_region is not None:
+            payload["screenshot_region"] = screenshot_region
+        return self._rpc(payload)
 
     def execute(
         self,
@@ -104,16 +112,18 @@ class ExecutorHttpClient:
         run_dir: str,
         step_id: str,
         metadata: dict[str, Any] | None = None,
+        screenshot_region: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._rpc(
-            {
-                "action": "execute",
-                "python_code": python_code,
-                "run_dir": run_dir,
-                "step_id": step_id,
-                "metadata": metadata or {},
-            }
-        )
+        payload: dict[str, Any] = {
+            "action": "execute",
+            "python_code": python_code,
+            "run_dir": run_dir,
+            "step_id": step_id,
+            "metadata": metadata or {},
+        }
+        if screenshot_region is not None:
+            payload["screenshot_region"] = screenshot_region
+        return self._rpc(payload)
 
     def close(self) -> None:
         return None

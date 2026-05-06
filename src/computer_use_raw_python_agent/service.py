@@ -10160,6 +10160,10 @@ def _is_low_signal_target_keyword(value: str) -> bool:
         "실제로",
         "존재한다",
         "downloaded",
+        "explicit",
+        "find",
+        "top-level",
+        "toplevel",
     }:
         return True
     if re.fullmatch(r"[가-힣]", cleaned):
@@ -10293,6 +10297,89 @@ def _strip_replan_diagnostic_summaries(text: str) -> str:
             end = min(next_candidates) if next_candidates else len(cleaned)
             cleaned = cleaned[:start] + "\n" + cleaned[end:]
     return cleaned
+
+
+def _installer_recovery_target_terms(request: StepRequest | None, *, limit: int = 4) -> list[str]:
+    if request is None:
+        return []
+    prompt_text = _strip_replan_diagnostic_summaries(str(request.user_prompt or ""))
+    reject_keywords = {
+        "setup",
+        "install",
+        "installer",
+        "launch",
+        "run",
+        "start",
+        "next",
+        "finish",
+        "continue",
+        "confirm",
+        "agreement",
+        "agree",
+        "accept",
+        "license",
+        "terms",
+        "subprocess",
+        "popen",
+        "startfile",
+        "msiexec",
+        "python",
+        "pyautogui",
+        "다음",
+        "설치",
+        "마침",
+        "완료",
+        "계속",
+        "확인",
+        "예",
+        "동의",
+        "동의함",
+        "동의합니다",
+        "약관",
+        "사용권",
+        "라이선스",
+        "진행",
+        "실행",
+        "시작",
+        "프로그램",
+    }
+    merged: list[str] = []
+
+    def _append_keyword(keyword: str) -> bool:
+        cleaned = str(keyword or "").strip().lower().strip("._-")
+        if not cleaned or cleaned in merged:
+            return False
+        if cleaned in reject_keywords or _is_low_signal_target_keyword(cleaned):
+            return False
+        if re.fullmatch(r"v?\d+(?:\.\d+)*", cleaned):
+            return False
+        merged.append(cleaned)
+        return len(merged) >= limit
+
+    task_segments = _iter_source_task_prompt_segments(prompt_text)
+    for source_text in task_segments:
+        for keyword in _prompt_keyword_candidates(str(source_text or ""), limit=max(limit * 4, 12)):
+            if _append_keyword(keyword):
+                return merged
+
+    explicit_installer = _extract_prompt_download_glob(prompt_text)
+    if explicit_installer:
+        for keyword in _installer_filename_keywords(explicit_installer, limit=max(limit, 4)):
+            if _append_keyword(keyword):
+                return merged
+        explicit_stem = Path(str(explicit_installer or "")).stem
+        for keyword in _prompt_keyword_candidates(explicit_stem, limit=max(limit * 2, 8)):
+            if _append_keyword(keyword):
+                return merged
+
+    if merged and (task_segments or explicit_installer):
+        return merged[:limit]
+
+    prompt_without_urls = re.sub(r"https?://\S+", " ", prompt_text)
+    for keyword in _prompt_keyword_candidates(prompt_without_urls, limit=max(limit * 4, 12)):
+        if _append_keyword(keyword):
+            return merged
+    return merged
 
 
 def _visible_flow_extra_targets(request: StepRequest | None, *, limit: int = 4) -> list[str]:
@@ -11446,8 +11533,20 @@ def _should_use_model_ui_candidates(request: StepRequest) -> bool:
     if not (request.screenshot_base64 or request.screenshot_path):
         return False
     if _looks_like_existing_installer_launch_task(request.user_prompt):
-        return True
+        return False
     return int(request.step_index or 0) > 0 or _has_visible_gui_continuation_cues(request)
+
+
+def _should_use_installer_ui_candidates(request: StepRequest) -> bool:
+    if not _MODEL_UI_CANDIDATES_ENABLED:
+        return False
+    if request.request_kind != "task_step":
+        return False
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    if not (request.screenshot_base64 or request.screenshot_path):
+        return False
+    return _looks_like_existing_installer_launch_task(request.user_prompt)
 
 
 def _request_image_bytes(request: StepRequest) -> bytes | None:
@@ -11481,6 +11580,78 @@ def _image_size_from_bytes(image_bytes: bytes | None) -> tuple[int, int] | None:
 
 def _request_screenshot_size(request: StepRequest) -> tuple[int, int] | None:
     return _image_size_from_bytes(_request_image_bytes(request))
+
+
+def _normalize_screenshot_region(value: Any) -> dict[str, int] | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        left = int(value.get("left"))
+        top = int(value.get("top"))
+        right = int(value.get("right"))
+        bottom = int(value.get("bottom"))
+    except (TypeError, ValueError):
+        return None
+    if right <= left or bottom <= top:
+        return None
+    return {"left": left, "top": top, "right": right, "bottom": bottom}
+
+
+def _installer_launcher_pid_from_last_execution(request: StepRequest | None) -> int | None:
+    if request is None or not isinstance(request.last_execution, dict):
+        return None
+    text_parts = [
+        request.last_execution.get("stdout_tail"),
+        request.last_execution.get("stderr_tail"),
+    ]
+    payload_metadata = request.last_execution.get("payload_metadata")
+    if isinstance(payload_metadata, dict):
+        text_parts.append(json.dumps(payload_metadata, ensure_ascii=False))
+    combined = "\n".join(str(part or "") for part in text_parts)
+    for match in re.finditer(r"\binstaller_launcher_pid\s*[:=]\s*(\d+)\b", combined, flags=re.IGNORECASE):
+        try:
+            pid = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if pid > 0:
+            return pid
+    return None
+
+
+def _execution_screenshot_region_for_request(request: StepRequest | None) -> dict[str, Any] | None:
+    if request is None:
+        return None
+    if not _should_use_installer_ui_candidates(request):
+        return None
+    expected_pid = _installer_launcher_pid_from_last_execution(request)
+    if expected_pid is not None:
+        return {"mode": "installer_window", "expected_pid": expected_pid}
+    existing_region = _normalize_screenshot_region(request.screenshot_region)
+    if existing_region is not None:
+        return existing_region
+    return {"mode": "installer_window"}
+
+
+def _coerce_model_point(value: Any, *, image_size: tuple[int, int] | None) -> tuple[int, int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    try:
+        x, y = float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return None
+    if image_size:
+        width, height = image_size
+        if 0 <= x <= 1 and 0 <= y <= 1:
+            x *= width
+            y *= height
+        elif 0 <= x <= 1000 and 0 <= y <= 1000:
+            x = x / 1000.0 * width
+            y = y / 1000.0 * height
+        x = max(0, min(int(round(x)), width - 1))
+        y = max(0, min(int(round(y)), height - 1))
+    else:
+        x, y = int(round(x)), int(round(y))
+    return x, y
 
 
 def _extract_json_object_or_array(text: str) -> Any:
@@ -12184,6 +12355,1224 @@ def _model_ui_candidates_observation(
     )
 
 
+def _score_installer_ui_candidate(text: str, kind: str) -> tuple[int, list[str]]:
+    normalized = str(text or "").strip().lower()
+    original = str(text or "").strip()
+    kind_normalized = str(kind or "").strip().lower()
+    if not normalized:
+        return 0, []
+    reject_terms = ("cancel", "close", "back", "decline", "no", "취소", "닫기", "뒤로", "거부", "아니", "아니오")
+    if any(term in normalized for term in reject_terms):
+        return -100, ["installer_reject_control"]
+    score = 0
+    tags: list[str] = []
+    if kind_normalized in {"button", "checkbox", "radio", "input", "control", "text"}:
+        score += 10
+        tags.append("installer_ui_kind")
+    primary_terms_en = (
+        "agree",
+        "accept",
+        "agreement",
+        "license",
+        "terms",
+        "ok",
+        "yes",
+        "next",
+        "install",
+        "finish",
+        "continue",
+        "confirm",
+    )
+    primary_terms_ko = (
+        "동의",
+        "동의함",
+        "약관",
+        "사용권",
+        "라이선스",
+        "확인",
+        "예",
+        "다음",
+        "설치",
+        "마침",
+        "완료",
+        "계속",
+        "진행",
+    )
+    if any(term in normalized for term in primary_terms_en) or any(term in original for term in primary_terms_ko):
+        score += 70
+        tags.append("installer_dialog_control")
+    if kind_normalized in {"checkbox", "radio"}:
+        score += 20
+        tags.append("installer_choice_control")
+    if re.search(r"\bv?\d+(?:\.\d+)+\b", normalized):
+        score -= 18
+        tags.append("version_text_penalty")
+    return score, list(dict.fromkeys(tags))
+
+
+def _crop_png_bytes(image_bytes: bytes, box: tuple[int, int, int, int]) -> tuple[bytes, tuple[int, int]] | None:
+    try:
+        from io import BytesIO
+        from PIL import Image
+
+        with Image.open(BytesIO(image_bytes)) as source:
+            cropped = source.crop(box)
+            buffer = BytesIO()
+            cropped.save(buffer, format="PNG")
+            return buffer.getvalue(), (int(cropped.width), int(cropped.height))
+    except Exception:
+        return None
+
+
+def _enhanced_ocr_image_variants(
+    image_bytes: bytes,
+    image_size: tuple[int, int],
+    *,
+    include_original: bool = True,
+) -> list[dict[str, Any]]:
+    variants: list[dict[str, Any]] = []
+    if include_original:
+        variants.append({"name": "original", "bytes": image_bytes, "size": image_size, "scale": 1.0})
+    try:
+        from io import BytesIO
+        from PIL import Image, ImageOps
+
+        with Image.open(BytesIO(image_bytes)) as source:
+            rgb = source.convert("RGB")
+            width, height = image_size
+            scale = 2.0 if max(width, height) < 1200 else 1.5
+            enlarged_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+            enlarged = rgb.resize(enlarged_size, Image.Resampling.LANCZOS)
+            enhanced = ImageOps.autocontrast(enlarged.convert("L")).convert("RGB")
+            enhanced_buffer = BytesIO()
+            enhanced.save(enhanced_buffer, format="PNG")
+            variants.append(
+                {
+                    "name": "enhanced",
+                    "bytes": enhanced_buffer.getvalue(),
+                    "size": enlarged_size,
+                    "scale": scale,
+                }
+            )
+    except Exception:
+        pass
+    return variants
+
+
+def _screen_region_metadata(left: int, top: int, right: int, bottom: int) -> dict[str, int]:
+    return {
+        "left": int(left),
+        "top": int(top),
+        "right": int(right),
+        "bottom": int(bottom),
+        "width": max(0, int(right) - int(left)),
+        "height": max(0, int(bottom) - int(top)),
+    }
+
+
+def _scale_point_to_base(point: tuple[int, int], scale: float) -> tuple[int, int]:
+    safe_scale = max(float(scale or 1.0), 0.001)
+    return (int(round(point[0] / safe_scale)), int(round(point[1] / safe_scale)))
+
+
+def _scale_bbox_to_base(bbox: tuple[int, int, int, int], scale: float) -> tuple[int, int, int, int]:
+    safe_scale = max(float(scale or 1.0), 0.001)
+    return (
+        int(round(bbox[0] / safe_scale)),
+        int(round(bbox[1] / safe_scale)),
+        int(round(bbox[2] / safe_scale)),
+        int(round(bbox[3] / safe_scale)),
+    )
+
+
+def _offset_point_to_screen(point: tuple[int, int], left: int, top: int) -> list[int]:
+    return [int(left + point[0]), int(top + point[1])]
+
+
+def _offset_bbox_to_screen(bbox: tuple[int, int, int, int], left: int, top: int) -> list[int]:
+    return [int(left + bbox[0]), int(top + bbox[1]), int(left + bbox[2]), int(top + bbox[3])]
+
+
+def _coerce_installer_crop_point(value: Any, *, image_size: tuple[int, int] | None) -> tuple[int, int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    try:
+        x, y = float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return None
+    if not image_size:
+        return int(round(x)), int(round(y))
+    width, height = image_size
+    if 0 <= x <= width and 0 <= y <= height:
+        return max(0, min(int(round(x)), width - 1)), max(0, min(int(round(y)), height - 1))
+    return _coerce_model_point(value, image_size=image_size)
+
+
+def _coerce_installer_crop_bbox(value: Any, *, image_size: tuple[int, int] | None) -> tuple[int, int, int, int] | None:
+    if isinstance(value, dict):
+        raw_values = [value.get(key) for key in ("left", "top", "right", "bottom")]
+        if any(item is None for item in raw_values):
+            left = value.get("x")
+            top = value.get("y")
+            width_value = value.get("width", value.get("w"))
+            height_value = value.get("height", value.get("h"))
+            raw_values = [
+                left,
+                top,
+                None if left is None or width_value is None else float(left) + float(width_value),
+                None if top is None or height_value is None else float(top) + float(height_value),
+            ]
+    elif isinstance(value, (list, tuple)) and len(value) >= 4:
+        raw_values = list(value[:4])
+    else:
+        return None
+    try:
+        left, top, right, bottom = [float(item) for item in raw_values]
+    except (TypeError, ValueError):
+        return None
+    if right <= left or bottom <= top:
+        right = left + abs(right)
+        bottom = top + abs(bottom)
+    if not image_size:
+        left, top, right, bottom = [int(round(item)) for item in (left, top, right, bottom)]
+        return (left, top, right, bottom) if right - left >= 4 and bottom - top >= 4 else None
+    width, height = image_size
+    if 0 <= left <= width and 0 <= top <= height and 0 <= right <= width and 0 <= bottom <= height:
+        coerced = (
+            max(0, min(int(round(left)), width - 1)),
+            max(0, min(int(round(top)), height - 1)),
+            max(0, min(int(round(right)), width)),
+            max(0, min(int(round(bottom)), height)),
+        )
+        return coerced if coerced[2] - coerced[0] >= 4 and coerced[3] - coerced[1] >= 4 else None
+    return _coerce_model_bbox(value, image_size=image_size)
+
+
+def _choice_control_elements_from_payload(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict) and isinstance(payload.get("control"), dict):
+        control = dict(payload["control"])
+        if isinstance(payload.get("label"), dict):
+            label = payload["label"]
+            if "text" not in control:
+                control["text"] = label.get("text", "")
+            control.setdefault("label_text", label.get("text", ""))
+            if "bbox" in label:
+                control.setdefault("label_bbox", label.get("bbox"))
+        return [control]
+    if isinstance(payload, dict):
+        for key in ("controls", "choices", "elements", "items", "candidates"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                controls: list[dict[str, Any]] = []
+                for item in value:
+                    if not isinstance(item, dict):
+                        continue
+                    if isinstance(item.get("control"), dict):
+                        control = dict(item["control"])
+                        if isinstance(item.get("label"), dict):
+                            label = item["label"]
+                            if "text" not in control:
+                                control["text"] = label.get("text", "")
+                            control.setdefault("label_text", label.get("text", ""))
+                            if "bbox" in label:
+                                control.setdefault("label_bbox", label.get("bbox"))
+                        controls.append(control)
+                    else:
+                        controls.append(item)
+                return controls
+    return _model_ui_ocr_elements_from_payload(payload)
+
+
+def _installer_choice_text_score(candidate_text: str, item: dict[str, Any]) -> int:
+    expected = re.sub(r"\s+", "", str(candidate_text or "").strip().lower())
+    texts = [
+        item.get("text"),
+        item.get("label"),
+        item.get("label_text"),
+    ]
+    unique_texts = list(dict.fromkeys(str(text or "").strip() for text in texts if str(text or "").strip()))
+    combined = re.sub(r"\s+", "", " ".join(unique_texts).lower())
+    if not expected or not combined:
+        return 0
+    if expected == combined:
+        return 100
+    if expected in combined or combined in expected:
+        return 80
+    expected_tokens = set(re.findall(r"[a-z0-9가-힣]+", expected))
+    combined_tokens = set(re.findall(r"[a-z0-9가-힣]+", combined))
+    if not expected_tokens or not combined_tokens:
+        return 0
+    return len(expected_tokens & combined_tokens) * 20
+
+
+def _best_choice_control_from_elements(
+    elements: list[dict[str, Any]],
+    *,
+    candidate_text: str,
+    image_size: tuple[int, int],
+    image_scale_to_base: float,
+) -> dict[str, Any] | None:
+    best: dict[str, Any] | None = None
+    best_score = -1
+    for item in elements:
+        item_kind = str(item.get("kind") or item.get("type") or "").strip().lower()
+        if item_kind and item_kind not in {"checkbox", "radio", "control", "input"}:
+            continue
+        point = _coerce_model_point(item.get("point") or item.get("click_point"), image_size=image_size)
+        item_bbox = _coerce_model_bbox(item.get("bbox") or item.get("box") or item.get("rect"), image_size=image_size)
+        label_bbox = _coerce_model_bbox(item.get("label_bbox"), image_size=image_size)
+        if point is None and item_bbox is not None:
+            left, top, right, bottom = item_bbox
+            point = (int((left + right) / 2), int((top + bottom) / 2))
+        if point is None:
+            continue
+        base_point = _scale_point_to_base(point, image_scale_to_base)
+        base_bbox = _scale_bbox_to_base(item_bbox, image_scale_to_base) if item_bbox is not None else None
+        base_label_bbox = _scale_bbox_to_base(label_bbox, image_scale_to_base) if label_bbox is not None else None
+        text_score = _installer_choice_text_score(candidate_text, item)
+        kind_score = 10 if item_kind in {"checkbox", "radio"} else 0
+        total_score = text_score + kind_score
+        if total_score > best_score:
+            best_score = total_score
+            best = {
+                "raw": item,
+                "point": base_point,
+                "bbox": base_bbox,
+                "label_bbox": base_label_bbox,
+                "match_score": total_score,
+            }
+    return best
+
+
+def _visual_refine_installer_choice_candidate(
+    *,
+    crop_bytes: bytes,
+    crop_size: tuple[int, int],
+    crop_left: int,
+    crop_top: int,
+    candidate: dict[str, Any],
+) -> dict[str, Any] | None:
+    kind = str(candidate.get("kind") or "").strip().lower()
+    if kind not in {"checkbox", "radio"}:
+        return None
+    source_point = candidate.get("source_click_point")
+    if not isinstance(source_point, list) or len(source_point) < 2:
+        return None
+    try:
+        anchor_x, anchor_y = int(source_point[0]), int(source_point[1])
+    except (TypeError, ValueError):
+        return None
+    width, height = crop_size
+    if width <= 0 or height <= 0:
+        return None
+    try:
+        from io import BytesIO
+        from PIL import Image, ImageOps
+
+        with Image.open(BytesIO(crop_bytes)) as source:
+            gray = ImageOps.grayscale(source.convert("RGB"))
+    except Exception:
+        return None
+    pixels = gray.load()
+    search_left = max(0, anchor_x - 120)
+    search_right = min(width, anchor_x + 180)
+    search_top = max(0, anchor_y - 90)
+    search_bottom = min(height, anchor_y + 90)
+    if search_right - search_left < 12 or search_bottom - search_top < 12:
+        return None
+    best: tuple[float, int, int, int, int, int] | None = None
+    for top in range(search_top, search_bottom):
+        for left in range(search_left, search_right):
+            for size in range(10, 30):
+                right = left + size
+                bottom = top + size
+                if right >= search_right or bottom >= search_bottom:
+                    continue
+                top_dark = sum(1 for offset in range(size) if pixels[left + offset, top] < 190)
+                bottom_dark = sum(1 for offset in range(size) if pixels[left + offset, bottom - 1] < 190)
+                left_dark = sum(1 for offset in range(size) if pixels[left, top + offset] < 190)
+                right_dark = sum(1 for offset in range(size) if pixels[right - 1, top + offset] < 190)
+                if min(top_dark, bottom_dark, left_dark, right_dark) < 3:
+                    continue
+                border_strength = top_dark + bottom_dark + left_dark + right_dark
+                if border_strength < int(size * 1.1):
+                    continue
+                interior_values = [
+                    pixels[x, y]
+                    for y in range(top + 3, bottom - 3, 3)
+                    for x in range(left + 3, right - 3, 3)
+                ]
+                if not interior_values:
+                    continue
+                interior_light = sum(1 for value in interior_values if value > 170)
+                interior_dark = sum(1 for value in interior_values if value < 130)
+                if interior_light < max(1, len(interior_values) // 2):
+                    continue
+                if interior_dark > max(2, int(len(interior_values) * 0.18)):
+                    continue
+                center_x = left + size // 2
+                center_y = top + size // 2
+                distance = ((center_x - anchor_x) ** 2 + (center_y - anchor_y) ** 2) ** 0.5
+                score = (
+                    float(border_strength)
+                    + float(min(top_dark, bottom_dark, left_dark, right_dark) * 4)
+                    + float(interior_light)
+                    - distance * 1.3
+                )
+                if best is None or score > best[0]:
+                    best = (score, center_x, center_y, left, top, size)
+    if best is None:
+        return None
+    score, center_x, center_y, left, top, size = best
+    if score < 20:
+        return None
+    source_bbox = (left, top, left + size, top + size)
+    source_point = (center_x, center_y)
+    return {
+        "click_point": _offset_point_to_screen(source_point, crop_left, crop_top),
+        "bbox": _offset_bbox_to_screen(source_bbox, crop_left, crop_top),
+        "source_click_point": [int(source_point[0]), int(source_point[1])],
+        "source_bbox": [int(source_bbox[0]), int(source_bbox[1]), int(source_bbox[2]), int(source_bbox[3])],
+        "visual_refined_click_point": _offset_point_to_screen(source_point, crop_left, crop_top),
+        "visual_refined_bbox": _offset_bbox_to_screen(source_bbox, crop_left, crop_top),
+        "visual_refined_source_coord_space": "installer_crop_pixel",
+        "visual_refined_score": int(round(score)),
+    }
+
+
+def _installer_spatial_ocr_crops(crop_size: tuple[int, int]) -> list[tuple[str, tuple[int, int, int, int]]]:
+    width, height = crop_size
+    if width <= 0 or height <= 0:
+        return []
+    mid_x = max(1, int(width / 2))
+    mid_y = max(1, int(height / 2))
+    return [
+        ("full_installer", (0, 0, width, height)),
+        ("top_left", (0, 0, mid_x, mid_y)),
+        ("top_right", (mid_x, 0, width, mid_y)),
+        ("bottom_left", (0, mid_y, mid_x, height)),
+        ("bottom_right", (mid_x, mid_y, width, height)),
+    ]
+
+
+def _installer_choice_auto_recrop_boxes(
+    *,
+    point: tuple[int, int],
+    crop_size: tuple[int, int],
+) -> list[tuple[str, tuple[int, int, int, int]]]:
+    width, height = crop_size
+    x, y = point
+    boxes: list[tuple[str, tuple[int, int, int, int]]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    if width <= 0 or height <= 0:
+        return boxes
+
+    def zone(value: int, limit: int) -> str:
+        if value < int(limit * 0.35):
+            return "low"
+        if value > int(limit * 0.65):
+            return "high"
+        return "center"
+
+    x_zone = zone(x, width)
+    y_zone = zone(y, height)
+    x_dirs = {"low": ["right"], "center": ["left", "right"], "high": ["left"]}[x_zone]
+    y_dirs = {"low": ["up"], "center": ["up", "down"], "high": ["down"]}[y_zone]
+
+    def box_for(x_dir: str, y_dir: str) -> tuple[int, int, int, int]:
+        size = 96
+        half = size // 2
+        margin = 24
+        if x_dir == "left":
+            left, right = x - size, x
+        elif x_dir == "right":
+            left, right = x, x + size
+        else:
+            left, right = x - half, x + half
+        if y_dir == "up":
+            top, bottom = y - size - margin, y - margin
+        elif y_dir == "down":
+            top, bottom = y + margin, y + margin + size
+        else:
+            top, bottom = y - half, y + half
+        return left, top, right, bottom
+
+    specs: list[tuple[str, tuple[int, int, int, int]]] = [("auto_choice_center", box_for("center", "center"))]
+    for x_dir in x_dirs:
+        for y_dir in y_dirs:
+            specs.append((f"auto_choice_{x_dir}_{y_dir}", box_for(x_dir, y_dir)))
+
+    for name, raw_box in specs:
+        left, top, right, bottom = raw_box
+        left = max(0, left)
+        top = max(0, top)
+        right = min(width, right)
+        bottom = min(height, bottom)
+        if right - left < 16 or bottom - top < 16:
+            continue
+        box = (left, top, right, bottom)
+        if box in seen:
+            continue
+        seen.add(box)
+        boxes.append((name, box))
+    return boxes
+
+
+def _recrop_refine_installer_choice_candidate(
+    *,
+    runtime: AgentRuntime,
+    request: StepRequest,
+    crop_bytes: bytes,
+    crop_size: tuple[int, int],
+    crop_left: int,
+    crop_top: int,
+    candidate: dict[str, Any],
+    max_new_tokens: int,
+    generation_context: dict[str, Any] | None,
+    index: int,
+) -> dict[str, Any] | None:
+    kind = str(candidate.get("kind") or "").strip().lower()
+    if kind not in {"checkbox", "radio"}:
+        return None
+    source_point = candidate.get("source_click_point")
+    if not isinstance(source_point, list) or len(source_point) < 2:
+        return None
+    try:
+        anchor = (int(source_point[0]), int(source_point[1]))
+    except (TypeError, ValueError):
+        return None
+    candidate_text = str(candidate.get("text") or "")
+    best: dict[str, Any] | None = None
+    best_score = -1
+    raw_text_by_crop: list[dict[str, Any]] = []
+    recrop_click_points: list[dict[str, Any]] = []
+    seen_recrop_points: set[tuple[int, int]] = set()
+    for crop_name, box in _installer_choice_auto_recrop_boxes(point=anchor, crop_size=crop_size):
+        cropped = _crop_png_bytes(crop_bytes, box)
+        if cropped is None:
+            continue
+        small_bytes, small_size = cropped
+        generated = runtime.generate_text(
+            prompt_bundle=PromptBundle(
+                system_prompt=(
+                    "Return compact strict JSON only. Do not return markdown, Python, prose, or reasoning. "
+                    "Extract the actual clickable checkbox or radio input from this tiny installer/dialog crop."
+                ),
+                user_prompt=json.dumps(
+                    {
+                        "candidate_text": candidate_text,
+                        "candidate_kind": kind,
+                        "crop_name": crop_name,
+                        "instructions": [
+                            "This image is a tiny crop around a model-visible checkbox/radio candidate.",
+                            "Return the actual clickable checkbox/radio control, not a decorative bullet and not the label center.",
+                            "If a checkbox/radio input is visible, include it even if only part of the adjacent label is visible.",
+                            "Use bbox and point relative to this tiny crop. For Qwen3.5/Qwen3-VL, use normalized 0-1000 coordinates.",
+                            "Output exactly: {\"controls\":[{\"control\":{\"kind\":\"checkbox|radio\",\"bbox\":[l,t,r,b],\"point\":[x,y],\"confidence\":0.0},\"label\":{\"text\":\"...\",\"bbox\":[l,t,r,b]}}]}",
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                session_prompt=request.user_prompt,
+                policy=request.policy,
+                execution_style=request.execution_style,
+                reasoning_enabled=False,
+                observation_text=None,
+                last_execution=request.last_execution,
+                web_search_context={},
+                recent_history=request.recent_history,
+                replan_requested=request.replan_requested,
+                replan_reasons=request.replan_reasons,
+            ),
+            image_path=None,
+            image_bytes=small_bytes,
+            use_blank_image=False,
+            max_new_tokens=min(max(int(max_new_tokens or 256), 160), 320),
+            generation_context=generation_context,
+        )
+        payload = _extract_json_object_or_array(generated.text)
+        elements = _choice_control_elements_from_payload(payload)
+        if not elements:
+            elements = _model_ui_ocr_elements_from_text(generated.text)
+        raw_text_by_crop.append({"crop_name": crop_name, "box": list(box), "raw_text": generated.text[:4000]})
+        for item in elements:
+            item_kind = str(item.get("kind") or item.get("type") or "").strip().lower()
+            if item_kind and item_kind not in {"checkbox", "radio", "control", "input"}:
+                continue
+            point = _coerce_model_point(item.get("point") or item.get("click_point"), image_size=small_size)
+            bbox = _coerce_model_bbox(item.get("bbox") or item.get("box") or item.get("rect"), image_size=small_size)
+            label_bbox = _coerce_model_bbox(item.get("label_bbox"), image_size=small_size)
+            if point is None and bbox is not None:
+                left, top, right, bottom = bbox
+                point = (int((left + right) / 2), int((top + bottom) / 2))
+            if point is None:
+                continue
+            text_score = _installer_choice_text_score(candidate_text, item)
+            if text_score <= 0:
+                continue
+            kind_score = 10 if item_kind in {"checkbox", "radio"} else 0
+            full_point = (box[0] + point[0], box[1] + point[1])
+            if full_point[0] < 16 or full_point[1] < 8:
+                continue
+            screen_point = _offset_point_to_screen(full_point, crop_left, crop_top)
+            recrop_point_key = (int(screen_point[0]), int(screen_point[1]))
+            if recrop_point_key not in seen_recrop_points:
+                seen_recrop_points.add(recrop_point_key)
+                recrop_click_points.append(
+                    {
+                        "crop_name": crop_name,
+                        "point": screen_point,
+                        "source_click_point": [int(full_point[0]), int(full_point[1])],
+                        "match_score": int(text_score + kind_score),
+                    }
+                )
+            # Prefer the lower retry crop when OCR confidence is otherwise equivalent. This keeps the choice
+            # OCR-driven while compensating for whole-dialog OCR often placing Korean checkbox labels too high.
+            total_score = text_score + kind_score + int(full_point[1] / 1000)
+            if total_score <= best_score:
+                continue
+            full_bbox = None
+            if bbox is not None:
+                left, top, right, bottom = bbox
+                full_bbox = (box[0] + left, box[1] + top, box[0] + right, box[1] + bottom)
+            full_label_bbox = None
+            if label_bbox is not None:
+                left, top, right, bottom = label_bbox
+                full_label_bbox = (box[0] + left, box[1] + top, box[0] + right, box[1] + bottom)
+            best_score = total_score
+            best = {
+                "crop_name": crop_name,
+                "crop_box": box,
+                "point": full_point,
+                "bbox": full_bbox,
+                "label_bbox": full_label_bbox,
+                "match_score": text_score + kind_score,
+                "model_id": generated.model_id,
+                "raw": item,
+            }
+    if best is None or int(best.get("match_score") or 0) < 10:
+        return None
+    point_x, point_y = best["point"]
+    refined: dict[str, Any] = {
+        "click_point": _offset_point_to_screen((point_x, point_y), crop_left, crop_top),
+        "source_click_point": [int(point_x), int(point_y)],
+        "ocr_recrop_click_point": _offset_point_to_screen((point_x, point_y), crop_left, crop_top),
+        "ocr_recrop_source_coord_space": "installer_crop_pixel",
+        "ocr_recrop_crop_name": best.get("crop_name"),
+        "ocr_recrop_crop_box": list(best.get("crop_box") or []),
+        "ocr_recrop_model_id": best.get("model_id"),
+        "ocr_recrop_match_score": int(best.get("match_score") or 0),
+        "recrop_click_points": recrop_click_points,
+    }
+    if best.get("bbox") is not None:
+        refined["bbox"] = _offset_bbox_to_screen(best["bbox"], crop_left, crop_top)
+        refined["source_bbox"] = list(best["bbox"])
+        refined["ocr_recrop_bbox"] = refined["bbox"]
+    if best.get("label_bbox") is not None:
+        refined["ocr_recrop_label_bbox"] = _offset_bbox_to_screen(best["label_bbox"], crop_left, crop_top)
+    if generation_context and generation_context.get("run_dir") and generation_context.get("step_id"):
+        run_dir = Path(str(generation_context["run_dir"]))
+        step_id = str(generation_context["step_id"])
+        _write_json(
+            run_dir / "responses" / f"{step_id}.installer-ui-ocr-recrop-{index:02d}.json",
+            {
+                "candidate": candidate,
+                "raw_text_by_crop": raw_text_by_crop,
+                "refined": refined,
+            },
+        )
+    return refined
+
+
+def _related_choice_points_from_spatial_crop(
+    *,
+    runtime: AgentRuntime,
+    request: StepRequest,
+    spatial_bytes: bytes,
+    spatial_size: tuple[int, int],
+    spatial_left: int,
+    spatial_top: int,
+    crop_left: int,
+    crop_top: int,
+    spatial_name: str,
+    candidate_text: str,
+    max_new_tokens: int,
+    generation_context: dict[str, Any] | None,
+    index: int,
+) -> list[dict[str, Any]]:
+    generated = runtime.generate_text(
+        prompt_bundle=PromptBundle(
+            system_prompt=(
+                "Return compact strict JSON only. Do not return markdown, Python, prose, or reasoning. "
+                "Extract clickable checkbox/radio controls from this Windows installer/dialog crop."
+            ),
+            user_prompt=json.dumps(
+                {
+                    "crop_name": spatial_name,
+                    "task": request.user_prompt,
+                    "instructions": [
+                        "Return only real clickable checkbox/radio inputs and their adjacent labels.",
+                        "Ignore decorative colored bullet squares inside license/body text.",
+                        "Ignore explanatory sentences unless a visible square/circle input is adjacent on the same row.",
+                        "If an agreement checkbox/radio is visible, include it even if the label is short.",
+                        "Use bbox and point relative to this crop. For Qwen3.5/Qwen3-VL, use normalized 0-1000 coordinates.",
+                        "Output exactly: {\"controls\":[{\"control\":{\"kind\":\"checkbox|radio\",\"bbox\":[l,t,r,b],\"point\":[x,y],\"confidence\":0.0},\"label\":{\"text\":\"...\",\"bbox\":[l,t,r,b]}}]}",
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            session_prompt=request.user_prompt,
+            policy=request.policy,
+            execution_style=request.execution_style,
+            reasoning_enabled=False,
+            observation_text=None,
+            last_execution=request.last_execution,
+            web_search_context={},
+            recent_history=request.recent_history,
+            replan_requested=request.replan_requested,
+            replan_reasons=request.replan_reasons,
+        ),
+        image_path=None,
+        image_bytes=spatial_bytes,
+        use_blank_image=False,
+        max_new_tokens=min(max(int(max_new_tokens or 256), 256), 512),
+        generation_context=generation_context,
+    )
+    payload = _extract_json_object_or_array(generated.text)
+    elements = _choice_control_elements_from_payload(payload)
+    if not elements:
+        elements = _model_ui_ocr_elements_from_text(generated.text)
+    if not any(_installer_choice_text_score(candidate_text, item) > 0 for item in elements):
+        return []
+    related: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    for item in elements:
+        kind = str(item.get("kind") or item.get("type") or "").strip().lower()
+        if kind and kind not in {"checkbox", "radio", "control", "input"}:
+            continue
+        point = _coerce_model_point(item.get("point") or item.get("click_point"), image_size=spatial_size)
+        bbox = _coerce_model_bbox(item.get("bbox") or item.get("box") or item.get("rect"), image_size=spatial_size)
+        if point is None and bbox is not None:
+            left, top, right, bottom = bbox
+            point = (int((left + right) / 2), int((top + bottom) / 2))
+        if point is None:
+            continue
+        full_point = (int(spatial_left + point[0]), int(spatial_top + point[1]))
+        screen_point = _offset_point_to_screen(full_point, crop_left, crop_top)
+        key = (int(screen_point[0]), int(screen_point[1]))
+        if key in seen:
+            continue
+        seen.add(key)
+        item_text = str(item.get("text") or item.get("label_text") or item.get("label") or "")
+        related.append(
+            {
+                "crop_name": spatial_name,
+                "point": screen_point,
+                "source_click_point": [int(full_point[0]), int(full_point[1])],
+                "kind": "checkbox" if kind in {"control", "input"} else kind or "checkbox",
+                "text": item_text[:80],
+            }
+        )
+    if generation_context and generation_context.get("run_dir") and generation_context.get("step_id"):
+        run_dir = Path(str(generation_context["run_dir"]))
+        step_id = str(generation_context["step_id"])
+        _write_json(
+            run_dir / "responses" / f"{step_id}.installer-ui-related-choice-{index:02d}.json",
+            {
+                "spatial_crop": spatial_name,
+                "candidate_text": candidate_text,
+                "raw_text": generated.text[:4000],
+                "related_click_points": related,
+            },
+        )
+    return related
+
+
+def _refine_installer_choice_candidate(
+    *,
+    runtime: AgentRuntime,
+    request: StepRequest,
+    crop_bytes: bytes,
+    crop_size: tuple[int, int],
+    crop_left: int,
+    crop_top: int,
+    candidate: dict[str, Any],
+    max_new_tokens: int,
+    generation_context: dict[str, Any] | None,
+    index: int,
+) -> dict[str, Any] | None:
+    kind = str(candidate.get("kind") or "").strip().lower()
+    if kind not in {"checkbox", "radio"}:
+        return None
+    bbox = candidate.get("bbox")
+    if not isinstance(bbox, list) or len(bbox) < 4:
+        return None
+    try:
+        screen_left, screen_top, screen_right, screen_bottom = [int(value) for value in bbox[:4]]
+    except (TypeError, ValueError):
+        return None
+    local_left = screen_left - crop_left
+    local_top = screen_top - crop_top
+    local_right = screen_right - crop_left
+    local_bottom = screen_bottom - crop_top
+    width, height = crop_size
+    if local_right <= local_left or local_bottom <= local_top:
+        return None
+    candidate_width = local_right - local_left
+    candidate_height = local_bottom - local_top
+    margin_x = min(90, max(55, candidate_width))
+    margin_y = min(72, max(40, int(candidate_height * 2.5)))
+    small_left = max(0, local_left - margin_x)
+    small_top = max(0, local_top - margin_y)
+    small_right = min(width, local_right + margin_x)
+    small_bottom = min(height, local_bottom + margin_y)
+    if small_right <= small_left or small_bottom <= small_top:
+        return None
+    cropped = _crop_png_bytes(crop_bytes, (small_left, small_top, small_right, small_bottom))
+    if cropped is None:
+        return None
+    small_bytes, small_size = cropped
+    system_prompt = (
+        "Return compact strict JSON only. Do not return markdown, Python, prose, or reasoning. "
+        "Extract the actual clickable checkbox or radio control from this small installer/dialog crop."
+    )
+    instructions = [
+        "This image is a small crop around one checkbox/radio candidate from a Windows installer/dialog.",
+        "There may be multiple nearby controls. Select the checkbox/radio whose label text best matches candidate_text.",
+        "Do not treat explanatory text or instructions containing candidate_text as a checkbox/radio unless a visible square/circle input is adjacent on the same row.",
+        "If candidate_text appears both in an explanatory sentence and in a standalone checkbox/radio row, choose the standalone checkbox/radio row.",
+        "Separate each clickable checkbox/radio square or circle from its adjacent label text.",
+        "Return actual clickable controls, not label centers.",
+        "Use bbox and point relative to this small crop image. For Qwen3.5/Qwen3-VL, use normalized 0-1000 coordinates for both x and y.",
+        "Output exactly this schema: {\"controls\":[{\"control\":{\"kind\":\"checkbox|radio\",\"bbox\":[l,t,r,b],\"point\":[x,y],\"confidence\":0.0},\"label\":{\"text\":\"...\",\"bbox\":[l,t,r,b]}}]}",
+    ]
+    candidate_text = str(candidate.get("text") or "")
+    raw_text_by_variant: list[dict[str, Any]] = []
+    best: dict[str, Any] | None = None
+    best_model_id = ""
+    best_variant_name = ""
+    best_score = -1
+    for variant in _enhanced_ocr_image_variants(small_bytes, small_size):
+        generated = runtime.generate_text(
+            prompt_bundle=PromptBundle(
+                system_prompt=system_prompt,
+                user_prompt=json.dumps(
+                    {
+                        "candidate_text": candidate.get("text", ""),
+                        "candidate_kind": kind,
+                        "image_variant": variant["name"],
+                        "instructions": instructions,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                session_prompt=request.user_prompt,
+                policy=request.policy,
+                execution_style=request.execution_style,
+                reasoning_enabled=False,
+                observation_text=None,
+                last_execution=request.last_execution,
+                web_search_context={},
+                recent_history=request.recent_history,
+                replan_requested=request.replan_requested,
+                replan_reasons=request.replan_reasons,
+            ),
+            image_path=None,
+            image_bytes=variant["bytes"],
+            use_blank_image=False,
+            max_new_tokens=min(max(int(max_new_tokens or 256), 160), 320),
+            generation_context=generation_context,
+        )
+        raw_text_by_variant.append({"variant": variant["name"], "raw_text": generated.text[:4000]})
+        payload = _extract_json_object_or_array(generated.text)
+        elements = _choice_control_elements_from_payload(payload)
+        if not elements:
+            elements = _model_ui_ocr_elements_from_text(generated.text)
+        variant_best = _best_choice_control_from_elements(
+            elements,
+            candidate_text=candidate_text,
+            image_size=variant["size"],
+            image_scale_to_base=float(variant["scale"]),
+        )
+        variant_score = int(variant_best.get("match_score") or 0) if variant_best is not None else -1
+        if variant_best is not None and variant_score > best_score:
+            best = variant_best
+            best_score = variant_score
+            best_model_id = generated.model_id
+            best_variant_name = str(variant["name"])
+    if best is None:
+        return None
+    if int(best.get("match_score") or 0) < 80:
+        if generation_context and generation_context.get("run_dir") and generation_context.get("step_id"):
+            run_dir = Path(str(generation_context["run_dir"]))
+            step_id = str(generation_context["step_id"])
+            _write_json(
+                run_dir / "responses" / f"{step_id}.installer-ui-refine-{index:02d}.json",
+                {
+                    "candidate": candidate,
+                    "small_crop": {"left": small_left, "top": small_top, "right": small_right, "bottom": small_bottom},
+                    "small_crop_size": list(small_size),
+                    "raw_text_by_variant": raw_text_by_variant,
+                    "refined": {
+                        "refinement_rejected": {
+                            "reason": "label_text_mismatch",
+                            "match_score": int(best.get("match_score") or 0),
+                        }
+                    },
+                },
+            )
+        return None
+    point_x, point_y = best["point"]
+    refined: dict[str, Any] = {
+        "refined_click_point": _offset_point_to_screen((point_x + small_left, point_y + small_top), crop_left, crop_top),
+        "refined_coord_space": "screen_abs",
+        "refined_source_coord_space": "installer_refine_crop_pixel",
+        "refined_source_region": _screen_region_metadata(
+            crop_left + small_left,
+            crop_top + small_top,
+            crop_left + small_right,
+            crop_top + small_bottom,
+        ),
+        "refinement_model_id": best_model_id,
+        "refinement_image_variant": best_variant_name,
+        "refinement_match_score": int(best.get("match_score") or 0),
+    }
+    if best.get("bbox") is not None:
+        left, top, right, bottom = best["bbox"]
+        refined["refined_bbox"] = _offset_bbox_to_screen(
+            (left + small_left, top + small_top, right + small_left, bottom + small_top),
+            crop_left,
+            crop_top,
+        )
+    if best.get("label_bbox") is not None:
+        left, top, right, bottom = best["label_bbox"]
+        refined["refined_label_bbox"] = _offset_bbox_to_screen(
+            (left + small_left, top + small_top, right + small_left, bottom + small_top),
+            crop_left,
+            crop_top,
+        )
+    if generation_context and generation_context.get("run_dir") and generation_context.get("step_id"):
+        run_dir = Path(str(generation_context["run_dir"]))
+        step_id = str(generation_context["step_id"])
+        _write_json(
+            run_dir / "responses" / f"{step_id}.installer-ui-refine-{index:02d}.json",
+            {
+                "candidate": candidate,
+                "small_crop": {"left": small_left, "top": small_top, "right": small_right, "bottom": small_bottom},
+                "small_crop_size": list(small_size),
+                "raw_text_by_variant": raw_text_by_variant,
+                "refined": refined,
+            },
+        )
+    return refined
+
+
+def _installer_ui_candidates_observation(
+    *,
+    runtime: AgentRuntime,
+    request: StepRequest,
+    max_new_tokens: int,
+    generation_context: dict[str, Any] | None,
+) -> str | None:
+    if not _should_use_installer_ui_candidates(request):
+        return None
+    image_bytes = _request_image_bytes(request)
+    image_size = _image_size_from_bytes(image_bytes)
+    existing_region = _normalize_screenshot_region(request.screenshot_region)
+    if existing_region is None:
+        return None
+    crop_region = (
+        existing_region["left"],
+        existing_region["top"],
+        existing_region["right"],
+        existing_region["bottom"],
+    )
+    crop_bytes = image_bytes
+    crop_size = image_size
+    if not crop_bytes or not crop_size or not image_size:
+        return None
+    crop_left, crop_top, crop_right, crop_bottom = crop_region
+    system_prompt = (
+        "Return compact strict JSON only. Do not return markdown, Python, prose, or reasoning. "
+        "Extract visible controls only from this cropped Windows installer/dialog image."
+    )
+    instructions = [
+        "This image is the installer/dialog crop.",
+        "Return controls that can advance installation: checkbox/radio choices, their adjacent labels, buttons, and confirmation controls.",
+        "Prefer agreement/license/terms controls such as agree, accept, 동의, 동의함, 약관, 사용권, 라이선스 when a Next/Install button may be disabled.",
+        "Include OK, Yes, Next, Install, Finish, Continue, 확인, 예, 다음, 설치, 마침, 완료 when visible.",
+        "Do not include browser address bars, download-page links, taskbar items, or unrelated background text.",
+        "Do not choose or emphasize Cancel, Close, Back, Decline, No, 취소, 닫기, 뒤로, 거부, 아니오.",
+        "Use bbox as [left, top, right, bottom] pixel coordinates relative to this cropped image.",
+        "If you can identify the exact clickable point, include point:[x,y] relative to this cropped image.",
+        "Output exactly this schema: {\"elements\":[{\"text\":\"...\",\"kind\":\"button|checkbox|radio|input|text\",\"bbox\":[l,t,r,b],\"point\":[x,y],\"confidence\":0.0}]}",
+    ]
+    user_payload = {
+        "task": request.user_prompt,
+        "instructions": instructions,
+    }
+    candidates: list[dict[str, Any]] = []
+    related_choice_points_by_spatial_crop: dict[str, list[dict[str, Any]]] = {}
+    raw_text_by_variant: list[dict[str, Any]] = []
+    parsed_element_count = 0
+    model_ids: list[str] = []
+    spatial_crops = _installer_spatial_ocr_crops(crop_size)
+    recrop_attempts = 0
+    related_choice_ocr_attempts = 0
+    for spatial_index, (spatial_name, spatial_box) in enumerate(spatial_crops):
+        spatial_crop = (crop_bytes, crop_size) if spatial_name == "full_installer" else _crop_png_bytes(crop_bytes, spatial_box)
+        if spatial_crop is None:
+            continue
+        spatial_bytes, spatial_size = spatial_crop
+        spatial_left, spatial_top, _, _ = spatial_box
+        variants = [{"name": "original", "bytes": spatial_bytes, "size": spatial_size, "scale": 1.0}]
+        for variant_index, variant in enumerate(variants):
+            generated = runtime.generate_text(
+                prompt_bundle=PromptBundle(
+                    system_prompt=system_prompt,
+                    user_prompt=json.dumps(
+                        {**user_payload, "image_variant": variant["name"], "spatial_crop": spatial_name},
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    session_prompt=request.user_prompt,
+                    policy=request.policy,
+                    execution_style=request.execution_style,
+                    reasoning_enabled=False,
+                    observation_text=None,
+                    last_execution=request.last_execution,
+                    web_search_context={},
+                    recent_history=request.recent_history,
+                    replan_requested=request.replan_requested,
+                    replan_reasons=request.replan_reasons,
+                ),
+                image_path=None,
+                image_bytes=variant["bytes"],
+                use_blank_image=False,
+                max_new_tokens=min(max(int(max_new_tokens or 256), 256), 512),
+                generation_context=generation_context,
+            )
+            model_ids.append(generated.model_id)
+            raw_text_by_variant.append(
+                {"variant": variant["name"], "spatial_crop": spatial_name, "raw_text": generated.text[:4000]}
+            )
+            payload = _extract_json_object_or_array(generated.text)
+            elements = _model_ui_ocr_elements_from_payload(payload)
+            if not elements:
+                elements = _model_ui_ocr_elements_from_text(generated.text)
+            parsed_element_count += len(elements)
+            for index, item in enumerate(elements):
+                text = str(item.get("text") or item.get("label") or item.get("content") or "").strip()
+                kind = str(item.get("kind") or item.get("type") or "text").strip().lower()
+                raw_point = item.get("point") or item.get("click_point")
+                point = _coerce_installer_crop_point(raw_point, image_size=variant["size"])
+                raw_bbox_value = item.get("bbox") or item.get("box") or item.get("rect")
+                bbox = _coerce_installer_crop_bbox(raw_bbox_value, image_size=variant["size"])
+                point = _scale_point_to_base(point, float(variant["scale"])) if point is not None else None
+                bbox = _scale_bbox_to_base(bbox, float(variant["scale"])) if bbox is not None else None
+                if point is not None:
+                    point = (point[0] + spatial_left, point[1] + spatial_top)
+                if bbox is not None:
+                    bbox = (
+                        bbox[0] + spatial_left,
+                        bbox[1] + spatial_top,
+                        bbox[2] + spatial_left,
+                        bbox[3] + spatial_top,
+                    )
+                if bbox is None and kind in {"checkbox", "radio"} and point is not None:
+                    x, y = point
+                    bbox = (
+                        max(0, x - 6),
+                        max(0, y - 6),
+                        min(crop_size[0], x + 6),
+                        min(crop_size[1], y + 6),
+                    )
+                if not text and kind in {"checkbox", "radio"} and point is not None and bbox is not None:
+                    screen_point = _offset_point_to_screen(point, crop_left, crop_top)
+                    related_choice_points_by_spatial_crop.setdefault(spatial_name, []).append(
+                        {
+                            "crop_name": spatial_name,
+                            "point": screen_point,
+                            "source_click_point": [int(point[0]), int(point[1])],
+                            "source_bbox": list(bbox),
+                            "kind": kind,
+                        }
+                    )
+                    continue
+                if not text or bbox is None:
+                    continue
+                score, tags = _score_installer_ui_candidate(text, kind)
+                if score <= 0:
+                    continue
+                if spatial_name != "full_installer" and kind in {"checkbox", "radio"} and point is not None:
+                    local_point_x = int(point[0] - spatial_left)
+                    local_point_y = int(point[1] - spatial_top)
+                    if local_point_x < 8 or local_point_y < 4:
+                        continue
+                if spatial_name != "full_installer" and kind in {"checkbox", "radio"}:
+                    score += 15
+                    tags.append("installer_spatial_crop")
+                left, top, right, bottom = bbox
+                if point is None:
+                    point = (int((left + right) / 2), int((top + bottom) / 2))
+                screen_bbox = _offset_bbox_to_screen(bbox, crop_left, crop_top)
+                screen_point = _offset_point_to_screen(point, crop_left, crop_top)
+                candidate = {
+                    "candidate_id": f"installer-ui-{spatial_index:02d}-{variant_index:02d}-{index:02d}",
+                    "text": text[:160],
+                    "kind": kind or "text",
+                    "bbox": screen_bbox,
+                    "click_point": screen_point,
+                    "coord_space": "screen_abs",
+                    "source_coord_space": "installer_crop_pixel",
+                    "source_region": _screen_region_metadata(crop_left, crop_top, crop_right, crop_bottom),
+                    "source_image_variant": f"{spatial_name}:{variant['name']}",
+                    "source_spatial_crop": spatial_name,
+                    "source_spatial_box": list(spatial_box),
+                    "source_bbox": list(bbox),
+                    "source_click_point": list(point),
+                    "score": int(score),
+                    "confidence": item.get("confidence", 1.0),
+                    "reason_tags": tags,
+                }
+                recrop_refined = None
+                if (
+                    kind in {"checkbox", "radio"}
+                    and str(candidate.get("source_spatial_crop") or "") != "full_installer"
+                    and recrop_attempts < 1
+                ):
+                    recrop_attempts += 1
+                    recrop_refined = _recrop_refine_installer_choice_candidate(
+                        runtime=runtime,
+                        request=request,
+                        crop_bytes=crop_bytes,
+                        crop_size=crop_size,
+                        crop_left=crop_left,
+                        crop_top=crop_top,
+                        candidate=candidate,
+                        max_new_tokens=max_new_tokens,
+                        generation_context=generation_context,
+                        index=len(candidates),
+                    )
+                if recrop_refined:
+                    candidate.update(recrop_refined)
+                    candidate["score"] = int(candidate.get("score") or 0) + 25
+                    candidate["reason_tags"] = list(
+                        dict.fromkeys([*candidate.get("reason_tags", []), "ocr_recrop_choice_control"])
+                    )
+                if (
+                    kind in {"checkbox", "radio"}
+                    and related_choice_ocr_attempts < 1
+                ):
+                    related_choice_ocr_attempts += 1
+                    related_points = _related_choice_points_from_spatial_crop(
+                        runtime=runtime,
+                        request=request,
+                        spatial_bytes=spatial_bytes,
+                        spatial_size=spatial_size,
+                        spatial_left=spatial_left,
+                        spatial_top=spatial_top,
+                        crop_left=crop_left,
+                        crop_top=crop_top,
+                        spatial_name=spatial_name,
+                        candidate_text=text,
+                        max_new_tokens=max_new_tokens,
+                        generation_context=generation_context,
+                        index=len(candidates),
+                    )
+                    if related_points:
+                        candidate["choice_ocr_click_points"] = related_points[:8]
+                        candidate["related_click_points"] = related_points[:8]
+                        candidate["score"] = int(candidate.get("score") or 0) + 5
+                        candidate["reason_tags"] = list(
+                            dict.fromkeys([*candidate.get("reason_tags", []), "installer_related_choice_controls"])
+                        )
+                candidates.append(candidate)
+    for candidate in candidates:
+        kind = str(candidate.get("kind") or "").strip().lower()
+        reason_tags = [str(tag) for tag in candidate.get("reason_tags", [])]
+        if kind not in {"checkbox", "radio"}:
+            continue
+        if "installer_dialog_control" not in reason_tags or "installer_choice_control" not in reason_tags:
+            continue
+        spatial_name = str(candidate.get("source_spatial_crop") or "").strip()
+        related_points = related_choice_points_by_spatial_crop.get(spatial_name) or []
+        if not related_points:
+            continue
+        seen_points = {
+            tuple(int(value) for value in point[:2])
+            for point in [candidate.get("click_point"), candidate.get("ocr_recrop_click_point")]
+            if isinstance(point, list) and len(point) >= 2
+        }
+        for item in candidate.get("recrop_click_points") or []:
+            point = item.get("point") if isinstance(item, dict) else None
+            if isinstance(point, list) and len(point) >= 2:
+                seen_points.add(tuple(int(value) for value in point[:2]))
+        unique_related: list[dict[str, Any]] = []
+        for item in related_points:
+            point = item.get("point")
+            if not isinstance(point, list) or len(point) < 2:
+                continue
+            key = tuple(int(value) for value in point[:2])
+            if key in seen_points:
+                continue
+            seen_points.add(key)
+            unique_related.append(item)
+        if not unique_related:
+            continue
+        candidate["choice_ocr_click_points"] = unique_related[:8]
+        candidate["related_click_points"] = unique_related[:8]
+        candidate["score"] = int(candidate.get("score") or 0) + 5
+        candidate["reason_tags"] = list(dict.fromkeys([*reason_tags, "installer_related_choice_controls"]))
+    candidates.sort(key=lambda item: int(item.get("score") or 0), reverse=True)
+    deduped_candidates: list[dict[str, Any]] = []
+    seen_candidate_keys: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        key = (
+            re.sub(r"\s+", "", str(candidate.get("text") or "").strip().lower()),
+            str(candidate.get("kind") or "").strip().lower(),
+        )
+        if key in seen_candidate_keys:
+            continue
+        seen_candidate_keys.add(key)
+        deduped_candidates.append(candidate)
+    candidates = deduped_candidates[:8]
+    debug_payload = {
+        "enabled": True,
+        "model_id": model_ids[0] if model_ids else "",
+        "model_ids": model_ids,
+        "screenshot_size": list(image_size),
+        "crop_region": _screen_region_metadata(crop_left, crop_top, crop_right, crop_bottom),
+        "crop_size": list(crop_size),
+        "raw_text_by_variant": raw_text_by_variant,
+        "parsed_element_count": parsed_element_count,
+        "candidates": candidates,
+    }
+    if generation_context and generation_context.get("run_dir") and generation_context.get("step_id"):
+        run_dir = Path(str(generation_context["run_dir"]))
+        step_id = str(generation_context["step_id"])
+        _write_json(run_dir / "responses" / f"{step_id}.installer-ui-candidates.json", debug_payload)
+    if not candidates:
+        return (
+            "INSTALLER_VISIBLE_UI_CANDIDATES: []\n"
+            "No installer-dialog model-visible candidates were extracted from the cropped installer UI region."
+        )
+    return (
+        "INSTALLER_VISIBLE_UI_CANDIDATES:\n"
+        "These candidates come from local model visual extraction of a cropped installer/dialog UI region, not Windows OCR.\n"
+        "Use these candidates only for installer/dialog progression. Do not use them for browser download-page navigation.\n"
+        + json.dumps(
+            {
+                "candidates": candidates,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
 def _request_with_model_ui_candidates(
     *,
     runtime: AgentRuntime,
@@ -12214,9 +13603,49 @@ def _request_with_model_ui_candidates(
         screenshot_path=request.screenshot_path,
         screenshot_base64=request.screenshot_base64,
         screenshot_media_type=request.screenshot_media_type,
+        screenshot_region=request.screenshot_region,
         observation_text=merged_observation,
         web_search_context=request.web_search_context,
         recent_history=list(request.recent_history) + ["system_hint=use MODEL_VISIBLE_UI_CANDIDATES click_point values for visible UI controls before inventing new coordinates"],
+        last_execution=request.last_execution,
+        step_index=request.step_index,
+    )
+
+
+def _request_with_installer_ui_candidates(
+    *,
+    runtime: AgentRuntime,
+    request: StepRequest,
+    max_new_tokens: int,
+    generation_context: dict[str, Any] | None,
+) -> StepRequest:
+    observation = _installer_ui_candidates_observation(
+        runtime=runtime,
+        request=request,
+        max_new_tokens=max_new_tokens,
+        generation_context=generation_context,
+    )
+    if not observation:
+        return request
+    existing_observation = str(request.observation_text or "").strip()
+    merged_observation = observation if not existing_observation else f"{existing_observation}\n\n{observation}"
+    return StepRequest(
+        user_prompt=request.user_prompt,
+        policy=request.policy,
+        execution_style=request.execution_style,
+        request_kind=request.request_kind,
+        repair_context=request.repair_context,
+        replan_requested=request.replan_requested,
+        replan_reasons=list(request.replan_reasons),
+        strong_visual_grounding=request.strong_visual_grounding,
+        reasoning_enabled=request.reasoning_enabled,
+        screenshot_path=request.screenshot_path,
+        screenshot_base64=request.screenshot_base64,
+        screenshot_media_type=request.screenshot_media_type,
+        screenshot_region=request.screenshot_region,
+        observation_text=merged_observation,
+        web_search_context=request.web_search_context,
+        recent_history=list(request.recent_history) + ["system_hint=use INSTALLER_VISIBLE_UI_CANDIDATES only for visible installer/dialog controls"],
         last_execution=request.last_execution,
         step_index=request.step_index,
     )
@@ -12233,6 +13662,64 @@ def _model_ui_candidates_from_observation(observation_text: str | None) -> list[
     if not isinstance(candidates, list):
         return []
     return [item for item in candidates if isinstance(item, dict)]
+
+
+def _installer_ui_candidates_from_observation(observation_text: str | None) -> list[dict[str, Any]]:
+    text = str(observation_text or "")
+    marker = "INSTALLER_VISIBLE_UI_CANDIDATES"
+    marker_index = text.find(marker)
+    if marker_index < 0:
+        return []
+    payload = _extract_json_object_or_array(text[marker_index:])
+    if not isinstance(payload, dict):
+        return []
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list):
+        return []
+    return [item for item in candidates if isinstance(item, dict)]
+
+
+def _teacher_visible_installer_clicks_from_prompt(prompt: str | None) -> list[dict[str, Any]]:
+    text = str(prompt or "")
+    for marker in ("TEACHER_VISIBLE_INSTALLER_ACTIONS:", "TEACHER_VISIBLE_INSTALLER_CLICK_TARGET:"):
+        marker_index = text.find(marker)
+        if marker_index < 0:
+            continue
+        remainder = text[marker_index + len(marker) :].lstrip()
+        first_line = remainder.splitlines()[0].strip() if remainder else ""
+        if not first_line:
+            return []
+        try:
+            payload = json.loads(first_line)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(payload, dict):
+            return []
+        action_payload: dict[str, Any] | None = None
+        raw_actions = payload.get("actions")
+        if isinstance(raw_actions, list):
+            for item in raw_actions:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("action") or "click").strip().lower() != "click":
+                    continue
+                action_payload = item
+                break
+        elif marker.endswith("CLICK_TARGET:"):
+            action_payload = payload
+        if not isinstance(action_payload, dict):
+            return []
+        point = action_payload.get("point") or action_payload.get("click_point")
+        if not isinstance(point, list) or len(point) < 2:
+            return []
+        try:
+            x, y = int(point[0]), int(point[1])
+        except (TypeError, ValueError):
+            return []
+        text_value = str(action_payload.get("text") or action_payload.get("candidate_id") or "teacher-selected installer control").strip()
+        tags = ["teacher_selected", "installer_dialog_control"]
+        return [{"text": text_value[:80], "point": [x, y], "tags": tags}]
+    return []
 
 
 def _has_model_ui_download_action_candidate(candidates: list[dict[str, Any]]) -> bool:
@@ -12592,6 +14079,10 @@ def _synthesized_model_ui_download_recovery_code(request: StepRequest) -> str:
         "import subprocess",
         "import time",
         "import urllib.parse",
+        "",
+        _RUNTIME_HELPERS["ensure_windows_dpi_aware"],
+        "",
+        "ensure_windows_dpi_aware()",
         "",
         "import pyautogui",
         "",
@@ -13160,8 +14651,8 @@ def _synthesized_model_ui_download_recovery_code(request: StepRequest) -> str:
 
 
 def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
-    candidates = _model_ui_candidates_from_observation(request.observation_text)
-    target_terms = _visible_flow_extra_targets(request, limit=8)
+    candidates = _installer_ui_candidates_from_observation(request.observation_text)
+    target_terms = _installer_recovery_target_terms(request, limit=8)
     context_prompt_key, context_prompt_excerpt = _context_prompt_key_for_target_terms(request, target_terms)
     reject_terms = ("cancel", "취소", "close", "닫기", "no", "아니")
     installer_control_terms_en = {
@@ -13170,8 +14661,15 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         "next",
         "install",
         "finish",
+        "confirm",
+        "proceed",
+        "start",
+        "launch",
         "agree",
         "accept",
+        "agreement",
+        "license",
+        "terms",
         "continue",
         "run",
     }
@@ -13181,11 +14679,40 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         "다음",
         "설치",
         "완료",
-        "동의",
-        "계속",
+        "진행",
+        "시작",
         "실행",
+        "확인 후",
+        "다음 단계",
+        "설치 완료",
+        "설치 진행",
+        "동의",
+        "동의함",
+        "동의합니다",
+        "약관",
+        "사용권",
+        "라이선스",
+        "계속",
     }
+
+    def _matches_installer_control_text(value: str) -> bool:
+        lowered = str(value or "").lower()
+        if any(term in lowered for term in installer_control_terms_en):
+            return True
+        return any(term in str(value or "") for term in installer_control_terms_ko)
+
     click_points: list[dict[str, Any]] = []
+    seen_click_points: set[tuple[int, int]] = set()
+    for item in _teacher_visible_installer_clicks_from_prompt(request.user_prompt):
+        point = item.get("point")
+        if not isinstance(point, list) or len(point) < 2:
+            continue
+        try:
+            x, y = int(point[0]), int(point[1])
+        except (TypeError, ValueError):
+            continue
+        seen_click_points.add((x, y))
+        click_points.append({"text": str(item.get("text") or "")[:80], "point": [x, y], "tags": item.get("tags") or []})
     for item in candidates:
         text = str(item.get("text") or "")
         tags = [str(tag) for tag in item.get("reason_tags") or []]
@@ -13195,22 +14722,122 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         lowered = text.lower()
         if any(term in lowered for term in reject_terms):
             continue
-        english_tokens = set(re.findall(r"[a-zA-Z]+", lowered))
-        korean_tokens = set(re.findall(r"[가-힣]+", text))
-        if not (
-            english_tokens.intersection(installer_control_terms_en)
-            or korean_tokens.intersection(installer_control_terms_ko)
-        ):
+        if not _matches_installer_control_text(text):
             continue
         if len(text.strip()) > 48 and any(term in lowered for term in target_terms):
             continue
         if re.search(r"\bv?\d+(?:\.\d+)+\b", lowered):
             continue
+        kind = str(item.get("kind") or "").strip().lower()
         try:
             x, y = int(point[0]), int(point[1])
         except (TypeError, ValueError):
             continue
-        click_points.append({"text": text[:80], "point": [x, y], "tags": tags})
+        if (x, y) in seen_click_points:
+            continue
+        seen_click_points.add((x, y))
+        click_payload = {"text": text[:80], "point": [x, y], "kind": kind, "tags": tags}
+        bbox = item.get("bbox")
+        if isinstance(bbox, list) and len(bbox) >= 4:
+            try:
+                click_payload["bbox"] = [int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])]
+            except (TypeError, ValueError):
+                pass
+        refined_point = item.get("refined_click_point")
+        if isinstance(refined_point, list) and len(refined_point) >= 2:
+            try:
+                click_payload["refined_click_point"] = [int(refined_point[0]), int(refined_point[1])]
+            except (TypeError, ValueError):
+                pass
+        refined_bbox = item.get("refined_bbox")
+        if isinstance(refined_bbox, list) and len(refined_bbox) >= 4:
+            try:
+                click_payload["refined_bbox"] = [int(refined_bbox[0]), int(refined_bbox[1]), int(refined_bbox[2]), int(refined_bbox[3])]
+            except (TypeError, ValueError):
+                pass
+        refined_label_bbox = item.get("refined_label_bbox")
+        if isinstance(refined_label_bbox, list) and len(refined_label_bbox) >= 4:
+            try:
+                click_payload["refined_label_bbox"] = [int(refined_label_bbox[0]), int(refined_label_bbox[1]), int(refined_label_bbox[2]), int(refined_label_bbox[3])]
+            except (TypeError, ValueError):
+                pass
+        recrop_click_points = item.get("recrop_click_points")
+        if isinstance(recrop_click_points, list):
+            normalized_recrop_points = []
+            seen_recrop_payload_points = set()
+            for recrop_item in recrop_click_points:
+                if not isinstance(recrop_item, dict):
+                    continue
+                recrop_point = recrop_item.get("point")
+                if not isinstance(recrop_point, list) or len(recrop_point) < 2:
+                    continue
+                try:
+                    recrop_x, recrop_y = int(recrop_point[0]), int(recrop_point[1])
+                except (TypeError, ValueError):
+                    continue
+                if (recrop_x, recrop_y) in seen_recrop_payload_points:
+                    continue
+                seen_recrop_payload_points.add((recrop_x, recrop_y))
+                normalized_recrop_points.append(
+                    {
+                        "crop_name": str(recrop_item.get("crop_name") or "")[:80],
+                        "point": [recrop_x, recrop_y],
+                        "match_score": int(recrop_item.get("match_score") or 0),
+                    }
+                )
+            if normalized_recrop_points:
+                click_payload["recrop_click_points"] = normalized_recrop_points[:5]
+        related_click_points = item.get("related_click_points")
+        if isinstance(related_click_points, list):
+            normalized_related_points = []
+            seen_related_payload_points = set()
+            for related_item in related_click_points:
+                if not isinstance(related_item, dict):
+                    continue
+                related_point = related_item.get("point")
+                if not isinstance(related_point, list) or len(related_point) < 2:
+                    continue
+                try:
+                    related_x, related_y = int(related_point[0]), int(related_point[1])
+                except (TypeError, ValueError):
+                    continue
+                if (related_x, related_y) in seen_related_payload_points:
+                    continue
+                seen_related_payload_points.add((related_x, related_y))
+                normalized_related_points.append(
+                    {
+                        "crop_name": str(related_item.get("crop_name") or "")[:80],
+                        "point": [related_x, related_y],
+                    }
+                )
+            if normalized_related_points:
+                click_payload["related_click_points"] = normalized_related_points[:8]
+        choice_ocr_click_points = item.get("choice_ocr_click_points")
+        if isinstance(choice_ocr_click_points, list):
+            normalized_choice_ocr_points = []
+            seen_choice_ocr_payload_points = set()
+            for choice_item in choice_ocr_click_points:
+                if not isinstance(choice_item, dict):
+                    continue
+                choice_point = choice_item.get("point")
+                if not isinstance(choice_point, list) or len(choice_point) < 2:
+                    continue
+                try:
+                    choice_x, choice_y = int(choice_point[0]), int(choice_point[1])
+                except (TypeError, ValueError):
+                    continue
+                if (choice_x, choice_y) in seen_choice_ocr_payload_points:
+                    continue
+                seen_choice_ocr_payload_points.add((choice_x, choice_y))
+                normalized_choice_ocr_points.append(
+                    {
+                        "crop_name": str(choice_item.get("crop_name") or "")[:80],
+                        "point": [choice_x, choice_y],
+                    }
+                )
+            if normalized_choice_ocr_points:
+                click_payload["choice_ocr_click_points"] = normalized_choice_ocr_points[:8]
+        click_points.append(click_payload)
     click_points = click_points[:5]
     install_marker = _extract_prompt_install_marker_path(request.user_prompt)
     lines = [
@@ -13223,10 +14850,15 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         "import time",
         "import zipfile",
         "",
+        _RUNTIME_HELPERS["ensure_windows_dpi_aware"],
+        "",
+        "ensure_windows_dpi_aware()",
+        "",
         "import pyautogui",
         "",
-        f"TARGET_TERMS = {json.dumps(target_terms, ensure_ascii=False)}",
-        f"VISIBLE_CLICKS = {json.dumps(click_points, ensure_ascii=False)}",
+        f"PRODUCT_TERMS = {json.dumps(target_terms, ensure_ascii=False)}",
+        "TARGET_TERMS = PRODUCT_TERMS",
+        f"VISIBLE_CLICKS = json.loads({repr(json.dumps(click_points, ensure_ascii=False))})",
         (
             f"INSTALL_MARKER = Path({json.dumps(install_marker, ensure_ascii=False)}).expanduser()"
             if install_marker
@@ -13243,7 +14875,7 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         "",
         "def _target_terms():",
         "    raw_terms = []",
-        "    for raw in TARGET_TERMS:",
+        "    for raw in PRODUCT_TERMS:",
         "        lowered = str(raw or '').lower().strip()",
         "        if lowered and lowered not in raw_terms:",
         "            raw_terms.append(lowered)",
@@ -13265,17 +14897,52 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         "    except Exception:",
         "        return {}",
         "",
-        "def _matches_target(path):",
-        "    terms = _target_terms()",
+        "def _matches_terms(path, terms):",
         "    lowered = str(path).lower()",
         "    return not terms or any(_contains_target(lowered, term) for term in terms)",
         "",
-        "def _package_score(path):",
+        "def _matches_target(path):",
+        "    return _matches_terms(path, _target_terms())",
+        "",
+        "def _installer_filename_terms(path):",
+        "    generic = {'setup', 'installer', 'install', 'launcher', 'client', 'desktop', 'windows', 'window', 'win', 'win32', 'win64', 'x64', 'x86', 'x86_64', 'amd64', 'arm64', 'exe', 'msi', 'zip', 'alz', 'download', 'downloads', 'latest', 'stable', 'release'}",
+        "    result = []",
+        "    stem = Path(str(path or '')).stem.lower()",
+        "    for token in re.split(r'[^a-z0-9가-힣]+', stem):",
+        "        cleaned = token.strip('._-')",
+        "        if not cleaned or cleaned in generic or cleaned in result:",
+        "            continue",
+        "        if cleaned.isdigit() or re.fullmatch(r'v?\\d+(?:\\.\\d+)*', cleaned):",
+        "            continue",
+        "        if len(cleaned) < (2 if re.search(r'[가-힣]', cleaned) else 3):",
+        "            continue",
+        "        result.append(cleaned)",
+        "        alpha_prefix = re.sub(r'\\d+$', '', cleaned)",
+        "        if alpha_prefix and alpha_prefix != cleaned and len(alpha_prefix) >= 3 and alpha_prefix not in generic and alpha_prefix not in result:",
+        "            result.append(alpha_prefix)",
+        "    return result[:4]",
+        "",
+        "def _marker_prompt_matches(payload):",
+        "    if not isinstance(payload, dict):",
+        "        return False",
+        "    stored_key = str(payload.get('prompt_key') or '').strip()",
+        "    return bool(CONTEXT_PROMPT_KEY and stored_key and stored_key == CONTEXT_PROMPT_KEY)",
+        "",
+        "def _package_terms(*paths):",
+        "    terms = list(_target_terms())",
+        "    for path in paths:",
+        "        for term in _installer_filename_terms(path):",
+        "            if term not in terms:",
+        "                terms.append(term)",
+        "    return terms",
+        "",
+        "def _package_score(path, terms=None):",
+        "    terms = terms or _target_terms()",
         "    lowered = str(path).lower()",
         "    name = path.name.lower()",
         "    score = 0",
         "    matched_terms = 0",
-        "    for term in _target_terms():",
+        "    for term in terms:",
         "        if _contains_target(lowered, term):",
         "            score += 30 if _contains_target(name, term) else 14",
         "            matched_terms += 1",
@@ -13296,7 +14963,14 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         "    return score, matched_terms, mtime",
         "",
         "def _candidate_packages():",
-        "    terms = _target_terms()",
+        "    context_payload = _read_json(CONTEXT_MARKER)",
+        "    install_payload = _read_json(INSTALL_MARKER)",
+        "    marker_installer_paths = []",
+        "    if _marker_prompt_matches(context_payload):",
+        "        marker_installer_paths.append(context_payload.get('installer_path'))",
+        "    if _marker_prompt_matches(install_payload):",
+        "        marker_installer_paths.append(install_payload.get('installer_path'))",
+        "    terms = _package_terms(*marker_installer_paths)",
         "    candidates = []",
         "    seen = set()",
         "",
@@ -13309,19 +14983,17 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         "            return",
         "        if candidate.suffix.lower() not in INSTALLER_SUFFIXES + ARCHIVE_SUFFIXES:",
         "            return",
-        "        if terms and not _matches_target(candidate):",
+        "        if terms and not _matches_terms(candidate, terms):",
         "            return",
         "        seen.add(key)",
         "        candidates.append(candidate)",
         "",
-        "    context_payload = _read_json(CONTEXT_MARKER)",
         "    _append(context_payload.get('installer_path'))",
-        "    install_payload = _read_json(INSTALL_MARKER)",
         "    _append(install_payload.get('installer_path'))",
         "    for suffix in ('*.exe', '*.msi', '*.zip', '*.alz'):",
         "        for path in DOWNLOADS.glob(suffix):",
         "            _append(path)",
-        "    candidates.sort(key=lambda p: _package_score(p), reverse=True)",
+        "    candidates.sort(key=lambda p: _package_score(p, terms), reverse=True)",
         "    return candidates",
         "",
         "def _candidate_installers(root):",
@@ -13475,40 +15147,142 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         "    print(f'launch installed executable: {exe} running={running}')",
         "    return running",
         "",
-        "existing = _find_installed_exe()",
-        "if existing:",
-        "    _write_marker(existing)",
-        "    if _launch_installed_exe(existing):",
-        "        raise SystemExit(0)",
+        "def _click_visible_controls_once():",
+        "    if not VISIBLE_CLICKS:",
+        "        return False",
+        "    pyautogui.PAUSE = 0.15",
+        "    clicked = False",
+        "    def _capture_click_region(x, y):",
+        "        try:",
+        "            screen_w, screen_h = pyautogui.size()",
+        "            left = max(0, min(int(x) - 80, int(screen_w) - 1))",
+        "            top = max(0, min(int(y) - 60, int(screen_h) - 1))",
+        "            width = max(1, min(160, int(screen_w) - left))",
+        "            height = max(1, min(120, int(screen_h) - top))",
+        "            return pyautogui.screenshot(region=(left, top, width, height)).convert('L')",
+        "        except Exception:",
+        "            return None",
+        "",
+        "    def _image_changed(before, after):",
+        "        if before is None or after is None:",
+        "            return False",
+        "        try:",
+        "            from PIL import ImageChops, ImageStat",
+        "            diff = ImageChops.difference(before, after)",
+        "            stat = ImageStat.Stat(diff)",
+        "            return max(stat.mean or [0.0]) > 0.25",
+        "        except Exception:",
+        "            return False",
+        "",
+        "    def _capture_screen():",
+        "        try:",
+        "            return pyautogui.screenshot().convert('L')",
+        "        except Exception:",
+        "            return None",
+        "",
+        "    def _is_existing_progression_button(item):",
+        "        kind = str(item.get('kind') or '').strip().lower()",
+        "        if kind != 'button':",
+        "            return False",
+        "        text = str(item.get('text') or '').strip().lower()",
+        "        if any(token in text for token in ('cancel', 'back', 'previous', 'close')):",
+        "            return False",
+        "        return any(token in text for token in ('다음', 'next', '설치', 'install', '계속', 'continue', '확인', 'ok', '완료', 'finish'))",
+        "",
+        "    def _progression_button_attempts():",
+        "        attempts = []",
+        "        for button in VISIBLE_CLICKS:",
+        "            if not _is_existing_progression_button(button):",
+        "                continue",
+        "            point = button.get('refined_click_point') or button.get('point') or [0, 0]",
+        "            try:",
+        "                x, y = int(point[0]), int(point[1])",
+        "            except Exception:",
+        "                continue",
+        "            attempts.append((button, x, y))",
+        "        return attempts",
+        "",
+        "    def _click_existing_progression_buttons(reason='after choice'):",
+        "        clicked_progression = False",
+        "        for button, x, y in _progression_button_attempts():",
+        "            _avoid_failsafe()",
+        "            print(f\"click existing installer progression button {reason}: {button.get('text')} at {(x, y)}\")",
+        "            pyautogui.click(x, y)",
+        "            clicked_progression = True",
+        "            time.sleep(0.35)",
+        "        return clicked_progression",
+        "",
+        "    clicked = _click_existing_progression_buttons(reason='before choice') or clicked",
+        "    for item in VISIBLE_CLICKS:",
+        "        kind = str(item.get('kind') or '').strip().lower()",
+        "        if _is_existing_progression_button(item):",
+        "            continue",
+        "        point_attempts = []",
+        "        choice_ocr_items = (item.get('choice_ocr_click_points') or []) if kind in ('checkbox', 'radio') else []",
+        "        if choice_ocr_items:",
+        "            for choice_item in choice_ocr_items:",
+        "                choice_point = choice_item.get('point')",
+        "                if isinstance(choice_point, list) and len(choice_point) >= 2:",
+        "                    point_attempts.append((choice_point, choice_item.get('crop_name') or 'choice_ocr'))",
+        "        else:",
+        "            for recrop_item in item.get('recrop_click_points') or []:",
+        "                recrop_point = recrop_item.get('point')",
+        "                if isinstance(recrop_point, list) and len(recrop_point) >= 2:",
+        "                    point_attempts.append((recrop_point, recrop_item.get('crop_name') or 'recrop'))",
+        "            for related_item in item.get('related_click_points') or []:",
+        "                related_point = related_item.get('point')",
+        "                if isinstance(related_point, list) and len(related_point) >= 2:",
+        "                    point_attempts.append((related_point, related_item.get('crop_name') or 'related_choice'))",
+        "            fallback_point = item.get('refined_click_point') or item.get('point') or [0, 0]",
+        "            point_attempts.append((fallback_point, 'primary'))",
+        "        seen_local_points = set()",
+        "        for point, point_source in point_attempts:",
+        "            x, y = int(point[0]), int(point[1])",
+        "            if (x, y) in seen_local_points:",
+        "                continue",
+        "            seen_local_points.add((x, y))",
+        "            _avoid_failsafe()",
+        "            before = _capture_click_region(x, y) if kind in ('checkbox', 'radio') else None",
+        "            print(f\"click visible installer control: {item.get('text')} source={point_source} at {(x, y)}\")",
+        "            pyautogui.click(x, y)",
+        "            clicked = True",
+        "            time.sleep(0.55 if kind in ('checkbox', 'radio') else 0.35)",
+        "            if kind in ('checkbox', 'radio'):",
+        "                clicked = _click_existing_progression_buttons(reason='after choice') or clicked",
+        "            after = _capture_click_region(x, y) if kind in ('checkbox', 'radio') else None",
+        "            if kind in ('checkbox', 'radio') and _image_changed(before, after):",
+        "                break",
+        "    return clicked",
         "",
         "packages = _candidate_packages()",
         "if not packages and VISIBLE_CLICKS:",
-        "    pyautogui.PAUSE = 0.15",
-        "    for item in VISIBLE_CLICKS:",
-        "        x, y = item['point']",
-        "        _avoid_failsafe()",
-        "        print(f\"click visible installer control: {item.get('text')} at {(x, y)}\")",
-        "        pyautogui.click(x, y)",
-        "        time.sleep(1.5)",
+        "    _click_visible_controls_once()",
         "    packages = _candidate_packages()",
         "",
         "installer = _resolve_installer_target(packages[0]) if packages else None",
+        "existing = None",
         "if installer:",
         "    print(f'launch installer target: {installer}')",
         "    if installer.suffix.lower() == '.msi':",
-        "        subprocess.Popen(['msiexec.exe', '/i', str(installer), '/passive', '/norestart'])",
+        "        proc = subprocess.Popen(['msiexec.exe', '/i', str(installer), '/passive', '/norestart'])",
+        "        print(f'installer_launcher_pid={int(proc.pid)}')",
         "        time.sleep(6.0)",
         "    elif installer.suffix.lower() == '.exe':",
-        "        try:",
-        "            os.startfile(str(installer))",
-        "        except AttributeError:",
-        "            subprocess.Popen([str(installer)])",
+        "        proc = subprocess.Popen([str(installer)], shell=False)",
+        "        print(f'installer_launcher_pid={int(proc.pid)}')",
         "        time.sleep(3.0)",
         "    else:",
         "        raise SystemExit(f'unexpected installer target: {installer}')",
         "else:",
-        "    raise SystemExit('no installer package available for installer recovery')",
+        "    existing = _find_installed_exe()",
+        "    if existing:",
+        "        _write_marker(existing)",
+        "        if _launch_installed_exe(existing):",
+        "            raise SystemExit(0)",
+        "    if not VISIBLE_CLICKS:",
+        "        raise SystemExit('no installer package available for installer recovery')",
         "",
+        "visible_controls_clicked = False",
         "for index in range(14):",
         "    current = _find_installed_exe()",
         "    if current:",
@@ -13516,6 +15290,8 @@ def _synthesized_model_ui_installer_recovery_code(request: StepRequest) -> str:
         "        if _launch_installed_exe(current):",
         "            raise SystemExit(0)",
         "    _avoid_failsafe()",
+        "    if not visible_controls_clicked:",
+        "        visible_controls_clicked = _click_visible_controls_once()",
         "    pyautogui.press('enter')",
         "    time.sleep(1.5)",
         "    if index in (2, 5, 8):",
@@ -13824,7 +15600,14 @@ def generate_step_response(
             done=False,
             notes=["framework_model_ui_browser_prelude_used"],
         )
-    if _should_use_model_ui_candidates(request):
+    if _should_use_installer_ui_candidates(request):
+        request = _request_with_installer_ui_candidates(
+            runtime=runtime,
+            request=request,
+            max_new_tokens=max_new_tokens,
+            generation_context=generation_context,
+        )
+    elif _should_use_model_ui_candidates(request):
         request = _request_with_model_ui_candidates(
             runtime=runtime,
             request=request,
@@ -14003,6 +15786,7 @@ def _extract_state(exec_result: dict[str, Any]) -> dict[str, Any]:
         "screenshot_path": exec_result.get("screenshot_path"),
         "screenshot_base64": exec_result.get("screenshot_base64"),
         "screenshot_media_type": exec_result.get("screenshot_media_type"),
+        "screenshot_region": _normalize_screenshot_region(exec_result.get("screenshot_region")),
         "observation_text": _sanitize_observation_text_for_model(exec_result.get("observation_text")),
     }
 
@@ -14025,6 +15809,7 @@ def _execute_code_step(
         run_dir=str(step_dir),
         step_id=step_id,
         metadata=executor_metadata,
+        screenshot_region=_execution_screenshot_region_for_request(request),
     )
     _write_json(root / "responses" / f"{step_id}.executor.json", exec_result)
     return exec_result, _extract_last_execution(exec_result), _extract_state(exec_result)
@@ -14062,6 +15847,7 @@ def _maybe_perform_web_search(
         screenshot_path=request.screenshot_path if web_search_decision_use_image else None,
         screenshot_base64=request.screenshot_base64 if web_search_decision_use_image else None,
         screenshot_media_type=request.screenshot_media_type if web_search_decision_use_image else None,
+        screenshot_region=request.screenshot_region if web_search_decision_use_image else None,
         observation_text=request.observation_text,
         web_search_context={},
         recent_history=_history_for_web_search(history),
@@ -14213,6 +15999,7 @@ def _attempt_dependency_repair(
             screenshot_path=state.get("screenshot_path"),
             screenshot_base64=state.get("screenshot_base64"),
             screenshot_media_type=state.get("screenshot_media_type"),
+            screenshot_region=_normalize_screenshot_region(state.get("screenshot_region")),
             observation_text=state.get("observation_text"),
             recent_history=_history_for_dependency_repair(history, failed_step_id=original_step_id),
             last_execution=last_execution,
@@ -14400,6 +16187,7 @@ def run_agent_control_loop(
             screenshot_path=screenshot_path,
             screenshot_base64=screenshot_base64,
             screenshot_media_type=screenshot_media_type,
+            screenshot_region=_normalize_screenshot_region(state.get("screenshot_region")),
             observation_text=state.get("observation_text"),
             web_search_context={},
             recent_history=_history_for_step(history),
@@ -14491,6 +16279,7 @@ def run_agent_control_loop(
                 screenshot_path=screenshot_path,
                 screenshot_base64=screenshot_base64,
                 screenshot_media_type=screenshot_media_type,
+                screenshot_region=_normalize_screenshot_region(state.get("screenshot_region")),
                 observation_text=state.get("observation_text"),
                 web_search_context=request.web_search_context,
                 recent_history=_history_for_empty_retry(history, step_index=step_index),
@@ -14768,6 +16557,7 @@ def run_agent_control_loop(
                     screenshot_path=screenshot_path,
                     screenshot_base64=screenshot_base64,
                     screenshot_media_type=screenshot_media_type,
+                    screenshot_region=_normalize_screenshot_region(state.get("screenshot_region")),
                     observation_text=state.get("observation_text"),
                     web_search_context=request.web_search_context,
                     recent_history=_history_for_invalid_python_retry_with_prompt(

@@ -12,9 +12,21 @@ import traceback
 import uuid
 
 from .config_utils import load_policy_from_path
+from .models import PromptBundle, StepRequest
 from .qwen_runtime import Qwen35RawPythonRuntime
 from .runtime import AgentRuntime, ExternalCliRawPythonRuntime
-from .service import build_executor_client, run_agent_control_loop
+from .service import (
+    _choice_control_elements_from_payload,
+    _coerce_model_bbox,
+    _coerce_model_point,
+    _crop_png_bytes,
+    _extract_json_object_or_array,
+    _installer_ui_candidates_from_observation,
+    _installer_ui_candidates_observation,
+    _model_ui_ocr_elements_from_text,
+    build_executor_client,
+    run_agent_control_loop,
+)
 
 
 _STATE_DIR = Path("/tmp/computer_use_raw_python_agent_qwen35")
@@ -326,6 +338,225 @@ def _handle_reload(daemon_state: AgentDaemonState, payload: dict[str, Any]) -> d
     return {"ok": True, "status": daemon_state.to_public_dict()}
 
 
+def _handle_debug_installer_ocr(daemon_state: AgentDaemonState, payload: dict[str, Any]) -> dict[str, Any]:
+    if not daemon_state.has_backend():
+        return {"ok": False, "error": "no backend is loaded; start once with --model-id or --agent-cli-command"}
+    defaults = _merge_defaults(daemon_state.defaults, dict(payload.get("overrides", {})))
+    prompt = str(
+        payload.get("prompt")
+        or "Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app."
+    )
+    base_run_dir = str(defaults.get("run_dir") or "")
+    if not base_run_dir:
+        raise RuntimeError("run_dir is not configured")
+    run_dir = Path(_make_run_dir(base_run_dir, "debug-installer-ocr"))
+    (run_dir / "responses").mkdir(parents=True, exist_ok=True)
+    executor_client = build_executor_client(
+        endpoint=defaults.get("endpoint"),
+        mcp_command=defaults.get("mcp_command"),
+        mcp_cwd=defaults.get("mcp_cwd"),
+    )
+    try:
+        daemon_state.phase = "running"
+        _write_state_file(os.getpid(), daemon_state.to_public_dict())
+        state = executor_client.observe(screenshot_region=dict(payload.get("screenshot_region") or {"mode": "installer_window"}))
+        request = StepRequest(
+            user_prompt=prompt,
+            policy=load_policy_from_path(str(defaults.get("policy") or "")),
+            execution_style="gui_first",
+            request_kind="task_step",
+            screenshot_base64=state.get("screenshot_base64"),
+            screenshot_media_type=state.get("screenshot_media_type"),
+            screenshot_region=state.get("screenshot_region") if isinstance(state.get("screenshot_region"), dict) else None,
+            observation_text=state.get("observation_text"),
+            strong_visual_grounding=True,
+            reasoning_enabled=False,
+            step_index=int(payload.get("step_index", 1)),
+        )
+        observation = None
+        if not bool(payload.get("skip_standard_candidates", False)):
+            observation = _installer_ui_candidates_observation(
+                runtime=daemon_state.ensure_runtime(),
+                request=request,
+                max_new_tokens=int(payload.get("max_new_tokens") or defaults.get("max_new_tokens") or 512),
+                generation_context={"run_dir": run_dir, "step_id": "debug-installer-ocr"},
+            )
+        candidates = _installer_ui_candidates_from_observation(observation or "")
+        multi_crop_results: list[dict[str, Any]] = []
+        image_bytes = None
+        try:
+            import base64
+
+            image_bytes = base64.b64decode(str(state.get("screenshot_base64") or ""))
+        except Exception:
+            image_bytes = None
+        if bool(payload.get("multi_crop", False)) and image_bytes:
+            image_size = None
+            if image_bytes.startswith(b"\x89PNG\r\n\x1a\n") and len(image_bytes) >= 24:
+                image_size = (int.from_bytes(image_bytes[16:20], "big"), int.from_bytes(image_bytes[20:24], "big"))
+            if image_size:
+                crop_width, crop_height = image_size
+                crop_specs = []
+                if not bool(payload.get("custom_crops_only", False)):
+                    crop_specs.extend(
+                        [
+                            ("full_installer", (0, 0, crop_width, crop_height)),
+                            ("lower_controls", (0, int(crop_height * 0.62), crop_width, crop_height)),
+                            ("agreement_band", (0, int(crop_height * 0.68), int(crop_width * 0.72), int(crop_height * 0.92))),
+                            ("lower_left_controls", (0, int(crop_height * 0.72), int(crop_width * 0.46), int(crop_height * 0.96))),
+                        ]
+                    )
+                for custom in payload.get("custom_crop_specs") or []:
+                    if not isinstance(custom, dict):
+                        continue
+                    name = str(custom.get("name") or "").strip() or f"custom_{len(crop_specs)}"
+                    box = custom.get("box")
+                    if not isinstance(box, (list, tuple)) or len(box) < 4:
+                        continue
+                    try:
+                        left, top, right, bottom = [int(value) for value in box[:4]]
+                    except (TypeError, ValueError):
+                        continue
+                    left = max(0, min(left, crop_width - 1))
+                    top = max(0, min(top, crop_height - 1))
+                    right = max(left + 1, min(right, crop_width))
+                    bottom = max(top + 1, min(bottom, crop_height))
+                    crop_specs.append((name, (left, top, right, bottom)))
+                runtime = daemon_state.ensure_runtime()
+                region = state.get("screenshot_region") if isinstance(state.get("screenshot_region"), dict) else {}
+                region_left = int(region.get("left") or 0)
+                region_top = int(region.get("top") or 0)
+                for crop_name, crop_box in crop_specs:
+                    cropped = _crop_png_bytes(image_bytes, crop_box)
+                    if not cropped:
+                        continue
+                    crop_bytes, sub_size = cropped
+                    generated = runtime.generate_text(
+                        prompt_bundle=PromptBundle(
+                            system_prompt=(
+                                "Return compact strict JSON only. Do not return markdown, Python, prose, or reasoning. "
+                                "Extract clickable checkbox/radio controls from this Windows installer/dialog crop."
+                            ),
+                            user_prompt=json.dumps(
+                                {
+                                    "crop_name": crop_name,
+                                    "task": prompt,
+                                    "instructions": [
+                                        "Return only real clickable checkbox/radio inputs and their adjacent labels.",
+                                        "Ignore decorative colored bullet squares inside license/body text.",
+                                        "Ignore explanatory sentences unless a visible square/circle input is adjacent on the same row.",
+                                        "If an agreement checkbox/radio is visible, include it even if the label is short.",
+                                        "Use bbox and point relative to this crop. For Qwen3.5/Qwen3-VL, use normalized 0-1000 coordinates.",
+                                        "Output exactly: {\"controls\":[{\"control\":{\"kind\":\"checkbox|radio\",\"bbox\":[l,t,r,b],\"point\":[x,y],\"confidence\":0.0},\"label\":{\"text\":\"...\",\"bbox\":[l,t,r,b]}}]}",
+                                    ],
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            ),
+                            session_prompt=prompt,
+                            policy=request.policy,
+                            execution_style="gui_first",
+                            reasoning_enabled=False,
+                            observation_text=None,
+                            last_execution={},
+                            web_search_context={},
+                            recent_history=[],
+                            replan_requested=False,
+                            replan_reasons=[],
+                        ),
+                        image_bytes=crop_bytes,
+                        use_blank_image=False,
+                        max_new_tokens=int(payload.get("max_new_tokens") or defaults.get("max_new_tokens") or 512),
+                        generation_context={"run_dir": run_dir, "step_id": f"debug-installer-ocr-{crop_name}"},
+                    )
+                    parsed = _extract_json_object_or_array(generated.text)
+                    elements = _choice_control_elements_from_payload(parsed)
+                    if not elements:
+                        elements = _model_ui_ocr_elements_from_text(generated.text)
+                    converted: list[dict[str, Any]] = []
+                    for item in elements:
+                        point = _coerce_model_point(item.get("point") or item.get("click_point"), image_size=sub_size)
+                        bbox = _coerce_model_bbox(item.get("bbox") or item.get("box") or item.get("rect"), image_size=sub_size)
+                        if point is None and bbox is not None:
+                            point = (int((bbox[0] + bbox[2]) / 2), int((bbox[1] + bbox[3]) / 2))
+                        if point is None:
+                            continue
+                        local_x = int(crop_box[0] + point[0])
+                        local_y = int(crop_box[1] + point[1])
+                        converted.append(
+                            {
+                                "text": str(item.get("text") or item.get("label_text") or item.get("label") or ""),
+                                "kind": str(item.get("kind") or item.get("type") or "control"),
+                                "source_crop": crop_name,
+                                "crop_point": [int(point[0]), int(point[1])],
+                                "installer_crop_point": [local_x, local_y],
+                                "screen_point": [region_left + local_x, region_top + local_y],
+                                "raw": item,
+                            }
+                        )
+                    multi_crop_results.append(
+                        {
+                            "crop_name": crop_name,
+                            "crop_box": list(crop_box),
+                            "crop_size": list(sub_size),
+                            "model_id": generated.model_id,
+                            "raw_text": generated.text[:4000],
+                            "controls": converted,
+                        }
+                    )
+        click_result: dict[str, Any] | None = None
+        click_candidates = candidates
+        if bool(payload.get("prefer_multi_crop", False)):
+            requested_source_crop = str(payload.get("click_source_crop") or "").strip()
+            flattened = [
+                {
+                    "text": item.get("text") or "ocr-control",
+                    "click_point": item.get("screen_point"),
+                    "source": result.get("crop_name"),
+                    "raw": item.get("raw"),
+                }
+                for result in multi_crop_results
+                for item in result.get("controls", [])
+                if isinstance(item.get("screen_point"), list)
+                and (not requested_source_crop or str(result.get("crop_name") or "") == requested_source_crop)
+            ]
+            if flattened:
+                click_candidates = flattened
+        if bool(payload.get("click", False)) and click_candidates:
+            first = click_candidates[0]
+            point = first.get("refined_click_point") or first.get("click_point")
+            if isinstance(point, list) and len(point) >= 2:
+                x, y = int(point[0]), int(point[1])
+                code = (
+                    "import time\n"
+                    "import pyautogui\n"
+                    f"pyautogui.moveTo({x}, {y}, duration=0.1)\n"
+                    f"pyautogui.click({x}, {y})\n"
+                    "time.sleep(0.8)\n"
+                    f"print('debug installer ocr clicked {first.get('text')} at ({x}, {y})')\n"
+                )
+                click_result = executor_client.execute(
+                    python_code=code,
+                    run_dir=str(run_dir / "executor"),
+                    step_id="debug-click",
+                    metadata={"debug_action": "installer_ocr_click", "candidate": first},
+                    screenshot_region=dict(payload.get("screenshot_region") or {"mode": "installer_window"}),
+                )
+        return {
+            "ok": True,
+            "run_dir": str(run_dir),
+            "screenshot_region": state.get("screenshot_region"),
+            "observation": observation,
+            "candidates": candidates,
+            "multi_crop_results": multi_crop_results,
+            "click_result": click_result,
+        }
+    finally:
+        daemon_state.phase = "ready"
+        _write_state_file(os.getpid(), daemon_state.to_public_dict())
+        executor_client.close()
+
+
 def _serve() -> int:
     requests_dir = daemon_requests_dir()
     responses_dir = daemon_responses_dir()
@@ -359,6 +590,8 @@ def _serve() -> int:
                         response = _handle_reload(daemon_state, payload)
                     elif action == "run":
                         response = _handle_run(daemon_state, payload)
+                    elif action == "debug_installer_ocr":
+                        response = _handle_debug_installer_ocr(daemon_state, payload)
                     elif action == "shutdown":
                         response = {"ok": True}
                         _write_response_file(response_path, response)
