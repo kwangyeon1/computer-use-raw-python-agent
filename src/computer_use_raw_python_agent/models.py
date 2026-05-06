@@ -90,6 +90,7 @@ class StepRequest:
     screenshot_path: str | None = None
     screenshot_base64: str | None = None
     screenshot_media_type: str | None = None
+    screenshot_region: dict[str, Any] | None = None
     observation_text: str | None = None
     web_search_context: dict[str, Any] = field(default_factory=dict)
     recent_history: list[str] = field(default_factory=list)
@@ -111,6 +112,7 @@ class StepRequest:
             screenshot_path=data.get("screenshot_path"),
             screenshot_base64=data.get("screenshot_base64"),
             screenshot_media_type=data.get("screenshot_media_type"),
+            screenshot_region=data.get("screenshot_region") if isinstance(data.get("screenshot_region"), dict) else None,
             observation_text=data.get("observation_text"),
             web_search_context=dict(data.get("web_search_context", {})),
             recent_history=[str(item) for item in data.get("recent_history", [])],
