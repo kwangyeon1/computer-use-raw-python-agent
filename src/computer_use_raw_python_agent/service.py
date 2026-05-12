@@ -9544,6 +9544,34 @@ def _looks_like_download_chunk_completed(*, user_prompt: str, last_execution: di
     )
 
 
+def _looks_like_install_chunk_completed(*, user_prompt: str, last_execution: dict[str, Any]) -> bool:
+    if not (
+        _looks_like_existing_installer_launch_task(user_prompt)
+        or _looks_like_launch_app_chunk_task(user_prompt)
+    ):
+        return False
+    if int(last_execution.get("return_code", 0) or 0) != 0:
+        return False
+    combined = "\n".join(
+        str(last_execution.get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    ).lower()
+    failure_markers = (
+        "installer ui recovery did not verify installed executable",
+        "installed executable detected but process did not stay running",
+    )
+    if any(marker in combined for marker in failure_markers):
+        return False
+    return all(
+        marker in combined
+        for marker in (
+            "install marker written:",
+            "launch installed executable:",
+            "running=true",
+        )
+    )
+
+
 def _looks_like_search_download_step(*, request: StepRequest, response: StepResponse, last_execution: dict[str, Any]) -> bool:
     if str(request.execution_style or "python_first").lower() != "gui_first":
         return False
@@ -10377,6 +10405,47 @@ def _installer_recovery_target_terms(request: StepRequest | None, *, limit: int 
         "msiexec",
         "python",
         "pyautogui",
+        "windows",
+        "uac",
+        "gui-first",
+        "for",
+        "if",
+        "return",
+        "use",
+        "using",
+        "current",
+        "explicit",
+        "treat",
+        "these",
+        "exact",
+        "runtime",
+        "generic",
+        "them",
+        "order",
+        "the",
+        "do",
+        "previous",
+        "retry",
+        "preconditions",
+        "users",
+        "default",
+        "defaults",
+        "option",
+        "options",
+        "success",
+        "target",
+        "targets",
+        "alias",
+        "aliases",
+        "installation",
+        "finishes",
+        "leaving",
+        "downloaded",
+        "downloads",
+        "ui",
+        "url",
+        "urls",
+        "gui",
         "다음",
         "설치",
         "마침",
@@ -10408,6 +10477,25 @@ def _installer_recovery_target_terms(request: StepRequest | None, *, limit: int 
         merged.append(cleaned)
         return len(merged) >= limit
 
+    def _append_prompt_alias_hints() -> bool:
+        for line in str(prompt_text or "").splitlines():
+            lowered_line = line.lower()
+            if not line.strip() or "top-level source task" in lowered_line:
+                continue
+            if any(marker in lowered_line for marker in ("previous stdout summary:", "previous stderr summary:", "verifier evidence:")):
+                continue
+            alias_tokens = re.findall(r"\b[A-Za-z][A-Za-z0-9._-]{1,}\b", line)
+            for token in alias_tokens:
+                has_lower = any(ch.islower() for ch in token)
+                has_upper = any(ch.isupper() for ch in token)
+                has_digit = any(ch.isdigit() for ch in token)
+                is_acronym = token.isupper() and 2 <= len(token) <= 5
+                if not ((has_lower and has_upper) or (has_digit and has_upper) or is_acronym):
+                    continue
+                if _append_keyword(token):
+                    return True
+        return False
+
     task_segments = _iter_source_task_prompt_segments(prompt_text)
     for source_text in task_segments:
         for keyword in _prompt_keyword_candidates(str(source_text or ""), limit=max(limit * 4, 12)):
@@ -10423,6 +10511,9 @@ def _installer_recovery_target_terms(request: StepRequest | None, *, limit: int 
         for keyword in _prompt_keyword_candidates(explicit_stem, limit=max(limit * 2, 8)):
             if _append_keyword(keyword):
                 return merged
+
+    if _append_prompt_alias_hints():
+        return merged
 
     if merged and (task_segments or explicit_installer):
         return merged[:limit]
@@ -16832,6 +16923,10 @@ def run_agent_control_loop(
         if _looks_like_download_chunk_completed(user_prompt=user_prompt, last_execution=last_execution):
             response.done = True
             response.notes.append("download_chunk_completed")
+
+        if _looks_like_install_chunk_completed(user_prompt=user_prompt, last_execution=last_execution):
+            response.done = True
+            response.notes.append("install_chunk_completed")
 
         if response.done and int(last_execution.get("return_code", 0) or 0) == 0:
             history.append(f"{step_id}_completed=1")

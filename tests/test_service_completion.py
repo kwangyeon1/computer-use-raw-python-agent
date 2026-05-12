@@ -61,6 +61,7 @@ from computer_use_raw_python_agent.service import (
     _looks_like_opened_page_only_step,
     _looks_like_reported_failure,
     _looks_like_download_chunk_completed,
+    _looks_like_install_chunk_completed,
     _looks_like_search_download_step,
     _last_execution_has_installer_artifact,
     _normalize_missing_module_install_name,
@@ -2551,6 +2552,50 @@ def test_download_chunk_completed_accepts_model_ui_recovery_markers() -> None:
         last_execution={
             "return_code": 0,
             "stdout_tail": "download ready after visible click: C:\\Users\\me\\Downloads\\app.msi",
+        },
+    )
+
+
+def test_install_chunk_completed_accepts_marker_and_running_stdout() -> None:
+    assert _looks_like_install_chunk_completed(
+        user_prompt=(
+            "Run the downloaded installer from Downloads, finish the installation, "
+            "and launch the installed app. Current chunk success target: app process is running."
+        ),
+        last_execution={
+            "return_code": 0,
+            "stdout_tail": (
+                "install marker written: C:\\Users\\me\\Downloads\\install-success.json "
+                "-> C:\\Users\\me\\AppData\\Local\\Target\\target.exe\n"
+                "launch installed executable: C:\\Users\\me\\AppData\\Local\\Target\\target.exe running=True\n"
+            ),
+        },
+    )
+
+
+def test_install_chunk_completed_rejects_unverified_installer_ui_stdout() -> None:
+    assert not _looks_like_install_chunk_completed(
+        user_prompt=(
+            "Run the downloaded installer from Downloads, finish the installation, "
+            "and launch the installed app. Current chunk success target: app process is running."
+        ),
+        last_execution={
+            "return_code": 1,
+            "stdout_tail": "launch installer target: C:\\Users\\me\\Downloads\\Target_Setup.exe\n",
+            "stderr_tail": "installer UI recovery did not verify installed executable\n",
+        },
+    )
+
+
+def test_install_chunk_completed_rejects_download_only_prompt() -> None:
+    assert not _looks_like_install_chunk_completed(
+        user_prompt="Current chunk success target: A target Windows installer `.exe` is fully downloaded in Downloads.",
+        last_execution={
+            "return_code": 0,
+            "stdout_tail": (
+                "install marker written: C:\\Users\\me\\Downloads\\install-success.json -> C:\\Target\\target.exe\n"
+                "launch installed executable: C:\\Target\\target.exe running=True\n"
+            ),
         },
     )
 
@@ -5101,6 +5146,21 @@ def test_installer_recovery_target_terms_ignore_installer_control_and_impl_words
     assert "다음" not in keywords
     assert "마침" not in keywords
     assert "subprocess" not in keywords
+
+
+def test_installer_recovery_target_terms_include_teacher_alias_hints_after_source_task() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n\n"
+            "Top-level source task for this run: 메모잇 설치해줘\n\n"
+            "Use Python to start the downloaded Memoit installer from Downloads and complete the setup wizard. "
+            "Current chunk success target: Memoit installation finishes without leaving the setup wizard open."
+        ),
+        execution_style="gui_first",
+    )
+    keywords = _installer_recovery_target_terms(request, limit=8)
+    assert "메모잇" in keywords
+    assert "memoit" in keywords
 
 
 def test_model_ui_installer_recovery_prefers_installer_before_existing_exe_scan() -> None:
