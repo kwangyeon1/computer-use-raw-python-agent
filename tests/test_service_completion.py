@@ -61,6 +61,9 @@ from computer_use_raw_python_agent.service import (
     _looks_like_opened_page_only_step,
     _looks_like_reported_failure,
     _looks_like_download_chunk_completed,
+    _looks_like_install_chunk_completed,
+    _looks_like_search_download_step,
+    _last_execution_has_installer_artifact,
     _normalize_missing_module_install_name,
     _prepare_python_code_for_execution,
     _prompt_keyword_candidates,
@@ -102,6 +105,7 @@ from computer_use_raw_python_agent.service import (
     _visible_flow_extra_targets,
 )
 from computer_use_raw_python_agent.models import StepRequest
+from computer_use_raw_python_agent.models import StepResponse
 
 
 def test_task_complete_marker_requires_confirmation_script() -> None:
@@ -2549,6 +2553,102 @@ def test_download_chunk_completed_accepts_model_ui_recovery_markers() -> None:
             "return_code": 0,
             "stdout_tail": "download ready after visible click: C:\\Users\\me\\Downloads\\app.msi",
         },
+    )
+
+
+def test_install_chunk_completed_accepts_marker_and_running_stdout() -> None:
+    assert _looks_like_install_chunk_completed(
+        user_prompt=(
+            "Run the downloaded installer from Downloads, finish the installation, "
+            "and launch the installed app. Current chunk success target: app process is running."
+        ),
+        last_execution={
+            "return_code": 0,
+            "stdout_tail": (
+                "install marker written: C:\\Users\\me\\Downloads\\install-success.json "
+                "-> C:\\Users\\me\\AppData\\Local\\Target\\target.exe\n"
+                "launch installed executable: C:\\Users\\me\\AppData\\Local\\Target\\target.exe running=True\n"
+            ),
+        },
+    )
+
+
+def test_install_chunk_completed_rejects_unverified_installer_ui_stdout() -> None:
+    assert not _looks_like_install_chunk_completed(
+        user_prompt=(
+            "Run the downloaded installer from Downloads, finish the installation, "
+            "and launch the installed app. Current chunk success target: app process is running."
+        ),
+        last_execution={
+            "return_code": 1,
+            "stdout_tail": "launch installer target: C:\\Users\\me\\Downloads\\Target_Setup.exe\n",
+            "stderr_tail": "installer UI recovery did not verify installed executable\n",
+        },
+    )
+
+
+def test_install_chunk_completed_rejects_download_only_prompt() -> None:
+    assert not _looks_like_install_chunk_completed(
+        user_prompt="Current chunk success target: A target Windows installer `.exe` is fully downloaded in Downloads.",
+        last_execution={
+            "return_code": 0,
+            "stdout_tail": (
+                "install marker written: C:\\Users\\me\\Downloads\\install-success.json -> C:\\Target\\target.exe\n"
+                "launch installed executable: C:\\Target\\target.exe running=True\n"
+            ),
+        },
+    )
+
+
+def test_search_download_step_detection_uses_existing_framework_signals() -> None:
+    request = StepRequest(
+        user_prompt="mobaxterm 설치해줘",
+        execution_style="gui_first",
+    )
+    response = StepResponse(
+        python_code="open_url_and_wait('https://example.com')",
+        raw_text="",
+        model_id="framework:model-ui-browser-prelude",
+        step_index=0,
+    )
+    assert _looks_like_search_download_step(
+        request=request,
+        response=response,
+        last_execution={"stdout_tail": "opened browser page for screenshot-grounded UI continuation"},
+    )
+
+
+def test_search_download_step_detection_ignores_existing_installer_launch_tasks() -> None:
+    request = StepRequest(
+        user_prompt="Find the existing installer `.zip` in Downloads, extract it, and launch the app.",
+        execution_style="gui_first",
+    )
+    response = StepResponse(
+        python_code="open_url_and_wait('https://example.com')",
+        raw_text="",
+        model_id="framework:model-ui-browser-prelude",
+        step_index=0,
+    )
+    assert not _looks_like_search_download_step(
+        request=request,
+        response=response,
+        last_execution={"stdout_tail": "opened browser page for screenshot-grounded UI continuation"},
+    )
+
+
+def test_last_execution_has_installer_artifact_accepts_existing_zip_marker() -> None:
+    assert _last_execution_has_installer_artifact(
+        {
+            "return_code": 0,
+            "stdout_tail": "using previously downloaded artifact before opening browser: C:\\Users\\me\\Downloads\\MobaXterm_Installer_v26.3.zip",
+        }
+    )
+    assert not _last_execution_has_installer_artifact(
+        {
+            "return_code": 1,
+            "stdout_tail": "opened browser page for screenshot-grounded UI continuation",
+            "stderr_tail": "no visible download-related control remains",
+        }
     )
 
 
@@ -5046,6 +5146,21 @@ def test_installer_recovery_target_terms_ignore_installer_control_and_impl_words
     assert "다음" not in keywords
     assert "마침" not in keywords
     assert "subprocess" not in keywords
+
+
+def test_installer_recovery_target_terms_include_teacher_alias_hints_after_source_task() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n\n"
+            "Top-level source task for this run: 메모잇 설치해줘\n\n"
+            "Use Python to start the downloaded Memoit installer from Downloads and complete the setup wizard. "
+            "Current chunk success target: Memoit installation finishes without leaving the setup wizard open."
+        ),
+        execution_style="gui_first",
+    )
+    keywords = _installer_recovery_target_terms(request, limit=8)
+    assert "메모잇" in keywords
+    assert "memoit" in keywords
 
 
 def test_model_ui_installer_recovery_prefers_installer_before_existing_exe_scan() -> None:
