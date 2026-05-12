@@ -9544,6 +9544,86 @@ def _looks_like_download_chunk_completed(*, user_prompt: str, last_execution: di
     )
 
 
+def _looks_like_install_chunk_completed(*, user_prompt: str, last_execution: dict[str, Any]) -> bool:
+    if not (
+        _looks_like_existing_installer_launch_task(user_prompt)
+        or _looks_like_launch_app_chunk_task(user_prompt)
+    ):
+        return False
+    if int(last_execution.get("return_code", 0) or 0) != 0:
+        return False
+    combined = "\n".join(
+        str(last_execution.get(key) or "")
+        for key in ("stdout_tail", "stderr_tail")
+    ).lower()
+    failure_markers = (
+        "installer ui recovery did not verify installed executable",
+        "installed executable detected but process did not stay running",
+    )
+    if any(marker in combined for marker in failure_markers):
+        return False
+    return all(
+        marker in combined
+        for marker in (
+            "install marker written:",
+            "launch installed executable:",
+            "running=true",
+        )
+    )
+
+
+def _looks_like_search_download_step(*, request: StepRequest, response: StepResponse, last_execution: dict[str, Any]) -> bool:
+    if str(request.execution_style or "python_first").lower() != "gui_first":
+        return False
+    prompt = str(request.user_prompt or "")
+    if not _looks_like_download_or_install_task(prompt):
+        return False
+    if _looks_like_existing_installer_launch_task(prompt):
+        return False
+    if _looks_like_archive_extract_or_executable_discovery_chunk(prompt):
+        return False
+    model_id = str(response.model_id or "")
+    code = str(response.python_code or "")
+    return bool(
+        model_id
+        in {
+            "framework:model-ui-download-recovery",
+            "framework:official-download-recovery",
+            "framework:visible-download-flow",
+            "framework:model-ui-browser-prelude",
+        }
+        or _looks_like_download_artifact_only_chunk(prompt)
+        or _looks_like_opened_page_only_step(code)
+        or _last_execution_opened_browser_for_gui_flow(last_execution)
+        or _looks_like_partial_download_page_navigation(last_execution)
+        or _looks_like_no_visible_download_candidates(last_execution)
+    )
+
+
+def _last_execution_has_installer_artifact(last_execution: dict[str, Any]) -> bool:
+    if not last_execution:
+        return False
+    combined = "\n".join(str(last_execution.get(key) or "") for key in ("stdout_tail", "stderr_tail")).lower()
+    artifact_markers = (
+        "downloaded:",
+        "downloaded successfully:",
+        "download ready:",
+        "recent download ready:",
+        "prompt-named download ready:",
+        "using existing installer:",
+        "using context installer:",
+        "using previously downloaded artifact:",
+        "using previously downloaded artifact before opening browser:",
+        "using existing installer from downloads before opening browser:",
+        "existing installer found:",
+        "installer_path",
+        "archive_extracted",
+    )
+    if any(marker in combined for marker in artifact_markers):
+        return True
+    return bool(re.search(r"\.(?:exe|msi|zip|alz)\b", combined))
+
+
 def build_executor_client(*, endpoint: str | None, mcp_command: list[str] | None, mcp_cwd: str | None):
     if bool(endpoint) == bool(mcp_command):
         raise RuntimeError("provide exactly one of endpoint or mcp_command")
@@ -10325,6 +10405,47 @@ def _installer_recovery_target_terms(request: StepRequest | None, *, limit: int 
         "msiexec",
         "python",
         "pyautogui",
+        "windows",
+        "uac",
+        "gui-first",
+        "for",
+        "if",
+        "return",
+        "use",
+        "using",
+        "current",
+        "explicit",
+        "treat",
+        "these",
+        "exact",
+        "runtime",
+        "generic",
+        "them",
+        "order",
+        "the",
+        "do",
+        "previous",
+        "retry",
+        "preconditions",
+        "users",
+        "default",
+        "defaults",
+        "option",
+        "options",
+        "success",
+        "target",
+        "targets",
+        "alias",
+        "aliases",
+        "installation",
+        "finishes",
+        "leaving",
+        "downloaded",
+        "downloads",
+        "ui",
+        "url",
+        "urls",
+        "gui",
         "다음",
         "설치",
         "마침",
@@ -10356,6 +10477,25 @@ def _installer_recovery_target_terms(request: StepRequest | None, *, limit: int 
         merged.append(cleaned)
         return len(merged) >= limit
 
+    def _append_prompt_alias_hints() -> bool:
+        for line in str(prompt_text or "").splitlines():
+            lowered_line = line.lower()
+            if not line.strip() or "top-level source task" in lowered_line:
+                continue
+            if any(marker in lowered_line for marker in ("previous stdout summary:", "previous stderr summary:", "verifier evidence:")):
+                continue
+            alias_tokens = re.findall(r"\b[A-Za-z][A-Za-z0-9._-]{1,}\b", line)
+            for token in alias_tokens:
+                has_lower = any(ch.islower() for ch in token)
+                has_upper = any(ch.isupper() for ch in token)
+                has_digit = any(ch.isdigit() for ch in token)
+                is_acronym = token.isupper() and 2 <= len(token) <= 5
+                if not ((has_lower and has_upper) or (has_digit and has_upper) or is_acronym):
+                    continue
+                if _append_keyword(token):
+                    return True
+        return False
+
     task_segments = _iter_source_task_prompt_segments(prompt_text)
     for source_text in task_segments:
         for keyword in _prompt_keyword_candidates(str(source_text or ""), limit=max(limit * 4, 12)):
@@ -10371,6 +10511,9 @@ def _installer_recovery_target_terms(request: StepRequest | None, *, limit: int 
         for keyword in _prompt_keyword_candidates(explicit_stem, limit=max(limit * 2, 8)):
             if _append_keyword(keyword):
                 return merged
+
+    if _append_prompt_alias_hints():
+        return merged
 
     if merged and (task_segments or explicit_installer):
         return merged[:limit]
@@ -16159,6 +16302,8 @@ def run_agent_control_loop(
     dependency_repairs_used = 0
     empty_generation_retries_used = 0
     invalid_generation_retries_used = 0
+    search_download_steps_used = 0
+    search_download_artifact_seen = False
     normalized_preferred_search_engines = ["google"]
     searxng_client = SearXNGClient(base_url=searxng_base_url, timeout_s=web_search_timeout_s) if web_search_enabled else None
 
@@ -16779,11 +16924,27 @@ def run_agent_control_loop(
             response.done = True
             response.notes.append("download_chunk_completed")
 
+        if _looks_like_install_chunk_completed(user_prompt=user_prompt, last_execution=last_execution):
+            response.done = True
+            response.notes.append("install_chunk_completed")
+
         if response.done and int(last_execution.get("return_code", 0) or 0) == 0:
             history.append(f"{step_id}_completed=1")
             final_response = response.to_dict()
             stopped_reason = stopped_reason or "task_completed"
             break
+
+        if _looks_like_search_download_step(request=request, response=response, last_execution=last_execution):
+            search_download_steps_used += 1
+            search_download_artifact_seen = search_download_artifact_seen or _last_execution_has_installer_artifact(last_execution)
+            response.notes.append(f"search_download_steps_used={search_download_steps_used}")
+            if search_download_steps_used >= 3 and not search_download_artifact_seen:
+                response.notes.append("stopped_due_to_search_download_step_limit")
+                final_response = response.to_dict()
+                _write_json(response_path, response.to_dict())
+                stopped_reason = "search_download_step_limit"
+                history.append(f"{step_id}_stopped=search_download_step_limit")
+                break
 
         current_visual_hash = _state_visual_hash(state)
         replan_reasons: list[str] = []
