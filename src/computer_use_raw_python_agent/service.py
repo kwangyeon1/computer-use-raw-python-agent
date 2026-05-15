@@ -10341,6 +10341,24 @@ def _string_list_assignment_values(code: str, names: tuple[str, ...]) -> list[st
     return result
 
 
+def _explicit_target_terms_marker_values(text: str, *, limit: int = 8) -> list[str]:
+    result: list[str] = []
+    marker = "++TARGET_TERMS++:"
+    for line in str(text or "").splitlines():
+        if marker not in line:
+            continue
+        _, raw_values = line.split(marker, 1)
+        for raw in re.split(r"[,，]", raw_values):
+            cleaned = str(raw or "").strip().lower().strip("`'\"[](){}")
+            if not cleaned or cleaned in result:
+                continue
+            result.append(cleaned)
+            if len(result) >= limit:
+                return result
+        return result
+    return result
+
+
 def _explicit_retry_search_keywords(text: str, *, limit: int = 6) -> list[str]:
     results: list[str] = []
     for pattern in (
@@ -10383,6 +10401,9 @@ def _installer_recovery_target_terms(request: StepRequest | None, *, limit: int 
     if request is None:
         return []
     prompt_text = _strip_replan_diagnostic_summaries(str(request.user_prompt or ""))
+    explicit_marker_terms = _explicit_target_terms_marker_values(prompt_text, limit=limit)
+    if explicit_marker_terms:
+        return explicit_marker_terms
     reject_keywords = {
         "setup",
         "install",
@@ -10477,25 +10498,6 @@ def _installer_recovery_target_terms(request: StepRequest | None, *, limit: int 
         merged.append(cleaned)
         return len(merged) >= limit
 
-    def _append_prompt_alias_hints() -> bool:
-        for line in str(prompt_text or "").splitlines():
-            lowered_line = line.lower()
-            if not line.strip() or "top-level source task" in lowered_line:
-                continue
-            if any(marker in lowered_line for marker in ("previous stdout summary:", "previous stderr summary:", "verifier evidence:")):
-                continue
-            alias_tokens = re.findall(r"\b[A-Za-z][A-Za-z0-9._-]{1,}\b", line)
-            for token in alias_tokens:
-                has_lower = any(ch.islower() for ch in token)
-                has_upper = any(ch.isupper() for ch in token)
-                has_digit = any(ch.isdigit() for ch in token)
-                is_acronym = token.isupper() and 2 <= len(token) <= 5
-                if not ((has_lower and has_upper) or (has_digit and has_upper) or is_acronym):
-                    continue
-                if _append_keyword(token):
-                    return True
-        return False
-
     task_segments = _iter_source_task_prompt_segments(prompt_text)
     for source_text in task_segments:
         for keyword in _prompt_keyword_candidates(str(source_text or ""), limit=max(limit * 4, 12)):
@@ -10512,16 +10514,8 @@ def _installer_recovery_target_terms(request: StepRequest | None, *, limit: int 
             if _append_keyword(keyword):
                 return merged
 
-    if _append_prompt_alias_hints():
-        return merged
-
     if merged and (task_segments or explicit_installer):
         return merged[:limit]
-
-    prompt_without_urls = re.sub(r"https?://\S+", " ", prompt_text)
-    for keyword in _prompt_keyword_candidates(prompt_without_urls, limit=max(limit * 4, 12)):
-        if _append_keyword(keyword):
-            return merged
     return merged
 
 

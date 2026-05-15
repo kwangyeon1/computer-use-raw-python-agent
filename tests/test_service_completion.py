@@ -5148,7 +5148,22 @@ def test_installer_recovery_target_terms_ignore_installer_control_and_impl_words
     assert "subprocess" not in keywords
 
 
-def test_installer_recovery_target_terms_include_teacher_alias_hints_after_source_task() -> None:
+def test_installer_recovery_target_terms_use_explicit_marker_terms() -> None:
+    request = StepRequest(
+        user_prompt=(
+            "Return executable Python only for this chunk.\n\n"
+            "Top-level source task for this run: 메모잇 설치해줘\n\n"
+            "Use Python to start the downloaded Memoit installer from Downloads and complete the setup wizard. "
+            "Current chunk success target: Memoit installation finishes without leaving the setup wizard open.\n"
+            "++TARGET_TERMS++: 메모잇,Memoit"
+        ),
+        execution_style="gui_first",
+    )
+    keywords = _installer_recovery_target_terms(request, limit=8)
+    assert keywords == ["메모잇", "memoit"]
+
+
+def test_installer_recovery_target_terms_do_not_infer_alias_from_prompt_text() -> None:
     request = StepRequest(
         user_prompt=(
             "Return executable Python only for this chunk.\n\n"
@@ -5160,7 +5175,7 @@ def test_installer_recovery_target_terms_include_teacher_alias_hints_after_sourc
     )
     keywords = _installer_recovery_target_terms(request, limit=8)
     assert "메모잇" in keywords
-    assert "memoit" in keywords
+    assert "memoit" not in keywords
 
 
 def test_model_ui_installer_recovery_prefers_installer_before_existing_exe_scan() -> None:
