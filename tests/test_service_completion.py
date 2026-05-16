@@ -875,25 +875,36 @@ def test_installer_ui_candidates_visually_refines_checkbox_square_from_model_anc
     assert candidates[0]["source_click_point"][1] >= 0
 
 
-def test_installer_choice_auto_recrop_boxes_uses_quadrant_primary_direction() -> None:
+def test_installer_choice_auto_recrop_boxes_uses_anchor_centered_quadrants() -> None:
     boxes = service_module._installer_choice_auto_recrop_boxes(point=(52, 416), crop_size=(877, 544))
 
     assert boxes == [
-        ("auto_choice_center", (4, 368, 100, 464)),
-        ("auto_choice_right_down", (52, 440, 148, 536)),
+        ("auto_choice_quad_top_left", (0, 320, 98, 440)),
+        ("auto_choice_quad_top_right", (50, 320, 148, 440)),
+        ("auto_choice_quad_bottom_left", (0, 392, 98, 512)),
+        ("auto_choice_quad_bottom_right", (50, 392, 148, 512)),
     ]
 
 
-def test_installer_choice_auto_recrop_boxes_expands_both_axes_near_center() -> None:
+def test_installer_choice_auto_recrop_boxes_keeps_center_anchor_split() -> None:
     boxes = service_module._installer_choice_auto_recrop_boxes(point=(438, 272), crop_size=(877, 544))
-    names = [name for name, _box in boxes]
 
-    assert names == [
-        "auto_choice_center",
-        "auto_choice_left_up",
-        "auto_choice_left_down",
-        "auto_choice_right_up",
-        "auto_choice_right_down",
+    assert boxes == [
+        ("auto_choice_quad_top_left", (342, 176, 462, 296)),
+        ("auto_choice_quad_top_right", (414, 176, 534, 296)),
+        ("auto_choice_quad_bottom_left", (342, 248, 462, 368)),
+        ("auto_choice_quad_bottom_right", (414, 248, 534, 368)),
+    ]
+
+
+def test_installer_choice_auto_recrop_boxes_keeps_anchor_center_near_edges() -> None:
+    boxes = service_module._installer_choice_auto_recrop_boxes(point=(24, 347), crop_size=(878, 543))
+
+    assert boxes == [
+        ("auto_choice_quad_top_left", (0, 251, 81, 371)),
+        ("auto_choice_quad_top_right", (39, 251, 120, 371)),
+        ("auto_choice_quad_bottom_left", (0, 323, 81, 443)),
+        ("auto_choice_quad_bottom_right", (39, 323, 120, 443)),
     ]
 
 
@@ -1129,7 +1140,7 @@ def test_model_ui_installer_recovery_keeps_recrop_click_points_local_to_candidat
     monkeypatch.setattr(service_module, "_MODEL_UI_CANDIDATES_ENABLED", True)
     observation = """INSTALLER_VISIBLE_UI_CANDIDATES:
 These candidates come from local model visual extraction of a cropped installer/dialog UI region, not Windows OCR.
-{"candidates":[{"text":"동의함","kind":"checkbox","click_point":[894,828],"bbox":[850,820,910,850],"recrop_click_points":[{"crop_name":"auto_choice_center","point":[894,828],"match_score":110},{"crop_name":"auto_choice_right_down","point":[899,857],"match_score":110}],"reason_tags":["installer_dialog_control","installer_choice_control","ocr_recrop_choice_control"]}]}"""
+{"candidates":[{"text":"동의함","kind":"checkbox","click_point":[894,828],"bbox":[850,820,910,850],"recrop_click_points":[{"crop_name":"auto_choice_quad_top_left","point":[894,828],"match_score":110},{"crop_name":"auto_choice_quad_bottom_left","point":[899,857],"match_score":110}],"reason_tags":["installer_dialog_control","installer_choice_control","ocr_recrop_choice_control"]}]}"""
     request = StepRequest(
         user_prompt="Find the existing installer `.exe` in Downloads, run the installer, finish the installation, and launch the installed app.",
         execution_style="gui_first",
@@ -1138,8 +1149,8 @@ These candidates come from local model visual extraction of a cropped installer/
     code = _synthesized_model_ui_installer_recovery_code(request)
 
     assert '"recrop_click_points"' in code
-    assert '"crop_name": "auto_choice_center"' in code
-    assert '"crop_name": "auto_choice_right_down"' in code
+    assert '"crop_name": "auto_choice_quad_top_left"' in code
+    assert '"crop_name": "auto_choice_quad_bottom_left"' in code
     assert "for recrop_item in item.get('recrop_click_points') or []:" in code
     assert "point_attempts.append((fallback_point, 'primary'))" in code
 

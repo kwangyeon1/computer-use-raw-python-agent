@@ -12904,40 +12904,24 @@ def _installer_choice_auto_recrop_boxes(
     if width <= 0 or height <= 0:
         return boxes
 
-    def zone(value: int, limit: int) -> str:
-        if value < int(limit * 0.35):
-            return "low"
-        if value > int(limit * 0.65):
-            return "high"
-        return "center"
-
-    x_zone = zone(x, width)
-    y_zone = zone(y, height)
-    x_dirs = {"low": ["right"], "center": ["left", "right"], "high": ["left"]}[x_zone]
-    y_dirs = {"low": ["up"], "center": ["up", "down"], "high": ["down"]}[y_zone]
-
-    def box_for(x_dir: str, y_dir: str) -> tuple[int, int, int, int]:
-        size = 96
-        half = size // 2
-        margin = 24
-        if x_dir == "left":
-            left, right = x - size, x
-        elif x_dir == "right":
-            left, right = x, x + size
-        else:
-            left, right = x - half, x + half
-        if y_dir == "up":
-            top, bottom = y - size - margin, y - margin
-        elif y_dir == "down":
-            top, bottom = y + margin, y + margin + size
-        else:
-            top, bottom = y - half, y + half
-        return left, top, right, bottom
-
-    specs: list[tuple[str, tuple[int, int, int, int]]] = [("auto_choice_center", box_for("center", "center"))]
-    for x_dir in x_dirs:
-        for y_dir in y_dirs:
-            specs.append((f"auto_choice_{x_dir}_{y_dir}", box_for(x_dir, y_dir)))
+    size = 192
+    half = size // 2
+    left = max(0, x - half)
+    top = max(0, y - half)
+    right = min(width, x + half)
+    bottom = min(height, y + half)
+    if right - left < 32 or bottom - top < 32:
+        return boxes
+    mid_x = int((left + right) / 2)
+    mid_y = int((top + bottom) / 2)
+    overlap_x = max(8, min(24, int((right - left) * 0.18)))
+    overlap_y = max(8, min(24, int((bottom - top) * 0.18)))
+    specs: list[tuple[str, tuple[int, int, int, int]]] = [
+        ("auto_choice_quad_top_left", (left, top, mid_x + overlap_x, mid_y + overlap_y)),
+        ("auto_choice_quad_top_right", (mid_x - overlap_x, top, right, mid_y + overlap_y)),
+        ("auto_choice_quad_bottom_left", (left, mid_y - overlap_y, mid_x + overlap_x, bottom)),
+        ("auto_choice_quad_bottom_right", (mid_x - overlap_x, mid_y - overlap_y, right, bottom)),
+    ]
 
     for name, raw_box in specs:
         left, top, right, bottom = raw_box
@@ -12993,7 +12977,7 @@ def _recrop_refine_installer_choice_candidate(
             prompt_bundle=PromptBundle(
                 system_prompt=(
                     "Return compact strict JSON only. Do not return markdown, Python, prose, or reasoning. "
-                    "Extract the actual clickable checkbox or radio input from this tiny installer/dialog crop."
+                    "Extract clickable checkbox/radio controls from this Windows installer/dialog crop."
                 ),
                 user_prompt=json.dumps(
                     {
@@ -13001,9 +12985,11 @@ def _recrop_refine_installer_choice_candidate(
                         "candidate_kind": kind,
                         "crop_name": crop_name,
                         "instructions": [
-                            "This image is a tiny crop around a model-visible checkbox/radio candidate.",
-                            "Return the actual clickable checkbox/radio control, not a decorative bullet and not the label center.",
+                            "Return only real clickable checkbox/radio inputs and their adjacent labels.",
+                            "Ignore decorative colored bullet squares inside license/body text.",
+                            "Ignore explanatory sentences unless a visible square/circle input is adjacent on the same row.",
                             "If a checkbox/radio input is visible, include it even if only part of the adjacent label is visible.",
+                            "If an agreement checkbox/radio is visible, include it even if the label is short.",
                             "Use bbox and point relative to this tiny crop. For Qwen3.5/Qwen3-VL, use normalized 0-1000 coordinates.",
                             "Output exactly: {\"controls\":[{\"control\":{\"kind\":\"checkbox|radio\",\"bbox\":[l,t,r,b],\"point\":[x,y],\"confidence\":0.0},\"label\":{\"text\":\"...\",\"bbox\":[l,t,r,b]}}]}",
                         ],
@@ -13046,9 +13032,9 @@ def _recrop_refine_installer_choice_candidate(
             if point is None:
                 continue
             text_score = _installer_choice_text_score(candidate_text, item)
-            if text_score <= 0:
+            kind_score = 10 if item_kind in {"checkbox", "radio", "control", "input"} else 0
+            if kind_score <= 0:
                 continue
-            kind_score = 10 if item_kind in {"checkbox", "radio"} else 0
             full_point = (box[0] + point[0], box[1] + point[1])
             if full_point[0] < 16 or full_point[1] < 8:
                 continue
